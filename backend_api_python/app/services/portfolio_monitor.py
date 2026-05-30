@@ -1054,6 +1054,131 @@ def _build_batch_html_report(
     return divider.join(parts)
 
 
+def _fmt_money(value: Any, decimals: int = 4) -> str:
+    """Format numbers for compact mobile push notifications."""
+    try:
+        return f"{float(value):,.{decimals}f}"
+    except Exception:
+        return "-"
+
+
+def _build_monitor_push_summary(
+    monitor_name: str,
+    position_analyses: Optional[List[Dict[str, Any]]],
+    language: str,
+    max_items: int = 4,
+) -> str:
+    """Build a short plain-text summary for Bark/webhook channels."""
+    is_zh = language.startswith('zh')
+    analyses = [p for p in (position_analyses or []) if isinstance(p, dict)]
+    buy_count = len([p for p in analyses if p.get('final_decision') == 'BUY'])
+    sell_count = len([p for p in analyses if p.get('final_decision') == 'SELL'])
+    hold_count = len([p for p in analyses if p.get('final_decision') == 'HOLD'])
+
+    if is_zh:
+        lines = [
+            f"监控: {monitor_name}",
+            f"状态: AI分析成功",
+            f"建议汇总: 买入 {buy_count} / 卖出 {sell_count} / 持有 {hold_count}",
+        ]
+    else:
+        lines = [
+            f"Monitor: {monitor_name}",
+            "Status: AI analysis succeeded",
+            f"Summary: BUY {buy_count} / SELL {sell_count} / HOLD {hold_count}",
+        ]
+
+    for pa in analyses[:max_items]:
+        if pa.get('error'):
+            label = pa.get('name') or pa.get('symbol') or '?'
+            lines.append(f"{label}: {'分析失败' if is_zh else 'analysis failed'}")
+            continue
+
+        symbol = pa.get('symbol') or pa.get('name') or '?'
+        decision = pa.get('final_decision') or 'HOLD'
+        if is_zh:
+            decision_text = {'BUY': '买入', 'SELL': '卖出', 'HOLD': '持有'}.get(decision, decision)
+            prefix = f"{symbol}: {decision_text}"
+            conf_label = "置信度"
+            price_label = "现价"
+            pnl_label = "盈亏"
+            reason_label = "摘要"
+        else:
+            prefix = f"{symbol}: {decision}"
+            conf_label = "Conf"
+            price_label = "Price"
+            pnl_label = "P&L"
+            reason_label = "Note"
+
+        confidence = pa.get('confidence', 50)
+        current_price = _fmt_money(pa.get('current_price'), 4)
+        pnl = pa.get('pnl')
+        pnl_pct = pa.get('pnl_percent')
+        try:
+            pnl_sign = '+' if float(pnl or 0) >= 0 else ''
+            pnl_text = f"{pnl_sign}{float(pnl or 0):,.2f} ({pnl_sign}{float(pnl_pct or 0):.1f}%)"
+        except Exception:
+            pnl_text = "-"
+
+        lines.append(f"{prefix} | {conf_label}: {confidence}% | {price_label}: ${current_price} | {pnl_label}: {pnl_text}")
+
+        reasoning = str(pa.get('reasoning') or '').strip()
+        if reasoning:
+            if len(reasoning) > 160:
+                reasoning = reasoning[:160] + "..."
+            lines.append(f"{reason_label}: {reasoning}")
+
+    if len(analyses) > max_items:
+        more = len(analyses) - max_items
+        lines.append(f"其余 {more} 个标的请查看站内报告" if is_zh else f"View the in-app report for {more} more symbols")
+
+    return "\n".join(lines)
+
+
+def _build_batch_push_summary(
+    monitor_results: List[Dict[str, Any]],
+    language: str,
+) -> str:
+    """Build a short plain-text summary for batched Bark/webhook notifications."""
+    is_zh = language.startswith('zh')
+    all_analyses: List[Dict[str, Any]] = []
+    for res in monitor_results:
+        meta = res.get('_meta', {})
+        all_analyses.extend(meta.get('position_analyses', []) or [])
+
+    names = ', '.join(r.get('_meta', {}).get('monitor_name', '?') for r in monitor_results)
+    buy_count = len([p for p in all_analyses if p.get('final_decision') == 'BUY'])
+    sell_count = len([p for p in all_analyses if p.get('final_decision') == 'SELL'])
+    hold_count = len([p for p in all_analyses if p.get('final_decision') == 'HOLD'])
+
+    if is_zh:
+        lines = [
+            f"监控: {names}",
+            f"状态: 批量AI分析成功",
+            f"任务数: {len(monitor_results)} | 标的数: {len(all_analyses)}",
+            f"建议汇总: 买入 {buy_count} / 卖出 {sell_count} / 持有 {hold_count}",
+        ]
+    else:
+        lines = [
+            f"Monitors: {names}",
+            "Status: batch AI analysis succeeded",
+            f"Tasks: {len(monitor_results)} | Symbols: {len(all_analyses)}",
+            f"Summary: BUY {buy_count} / SELL {sell_count} / HOLD {hold_count}",
+        ]
+
+    for pa in all_analyses[:5]:
+        symbol = pa.get('symbol') or pa.get('name') or '?'
+        decision = pa.get('final_decision') or 'HOLD'
+        decision_text = {'BUY': '买入', 'SELL': '卖出', 'HOLD': '持有'}.get(decision, decision) if is_zh else decision
+        lines.append(f"{symbol}: {decision_text} | {pa.get('confidence', 50)}% | ${_fmt_money(pa.get('current_price'), 4)}")
+
+    if len(all_analyses) > 5:
+        more = len(all_analyses) - 5
+        lines.append(f"其余 {more} 个标的请查看站内报告" if is_zh else f"View the in-app report for {more} more symbols")
+
+    return "\n".join(lines)
+
+
 def _send_batch_notification(
     user_id: int,
     monitor_results: List[Dict[str, Any]],
@@ -1110,6 +1235,7 @@ def _send_batch_notification(
 
     html_report = _build_batch_html_report(successful, language)
     telegram_report = _build_batch_telegram_report(successful, language)
+    push_summary = _build_batch_push_summary(successful, language)
 
     try:
         notifier = SignalNotifier()
@@ -1150,8 +1276,9 @@ def _send_batch_notification(
                     if url:
                         notifier._notify_webhook(url=url, payload={
                             'type': 'portfolio_monitor_batch',
+                            'title': title,
+                            'message': push_summary,
                             'monitors': [r.get('_meta', {}).get('monitor_name') for r in successful],
-                            'html_report': html_report,
                         })
             except Exception as e:
                 logger.warning(f"Batch notification channel {channel} failed: {e}")
@@ -1220,6 +1347,7 @@ def _send_monitor_notification(
         
         # Generate reports for different channels
         html_report = result.get('analysis', '')  # This is already HTML from _build_html_report
+        push_summary = _build_monitor_push_summary(monitor_name, position_analyses, language)
         
         # Generate Telegram-specific report if we have the data
         telegram_report = ''
@@ -1283,9 +1411,9 @@ def _send_monitor_notification(
                             url=url,
                             payload={
                                 'type': 'portfolio_monitor',
+                                'title': title,
+                                'message': push_summary,
                                 'monitor_name': monitor_name,
-                                'result': result,
-                                'html_report': html_report
                             }
                         )
                         

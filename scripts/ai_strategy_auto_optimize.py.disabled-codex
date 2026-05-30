@@ -1,0 +1,305 @@
+﻿import json
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+
+BASE = 'http://127.0.0.1:8888'
+TOKEN = 'qd_agent__7cvYXNBw79TtjD-dFwZUHVkUMtw3WA5oLZf6phjges'
+STRATEGY_ID = 6
+MARK = datetime.now(timezone.utc).strftime('ai-opt-%Y%m%d-%H%M%SZ')
+START_DATE = '2026-05-19'
+END_DATE = '2026-05-26'
+
+
+def request(method, path, payload=None, idem=None):
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    headers = {'Authorization': 'Bearer ' + TOKEN}
+    if payload is not None:
+        headers['Content-Type'] = 'application/json'
+    if idem:
+        headers['Idempotency-Key'] = idem
+    req = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=240) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        raise RuntimeError(f'HTTP {e.code} {method} {path}: {body}')
+
+
+def get_data(resp):
+    if resp.get('code') != 0:
+        raise RuntimeError(json.dumps(resp, ensure_ascii=False))
+    return resp.get('data')
+
+
+def run_backtest(strategy, code, name, idx, trading_config):
+    payload = {
+        'code': code,
+        'market': strategy.get('market_category') or 'Crypto',
+        'symbol': strategy.get('symbol') or trading_config.get('symbol') or 'DOGE/USDT',
+        'timeframe': strategy.get('timeframe') or trading_config.get('timeframe') or '5m',
+        'start_date': START_DATE,
+        'end_date': END_DATE,
+        'initial_capital': float(strategy.get('initial_capital') or trading_config.get('initial_capital') or 20),
+        'leverage': int(strategy.get('leverage') or trading_config.get('leverage') or 2),
+        'trade_direction': trading_config.get('trade_direction') or 'long',
+        'strategy_config': trading_config,
+        'indicator_params': trading_config.get('indicator_params') or {},
+    }
+    job = get_data(request('POST', '/api/agent/v1/backtests', payload, idem=f'{MARK}-{idx}-{name}'))
+    job_id = job.get('job_id')
+    final = None
+    for _ in range(90):
+        time.sleep(2)
+        final = get_data(request('GET', f'/api/agent/v1/jobs/{job_id}'))
+        if final.get('status') in ('succeeded', 'failed', 'cancelled'):
+            break
+    result = final.get('result') or {}
+    err = final.get('error')
+    status = final.get('status')
+    metrics = {
+        'totalReturn': result.get('totalReturn'),
+        'maxDrawdown': result.get('maxDrawdown'),
+        'sharpeRatio': result.get('sharpeRatio'),
+        'winRate': result.get('winRate'),
+        'profitFactor': result.get('profitFactor'),
+        'totalTrades': result.get('totalTrades'),
+    }
+    score = -999999.0
+    if status == 'succeeded':
+        ret = float(metrics.get('totalReturn') or 0)
+        dd = abs(float(metrics.get('maxDrawdown') or 0))
+        sharpe = float(metrics.get('sharpeRatio') or 0)
+        pf = float(metrics.get('profitFactor') or 0)
+        win = float(metrics.get('winRate') or 0)
+        trades = int(float(metrics.get('totalTrades') or 0))
+        sample_penalty = 8 if trades < 8 else (3 if trades < 12 else 0)
+        score = ret + sharpe * 8 + pf * 4 + win * 0.04 - dd * 0.45 - sample_penalty
+    return {'name': name, 'job_id': job_id, 'status': status, 'error': err, 'metrics': metrics, 'score': round(score, 4)}
+
+
+def build_code(p):
+    return f'''import pandas as pd
+import numpy as np
+
+my_indicator_name = "[策略] 布林带+RSI高抛低吸 (AI优化版)"
+my_indicator_description = "AI优化：减少过密补仓，使用更早的盈利退出与更紧的内部熔断。"
+
+# @strategy tradeDirection long
+# @strategy entryPct {p['entry_pct']}
+# @strategy stopLossPct {p['stop_loss_pct']}
+# @strategy takeProfitPct {p['take_profit_pct']}
+# @strategy trailingEnabled true
+# @strategy trailingStopPct {p['trailing_stop_pct']}
+# @strategy trailingActivationPct {p['trailing_activation_pct']}
+# QD_VERSION_MARK: {MARK}; backup_indicator_id={{BACKUP_ID}}; candidate={p['name']}
+
+df = df.copy()
+
+bb_period = {p['bb_period']}
+bb_std_num = {p['bb_std_num']}
+rsi_period = {p['rsi_period']}
+rsi_overbought = {p['rsi_overbought']}
+rsi_oversold = {p['rsi_oversold']}
+max_position_limit = {p['max_position_limit']}
+price_step_pct = {p['price_step_pct']}
+hard_stop_price_ratio = {p['hard_stop_price_ratio']}
+min_profit_exit_pct = {p['min_profit_exit_pct']}
+profit_exit_rsi = {p['profit_exit_rsi']}
+
+bb_period = max(2, int(bb_period))
+rsi_period = max(2, int(rsi_period))
+max_position_limit = max(1, int(max_position_limit))
+price_step_pct = max(0.0, float(price_step_pct))
+
+df["bb_mid"] = df["close"].rolling(bb_period, min_periods=1).mean()
+df["bb_std"] = df["close"].rolling(bb_period, min_periods=1).std().fillna(0)
+df["bb_upper"] = df["bb_mid"] + (bb_std_num * df["bb_std"])
+df["bb_lower"] = df["bb_mid"] - (bb_std_num * df["bb_std"])
+
+delta = df["close"].diff()
+gain = delta.clip(lower=0)
+loss = -delta.clip(upper=0)
+avg_gain = gain.ewm(com=rsi_period - 1, min_periods=1).mean()
+avg_loss = loss.ewm(com=rsi_period - 1, min_periods=1).mean()
+rs = avg_gain / avg_loss.replace(0, np.nan)
+df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
+
+df["rsi_oversold_zone"] = df["rsi"] <= rsi_oversold
+raw_buy = (df["close"] <= df["bb_lower"]) & (df["rsi_oversold_zone"].rolling(2).max() > 0)
+df["rsi_overbought_zone"] = df["rsi"] >= rsi_overbought
+raw_sell = (df["close"] >= df["bb_upper"]) & (df["rsi_overbought_zone"].rolling(2).max() > 0)
+
+buy_signals = []
+sell_signals = []
+signal_types = []
+position_qty = 0
+avg_price = 0.0
+last_buy_price = 0.0
+
+for i in range(len(df)):
+    current_price = float(df["close"].iloc[i])
+    current_rsi = float(df["rsi"].iloc[i])
+    is_raw_buy = bool(raw_buy.iloc[i])
+    is_raw_sell = bool(raw_sell.iloc[i])
+    do_buy = False
+    do_sell = False
+    mark_type = ""
+
+    if is_raw_buy and position_qty < max_position_limit:
+        if position_qty == 0:
+            do_buy = True
+            avg_price = current_price
+            last_buy_price = current_price
+            position_qty += 1
+        elif current_price <= last_buy_price * (1 - price_step_pct):
+            do_buy = True
+            avg_price = (avg_price * position_qty + current_price) / (position_qty + 1)
+            last_buy_price = current_price
+            position_qty += 1
+
+    if position_qty > 0 and current_price <= avg_price * hard_stop_price_ratio:
+        do_sell = True
+        position_qty = 0
+        avg_price = 0.0
+        last_buy_price = 0.0
+        mark_type = "STOP"
+    elif position_qty > 0 and current_price >= avg_price * (1 + min_profit_exit_pct) and (is_raw_sell or current_rsi >= profit_exit_rsi or current_price >= float(df["bb_mid"].iloc[i])):
+        do_sell = True
+        position_qty = 0
+        avg_price = 0.0
+        last_buy_price = 0.0
+        mark_type = "S"
+
+    buy_signals.append(do_buy)
+    sell_signals.append(do_sell)
+    signal_types.append(mark_type)
+
+df["buy"] = pd.Series(buy_signals, index=df.index).fillna(False).astype(bool)
+df["sell"] = pd.Series(sell_signals, index=df.index).fillna(False).astype(bool)
+df["signal_type"] = signal_types
+
+buy_marks = df["low"].where(df["buy"], other=None) * 0.995
+is_tp_sell = df["sell"] & (df["signal_type"] == "S")
+is_stop_sell = df["sell"] & (df["signal_type"] == "STOP")
+sell_tp_marks = df["high"].where(is_tp_sell, other=None) * 1.005
+sell_sl_marks = df["high"].where(is_stop_sell, other=None) * 1.005
+
+base_output = {{
+    "name": "布林带RSI均值回归(AI优化版)",
+    "plots": [
+        {{"name": "布林中轨", "data": df["bb_mid"].tolist(), "color": "#722ed1", "overlay": True}},
+        {{"name": "布林上轨", "data": df["bb_upper"].tolist(), "color": "#ff4d4f", "overlay": True}},
+        {{"name": "布林下轨", "data": df["bb_lower"].tolist(), "color": "#52c41a", "overlay": True}},
+        {{"name": "RSI", "data": df["rsi"].tolist(), "color": "#faad14", "overlay": False}},
+    ],
+}}
+
+try:
+    backtest_params
+    is_backtest_env = True
+except NameError:
+    is_backtest_env = False
+
+if is_backtest_env:
+    output = base_output
+else:
+    output = {{
+        **base_output,
+        "signals": [
+            {{"type": "buy", "text": "B", "data": buy_marks.tolist(), "color": "#00E676"}},
+            {{"type": "sell", "text": "S", "data": sell_tp_marks.tolist(), "color": "#FF5252"}},
+            {{"type": "sell", "text": "STOP", "data": sell_sl_marks.tolist(), "color": "#800080"}},
+        ],
+    }}
+'''
+
+strategy = get_data(request('GET', f'/api/agent/v1/strategies/{STRATEGY_ID}'))
+indicator_config_old = dict(strategy.get('indicator_config') or {})
+trading_config = dict(strategy.get('trading_config') or {})
+exchange_config = dict(strategy.get('exchange_config') or {})
+notification_config = dict(strategy.get('notification_config') or {})
+ai_model_config = dict(strategy.get('ai_model_config') or {})
+current_code = indicator_config_old.get('indicator_code') or indicator_config_old.get('code') or ''
+
+backup_payload = {
+    'strategy_name': f"{strategy.get('strategy_name') or 'strategy'} [pre-opt-backup {MARK}]",
+    'strategy_type': strategy.get('strategy_type') or 'IndicatorStrategy',
+    'market_category': strategy.get('market_category') or 'Crypto',
+    'execution_mode': 'signal',
+    'status': 'stopped',
+    'notification_config': notification_config,
+    'exchange_config': exchange_config,
+    'indicator_config': indicator_config_old,
+    'trading_config': trading_config,
+    'ai_model_config': ai_model_config,
+    'strategy_mode': strategy.get('strategy_mode') or 'signal',
+}
+backup = get_data(request('POST', '/api/agent/v1/strategies', backup_payload))
+backup_id = backup.get('strategy_id')
+
+candidates = [
+    {'name':'baseline_current','code': current_code, 'params': None},
+]
+param_sets = [
+    {'name':'conservative_fast_exit','bb_period':20,'bb_std_num':2.1,'rsi_period':14,'rsi_overbought':60,'rsi_oversold':32,'max_position_limit':3,'price_step_pct':0.015,'hard_stop_price_ratio':0.90,'min_profit_exit_pct':0.012,'profit_exit_rsi':55,'entry_pct':0.16,'stop_loss_pct':0.12,'take_profit_pct':0.035,'trailing_stop_pct':0.008,'trailing_activation_pct':0.008},
+    {'name':'wider_band_fewer_entries','bb_period':22,'bb_std_num':2.3,'rsi_period':14,'rsi_overbought':62,'rsi_oversold':30,'max_position_limit':2,'price_step_pct':0.02,'hard_stop_price_ratio':0.88,'min_profit_exit_pct':0.018,'profit_exit_rsi':58,'entry_pct':0.14,'stop_loss_pct':0.14,'take_profit_pct':0.045,'trailing_stop_pct':0.01,'trailing_activation_pct':0.012},
+    {'name':'balanced_mid_exit','bb_period':20,'bb_std_num':2.0,'rsi_period':14,'rsi_overbought':58,'rsi_oversold':35,'max_position_limit':3,'price_step_pct':0.012,'hard_stop_price_ratio':0.89,'min_profit_exit_pct':0.015,'profit_exit_rsi':56,'entry_pct':0.18,'stop_loss_pct':0.13,'take_profit_pct':0.04,'trailing_stop_pct':0.009,'trailing_activation_pct':0.01},
+    {'name':'strict_entry_quick_lock','bb_period':24,'bb_std_num':2.2,'rsi_period':14,'rsi_overbought':59,'rsi_oversold':30,'max_position_limit':3,'price_step_pct':0.018,'hard_stop_price_ratio':0.91,'min_profit_exit_pct':0.01,'profit_exit_rsi':54,'entry_pct':0.15,'stop_loss_pct':0.10,'take_profit_pct':0.032,'trailing_stop_pct':0.007,'trailing_activation_pct':0.007},
+    {'name':'original_signal_tighter_risk','bb_period':20,'bb_std_num':2.0,'rsi_period':14,'rsi_overbought':65,'rsi_oversold':35,'max_position_limit':3,'price_step_pct':0.01,'hard_stop_price_ratio':0.90,'min_profit_exit_pct':0.015,'profit_exit_rsi':58,'entry_pct':0.16,'stop_loss_pct':0.12,'take_profit_pct':0.04,'trailing_stop_pct':0.008,'trailing_activation_pct':0.01},
+]
+for p in param_sets:
+    candidates.append({'name': p['name'], 'code': build_code(p).replace('{BACKUP_ID}', str(backup_id)), 'params': p})
+
+results = []
+for idx, c in enumerate(candidates):
+    results.append(run_backtest(strategy, c['code'], c['name'], idx, trading_config))
+
+best = max(results, key=lambda r: r['score'])
+best_candidate = next(c for c in candidates if c['name'] == best['name'])
+if best_candidate['name'] == 'baseline_current':
+    optimized_code = current_code
+    chosen_params = None
+else:
+    optimized_code = best_candidate['code']
+    chosen_params = best_candidate['params']
+
+indicator_config_new = dict(indicator_config_old)
+indicator_config_new['indicator_code'] = optimized_code
+indicator_config_new['code'] = optimized_code
+indicator_config_new['indicator_name'] = '[策略] 布林带+RSI高抛低吸 (AI优化版)'
+indicator_config_new['version_mark'] = MARK
+indicator_config_new['backup_indicator_id'] = backup_id
+indicator_config_new['optimized_from_job_results'] = results
+
+trading_patch = {'version_mark': MARK, 'backup_indicator_id': backup_id, 'optimization_choice': best['name']}
+if chosen_params:
+    trading_patch.update({
+        'entry_pct': chosen_params['entry_pct'],
+        'stop_loss_pct': chosen_params['stop_loss_pct'],
+        'take_profit_pct': chosen_params['take_profit_pct'],
+        'trailing_enabled': True,
+        'trailing_stop_pct': chosen_params['trailing_stop_pct'],
+        'trailing_activation_pct': chosen_params['trailing_activation_pct'],
+        'indicator_params': {},
+    })
+
+patched = get_data(request('PATCH', f'/api/agent/v1/strategies/{STRATEGY_ID}', {
+    'strategy_name': f"[策略] 布林带+RSI高抛低吸 (AI优化版)-DOGE/USDT [{MARK}]",
+    'indicator_config': indicator_config_new,
+    'trading_config': trading_patch,
+}))
+
+final = run_backtest(strategy, optimized_code, 'final_patched_' + best['name'], 'final', {**trading_config, **trading_patch})
+
+print(json.dumps({
+    'mark': MARK,
+    'strategy_id': STRATEGY_ID,
+    'backup_indicator_id': backup_id,
+    'patched_strategy_name': patched.get('strategy_name') if isinstance(patched, dict) else None,
+    'candidate_results': results,
+    'best_choice': best,
+    'final_check': final,
+}, ensure_ascii=False, indent=2))

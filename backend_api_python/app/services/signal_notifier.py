@@ -69,6 +69,7 @@ _WEBHOOK_DIALECT_PATTERNS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ('dingtalk', ('oapi.dingtalk.com/robot/send',)),
     ('wecom', ('qyapi.weixin.qq.com/cgi-bin/webhook/send',)),
     ('slack', ('hooks.slack.com/services/',)),
+    ('bark', ('api.day.app',)),
 )
 
 
@@ -91,6 +92,22 @@ def _shorten(s: str, limit: int = 4000) -> str:
     return s if len(s) <= limit else (s[:limit] + '…')
 
 
+def _strip_html(s: str) -> str:
+    s = str(s or '')
+    s = html.unescape(s)
+    # Lightweight HTML-to-text fallback for webhook payloads that still
+    # contain rich reports. Keep this dependency-free inside notifier.
+    import re
+    s = re.sub(r'<style\b[^>]*>.*?</style>', ' ', s, flags=re.I | re.S)
+    s = re.sub(r'<script\b[^>]*>.*?</script>', ' ', s, flags=re.I | re.S)
+    s = re.sub(r'<br\s*/?>', '\n', s, flags=re.I)
+    s = re.sub(r'</(div|p|h[1-6]|li|tr)>', '\n', s, flags=re.I)
+    s = re.sub(r'<[^>]+>', ' ', s)
+    s = re.sub(r'[ \t]+', ' ', s)
+    s = re.sub(r'\n\s*\n+', '\n', s)
+    return s.strip()
+
+
 def _build_webhook_text(payload: Dict[str, Any]) -> Tuple[str, str]:
     """
     Distill our internal payload into (title, body) plain text suitable
@@ -106,6 +123,36 @@ def _build_webhook_text(payload: Dict[str, Any]) -> Tuple[str, str]:
     explicit_msg = str(p.get('message') or '').strip()
     if explicit_title or explicit_msg:
         return (explicit_title or 'QuantDinger'), (explicit_msg or '')
+
+    monitor_name = str(p.get('monitor_name') or '').strip()
+    if monitor_name:
+        title = f"QuantDinger 资产监测: {monitor_name}"
+        result = p.get('result') or {}
+        analyses = result.get('position_analyses') if isinstance(result, dict) else None
+        if isinstance(analyses, list) and analyses:
+            lines = [f"监控: {monitor_name}", "状态: AI分析成功"]
+            for pa in analyses[:4]:
+                if not isinstance(pa, dict):
+                    continue
+                symbol = pa.get('symbol') or pa.get('name') or '?'
+                decision = pa.get('final_decision') or 'HOLD'
+                confidence = pa.get('confidence', 50)
+                current_price = pa.get('current_price')
+                try:
+                    price_text = f"${float(current_price or 0):,.4f}"
+                except Exception:
+                    price_text = "-"
+                lines.append(f"{symbol}: {decision} | 置信度: {confidence}% | 现价: {price_text}")
+            if len(analyses) > 4:
+                lines.append(f"其余 {len(analyses) - 4} 个标的请查看站内报告")
+            return title, "\n".join(lines)
+
+        html_report = p.get('html_report')
+        if not html_report and isinstance(result, dict):
+            html_report = result.get('analysis')
+        html_report = str(html_report or '').strip()
+        if html_report:
+            return title, _shorten(_strip_html(html_report), 1200)
 
     strategy = p.get('strategy') or {}
     instrument = p.get('instrument') or {}
@@ -170,6 +217,15 @@ def _adapt_payload_for_dialect(dialect: str, payload: Dict[str, Any]) -> Dict[st
     - Slack incoming webhook: ``{text}``
     """
     title, body = _build_webhook_text(payload)
+
+    if dialect == 'bark':
+        return {
+            "title": _shorten(title, 200),
+            "body": _shorten(body, 2000),
+            # 可选：你可以根据 Bark 的官方文档增加其他参数，比如声音或分组
+            "sound": "minuet.caf",
+            "group": "QuantDinger"
+        }
 
     if dialect == 'feishu':
         # Feishu/Lark text content cap is around 30k chars but the chat
@@ -1218,5 +1274,3 @@ class SignalNotifier:
             results[c] = {"ok": bool(ok), "error": (err or "")}
 
         return results
-
-

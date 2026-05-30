@@ -556,6 +556,116 @@ class PendingOrderWorker:
                                 except Exception:
                                     pass
 
+                    elif isinstance(client, HtxClient) and market_type == "swap":
+                        try:
+                            resp = client.get_positions(symbol=strategy_symbol or "")
+                        except Exception as e:
+                            msg = str(e)
+                            if is_fatal_exchange_error(msg):
+                                logger.error(f"[PositionSync] Strategy {sid} HTX fatal auth error; auto-stopping. error={msg}")
+                                auto_stop_live_strategy(int(sid), msg, source="position_sync_htx")
+                                continue
+                            if _is_exchange_rate_limit_error(msg):
+                                _set_exchange_sync_backoff(cache_key)
+                                logger.error(
+                                    "[PositionSync] HTX rate limit for key=%s; backing off %ss. error=%s",
+                                    cache_key,
+                                    int(_exchange_sync_backoff_sec()),
+                                    msg,
+                                )
+                                continue
+                            logger.error(f"[PositionSync] Strategy {sid} HTX get_positions failed: {msg}", exc_info=True)
+                            continue
+
+                        data = resp.get("data") if isinstance(resp, dict) else resp
+                        if isinstance(data, dict):
+                            data = data.get("data") or data.get("positions") or data.get("list") or []
+                        if not isinstance(data, list):
+                            data = []
+
+                        contract_size_by_symbol: Dict[str, float] = {}
+
+                        for p in data:
+                            if not isinstance(p, dict):
+                                continue
+
+                            raw_sym = str(p.get("contract_code") or p.get("symbol") or "").strip().upper()
+                            if not raw_sym:
+                                continue
+                            hb_sym = raw_sym.replace("-SWAP", "").replace("-", "/")
+                            if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
+                                hb_sym = f"{hb_sym[:-4]}/USDT"
+
+                            raw_qty = 0.0
+                            for qty_key in (
+                                "volume",
+                                "qty",
+                                "position_qty",
+                                "positionQty",
+                                "amount",
+                                "position",
+                                "available",
+                                "avail_position",
+                            ):
+                                try:
+                                    candidate = float(p.get(qty_key) or 0.0)
+                                except Exception:
+                                    candidate = 0.0
+                                if abs(candidate) > 0:
+                                    raw_qty = candidate
+                                    break
+                            if abs(raw_qty) <= 0:
+                                continue
+
+                            direction = str(p.get("direction") or p.get("side") or p.get("pos_side") or p.get("positionSide") or "").strip().lower()
+                            if direction in ("buy", "long"):
+                                side = "long"
+                            elif direction in ("sell", "short"):
+                                side = "short"
+                            else:
+                                side = "long" if raw_qty > 0 else "short"
+
+                            # HTX linear swap position volume is contract count. Convert to base quantity
+                            # so local rows match fills/trade history, e.g. 1 DOGE-USDT contract = 100 DOGE.
+                            contract_size = contract_size_by_symbol.get(hb_sym)
+                            if contract_size is None:
+                                contract_size = 1.0
+                                try:
+                                    contract_info = client.get_contract_info(symbol=hb_sym) or {}
+                                    contract_size = float(contract_info.get("contract_size") or contract_info.get("contractSize") or 1.0)
+                                    if contract_size <= 0:
+                                        contract_size = 1.0
+                                except Exception as e:
+                                    logger.debug(f"[PositionSync] HTX {hb_sym}: failed to fetch contract size, using 1.0: {e}")
+                                    contract_size = 1.0
+                                contract_size_by_symbol[hb_sym] = contract_size
+
+                            qty_base = abs(float(raw_qty)) * float(contract_size)
+                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = float(qty_base)
+
+                            entry_price = 0.0
+                            for price_key in (
+                                "entry_price",
+                                "open_avg_price",
+                                "avg_price",
+                                "trade_avg_price",
+                                "position_avg_price",
+                                "avg_open_price",
+                                "open_price",
+                                "cost_open",
+                            ):
+                                try:
+                                    candidate_price = float(p.get(price_key) or 0.0)
+                                except Exception:
+                                    candidate_price = 0.0
+                                if candidate_price > 0:
+                                    entry_price = candidate_price
+                                    break
+                            if entry_price > 0:
+                                exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})[side] = entry_price
+                            else:
+                                logger.debug(f"[PositionSync] HTX {hb_sym} {side}: entry price missing in position data")
+
                     elif isinstance(client, BybitClient) and market_type == "swap":
                         # Bybit v5 requires symbol or settleCoin — use USDT for full linear book
                         resp = client.get_positions(settle_coin="USDT")
@@ -2866,5 +2976,4 @@ class PendingOrderWorker:
             )
             db.commit()
             cur.close()
-
 

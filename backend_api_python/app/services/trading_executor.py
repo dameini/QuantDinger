@@ -1314,9 +1314,58 @@ class TradingExecutor:
             max_consecutive_errors = 1
         consecutive_errors = 0
         exit_reason: str = ""
+        # Populated after `_load_strategy()` succeeds; defaults keep early failures readable.
+        strategy_name: str = f"strategy_{int(strategy_id)}"
+        symbol: str = ""
+        execution_mode: str = "signal"
+        market_type: str = "swap"
+        market_category: str = "Crypto"
+        leverage: float = 1.0
+        notified_auto_stop: bool = False
+
+        def _notify_bark_auto_stop(reason: str) -> None:
+            """
+            Send a Bark push notification when a strategy auto-stops.
+
+            Configure via env var:
+              - BARK_AUTO_STOP_URL=https://api.day.app/<your_key>
+            Optional:
+              - BARK_AUTO_STOP_GROUP=QuantDinger
+              - BARK_AUTO_STOP_SOUND=
+              - BARK_AUTO_STOP_ICON=
+              - BARK_AUTO_STOP_TIMEOUT_SEC=4
+            """
+            bark_url = (os.getenv("BARK_AUTO_STOP_URL") or "").strip().rstrip("/")
+            if not bark_url:
+                return
+            try:
+                from urllib.parse import quote
+                import requests
+
+                title = f"QD Auto-Stopped | {strategy_name}"
+                body = f"{symbol} | {str(reason or '').strip()}".strip(" |")
+                url = f"{bark_url}/{quote(title)}/{quote(body)}"
+                params: Dict[str, Any] = {}
+                group = (os.getenv("BARK_AUTO_STOP_GROUP") or "").strip()
+                sound = (os.getenv("BARK_AUTO_STOP_SOUND") or "").strip()
+                icon = (os.getenv("BARK_AUTO_STOP_ICON") or "").strip()
+                if group:
+                    params["group"] = group
+                if sound:
+                    params["sound"] = sound
+                if icon:
+                    params["icon"] = icon
+                try:
+                    timeout_sec = float(os.getenv("BARK_AUTO_STOP_TIMEOUT_SEC") or "4")
+                except Exception:
+                    timeout_sec = 4.0
+                requests.get(url, params=params, timeout=max(1.0, timeout_sec))
+            except Exception as e:
+                logger.debug("bark auto-stop notify failed: %s", e)
 
         def _set_db_stopped_best_effort(reason: str) -> None:
             """Best-effort: mark strategy stopped to avoid zombie 'running' status."""
+            nonlocal notified_auto_stop
             try:
                 with get_db_connection() as db:
                     cur = db.cursor()
@@ -1333,6 +1382,79 @@ class TradingExecutor:
                     append_strategy_log(strategy_id, "error", f"Auto-stopped: {reason}")
             except Exception:
                 pass
+            # Notify once per auto-stop to avoid duplicate alerts from multiple
+            # best-effort stop calls (error threshold + finally cleanup, etc.)
+            if notified_auto_stop:
+                return
+            try:
+                notified_auto_stop = True
+                _notify_bark_auto_stop(reason)
+            except Exception as _notify_e:
+                logger.debug("auto_stop notify failed: %s", _notify_e)
+
+        def _protect_open_positions_on_exit(reason: str) -> None:
+            """
+            Strategy-thread exit protection.
+
+            Default is notify-only. Operators may opt into automatic market close
+            by setting STRATEGY_EXIT_POSITION_PROTECTION=close.
+            """
+            try:
+                action = self._exit_position_protection_action()
+                if action == "off":
+                    return
+
+                positions = self._get_open_positions_for_strategy(strategy_id)
+                if not positions:
+                    return
+
+                summary = self._format_position_summary(positions)
+                exit_msg = (
+                    f"Position protection: strategy thread exited with open positions; "
+                    f"action={action}, reason={reason or 'strategy thread exited'}, "
+                    f"positions={summary}"
+                )
+                logger.error("[Strategy %s] %s", strategy_id, exit_msg)
+                try:
+                    append_strategy_log(strategy_id, "error", exit_msg)
+                except Exception:
+                    pass
+
+                try:
+                    _notify_bark_auto_stop(f"{reason or 'strategy thread exited'} | OPEN POSITION: {summary}")
+                except Exception as e:
+                    logger.debug("position protection notify failed: %s", e)
+
+                if action != "close":
+                    return
+
+                if str(execution_mode or "").strip().lower() != "live":
+                    append_strategy_log(
+                        strategy_id,
+                        "error",
+                        "Position protection close skipped: execution_mode is not live",
+                    )
+                    return
+
+                enqueued = 0
+                for pos in positions:
+                    if self._enqueue_protective_close_order(
+                        strategy_id=int(strategy_id),
+                        pos=pos,
+                        market_type=market_type,
+                        market_category=market_category,
+                        leverage=float(leverage or 1.0),
+                        execution_mode=execution_mode,
+                    ):
+                        enqueued += 1
+
+                append_strategy_log(
+                    strategy_id,
+                    "error",
+                    f"Position protection close orders enqueued: {enqueued}/{len(positions)}",
+                )
+            except Exception as e:
+                logger.warning("position protection failed for strategy %s: %s", strategy_id, e)
 
         def _is_fatal_error(err: Exception, msg: str) -> bool:
             # Config errors from data sources should stop immediately.
@@ -1584,6 +1706,9 @@ class TradingExecutor:
             )
             if not klines or len(klines) < 2:
                 logger.error(f"Strategy {strategy_id} failed to fetch K-lines")
+                exit_reason = "failed to fetch K-lines during init"
+                logger.error(f"Strategy {strategy_id} {exit_reason}")
+                _set_db_stopped_best_effort(exit_reason)
                 return
             logger.info(rf'Strategy {strategy_id} history kline number: {len(klines)}')
             
@@ -1591,6 +1716,9 @@ class TradingExecutor:
             df = self._klines_to_dataframe(klines)
             if len(df) == 0:
                 logger.error(f"Strategy {strategy_id} K-lines are empty after normalization")
+                exit_reason = "K-lines empty after normalization during init"
+                logger.error(f"Strategy {strategy_id} {exit_reason}")
+                _set_db_stopped_best_effort(exit_reason)
                 return
 
             # ============================================
@@ -2343,6 +2471,11 @@ class TradingExecutor:
             except Exception:
                 pass
         finally:
+            # Protect against naked positions when the strategy thread exits.
+            try:
+                _protect_open_positions_on_exit(exit_reason or "strategy thread exited")
+            except Exception:
+                pass
             # 清理
             with self.lock:
                 if strategy_id in self.running_strategies:
@@ -3591,6 +3724,129 @@ class TradingExecutor:
         except Exception as e:
             logger.error(f"Failed to fetch positions: {str(e)}")
             return []
+
+    def _exit_position_protection_action(self) -> str:
+        """
+        Return thread-exit position protection mode.
+
+        Values:
+        - off: do nothing
+        - notify: log + Bark alert only (default)
+        - close: enqueue live market close orders for remaining positions
+        """
+        raw = (os.getenv("STRATEGY_EXIT_POSITION_PROTECTION") or "notify").strip().lower()
+        if raw in ("0", "false", "no", "off", "none", "disabled"):
+            return "off"
+        if raw in ("close", "flatten", "liquidate", "market_close"):
+            return "close"
+        return "notify"
+
+    def _get_open_positions_for_strategy(self, strategy_id: int) -> List[Dict[str, Any]]:
+        """Return non-zero local positions for a strategy."""
+        try:
+            with get_db_connection() as db:
+                cursor = db.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, symbol, side, size, entry_price, current_price, highest_price, lowest_price
+                    FROM qd_strategy_positions
+                    WHERE strategy_id = %s
+                    """,
+                    (int(strategy_id),),
+                )
+                rows = cursor.fetchall() or []
+                cursor.close()
+            positions = []
+            for row in rows:
+                try:
+                    side = (row.get("side") or "").strip().lower()
+                    size = float(row.get("size") or 0.0)
+                except Exception:
+                    continue
+                if side in ("long", "short") and size > 0:
+                    positions.append(row)
+            return positions
+        except Exception as e:
+            logger.warning("Failed to fetch open positions for strategy %s: %s", strategy_id, e)
+            return []
+
+    def _format_position_summary(self, positions: List[Dict[str, Any]]) -> str:
+        """Compact position summary for logs and push alerts."""
+        parts = []
+        for pos in positions or []:
+            try:
+                sym = str(pos.get("symbol") or "")
+                side = str(pos.get("side") or "")
+                size = float(pos.get("size") or 0.0)
+                entry = float(pos.get("entry_price") or 0.0)
+                cur = float(pos.get("current_price") or 0.0)
+                parts.append(f"{sym} {side} size={size:g} entry={entry:g} current={cur:g}")
+            except Exception:
+                continue
+        return "; ".join(parts) if parts else "unknown"
+
+    def _enqueue_protective_close_order(
+        self,
+        *,
+        strategy_id: int,
+        pos: Dict[str, Any],
+        market_type: str,
+        market_category: str,
+        leverage: float,
+        execution_mode: str,
+    ) -> bool:
+        """Enqueue a best-effort live market close when a dead strategy still has a position."""
+        try:
+            symbol = str(pos.get("symbol") or "").strip()
+            side = (pos.get("side") or "").strip().lower()
+            size = float(pos.get("size") or 0.0)
+            if not symbol or side not in ("long", "short") or size <= 0:
+                return False
+            signal_type = "close_long" if side == "long" else "close_short"
+            ref_price = float(pos.get("current_price") or pos.get("entry_price") or 0.0)
+            signal_ts = int(time.time())
+
+            pending_id = self._enqueue_pending_order(
+                strategy_id=int(strategy_id),
+                symbol=symbol,
+                signal_type=signal_type,
+                amount=float(size),
+                price=float(ref_price or 0.0),
+                signal_ts=signal_ts,
+                market_type=market_type or "swap",
+                leverage=float(leverage or 1.0),
+                execution_mode=execution_mode or "live",
+                notification_config={},
+                extra_payload={
+                    "ref_price": float(ref_price or 0.0),
+                    "signal_ts": int(signal_ts),
+                    "reason": "thread_exit_position_protection",
+                    "close_fallback_to_market": True,
+                    "open_fallback_to_market": True,
+                    "protective_close": True,
+                    "market_category": str(market_category or "Crypto"),
+                },
+            )
+            if pending_id:
+                append_strategy_log(
+                    strategy_id,
+                    "error",
+                    f"Position protection enqueued {signal_type} {symbol} size={size:g} pending_id={pending_id}",
+                )
+                return True
+            append_strategy_log(
+                strategy_id,
+                "error",
+                f"Position protection skipped duplicate/inflight close: {signal_type} {symbol} size={size:g}",
+            )
+            return False
+        except Exception as e:
+            logger.warning("protective close enqueue failed for strategy %s: %s", strategy_id, e)
+            try:
+                append_strategy_log(strategy_id, "error", f"Position protection enqueue failed: {e}")
+            except Exception:
+                pass
+            return False
 
     def _execute_trading_logic(self, *args, **kwargs):
         """已废弃"""
