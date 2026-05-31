@@ -406,6 +406,7 @@ def analyze_indicator_code_quality(code: str) -> List[Dict[str, Any]]:
 
     cfg = StrategyConfigParser.parse(raw)
 
+    trading = _has_execution_signal_columns(raw)
     if trading:
         if not cfg:
             hints.append(

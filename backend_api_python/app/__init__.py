@@ -353,6 +353,9 @@ def create_app(config_name='default'):
 
     setup_logger()
 
+    from app.utils.auth import _configure_jwt_secret_warnings
+    _configure_jwt_secret_warnings()
+
     # ib_insync uses asyncio across Flask + worker threads; without this, IBKR
     # sockets often drop within seconds (nested loop / thread handoff issues).
     try:
