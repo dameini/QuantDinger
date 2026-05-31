@@ -351,6 +351,9 @@ class PendingOrderWorker:
                 # Get strategy's trading symbol(s) to filter positions
                 # Only sync positions for symbols that this strategy actually trades
                 allowed_symbols = strategy_allowed_symbols(sc)
+                sync_symbol = ""
+                if allowed_symbols:
+                    sync_symbol = normalize_strategy_symbol(str(sorted(allowed_symbols)[0] or ""))
 
                 # Lazy import MT5 / IBKR / Alpaca clients here so the elif chain
                 # below can rely on isinstance() checks without paying the import
@@ -558,7 +561,7 @@ class PendingOrderWorker:
 
                     elif isinstance(client, HtxClient) and market_type == "swap":
                         try:
-                            resp = client.get_positions(symbol=strategy_symbol or "")
+                            resp = client.get_positions(symbol=sync_symbol)
                         except Exception as e:
                             msg = str(e)
                             if is_fatal_exchange_error(msg):
@@ -2976,4 +2979,3 @@ class PendingOrderWorker:
             )
             db.commit()
             cur.close()
-

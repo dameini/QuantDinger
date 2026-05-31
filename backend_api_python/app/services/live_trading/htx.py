@@ -863,6 +863,200 @@ class HtxClient(BaseRestClient):
             raw = self._swap_v5_request("GET", "/v5/trade/order/details", params=params)
         return htx_v5.normalize_order_detail(raw)
 
+    @staticmethod
+    def _first_value(row: Dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            if key in row and row.get(key) not in (None, ""):
+                return row.get(key)
+        return None
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value in (None, ""):
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _to_int_ms(value: Any) -> int:
+        try:
+            if value in (None, ""):
+                return 0
+            v = float(value)
+            if v <= 0:
+                return 0
+            if v < 10_000_000_000:
+                v *= 1000
+            return int(v)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _extract_rows(raw: Any) -> List[Dict[str, Any]]:
+        data = raw.get("data") if isinstance(raw, dict) else raw
+        if isinstance(data, dict):
+            for key in ("data", "list", "orders", "trades", "matchResults", "matchresults"):
+                nested = data.get(key)
+                if isinstance(nested, list):
+                    return [x for x in nested if isinstance(x, dict)]
+            if data:
+                return [data]
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        return []
+
+    def _normalize_history_fill(self, row: Dict[str, Any], *, symbol: str, market_type: str) -> Dict[str, Any]:
+        raw_symbol = str(
+            self._first_value(row, "symbol", "contract_code", "contractCode")
+            or symbol
+            or ""
+        ).strip()
+        hb_symbol = raw_symbol.upper().replace("-SWAP", "").replace("-", "/")
+        if "/" not in hb_symbol and hb_symbol.endswith("USDT") and len(hb_symbol) > 4:
+            hb_symbol = f"{hb_symbol[:-4]}/USDT"
+
+        order_id = str(self._first_value(row, "order_id", "order-id", "orderId", "order_id_str", "id") or "").strip()
+        client_order_id = str(
+            self._first_value(row, "client_order_id", "client-order-id", "clientOrderId", "clientOrderID", "client_oid")
+            or ""
+        ).strip()
+        trade_id = str(self._first_value(row, "trade_id", "trade-id", "match_id", "match-id", "id") or "").strip()
+        ts_ms = self._to_int_ms(
+            self._first_value(
+                row,
+                "created-at",
+                "created_at",
+                "createdAt",
+                "created_time",
+                "createdTime",
+                "trade_time",
+                "tradeTime",
+                "updated_time",
+                "updatedTime",
+                "ts",
+                "time",
+            )
+        )
+
+        side_raw = str(self._first_value(row, "type", "direction", "side", "order_type", "orderType") or "").lower()
+        offset_raw = str(self._first_value(row, "offset", "trade_type", "tradeType", "reduce_only") or "").lower()
+        if "buy" in side_raw:
+            side = "buy"
+        elif "sell" in side_raw:
+            side = "sell"
+        else:
+            side = side_raw
+        is_close = offset_raw in ("close", "reduce", "1", "true") or "close" in side_raw
+        if market_type == "spot":
+            trade_type = "buy" if side == "buy" else "sell"
+        elif side == "buy" and is_close:
+            trade_type = "close_short"
+        elif side == "sell" and is_close:
+            trade_type = "close_long"
+        elif side == "sell":
+            trade_type = "open_short"
+        else:
+            trade_type = "open_long"
+
+        price = self._to_float(self._first_value(row, "price", "trade_price", "tradePrice", "match_price", "matchPrice"))
+        qty = self._to_float(
+            self._first_value(
+                row,
+                "filled_amount",
+                "filled-amount",
+                "filled",
+                "amount",
+                "qty",
+                "quantity",
+                "volume",
+                "trade_volume",
+                "tradeVolume",
+            )
+        )
+        if market_type == "swap" and qty > 0:
+            try:
+                contract_info = self.get_contract_info(symbol=hb_symbol) or {}
+                contract_size = self._to_float(contract_info.get("contract_size") or contract_info.get("contractSize"), 1.0)
+                if contract_size > 0:
+                    qty *= contract_size
+            except Exception:
+                pass
+        value = self._to_float(self._first_value(row, "value", "trade_turnover", "tradeTurnover", "filled_cash_amount", "filled-cash-amount"))
+        if value <= 0 and price > 0 and qty > 0:
+            value = price * qty
+        fee = abs(self._to_float(self._first_value(row, "fee", "trade_fee", "tradeFee", "filled_fees", "filled-fees", "commission")))
+        fee_ccy = str(self._first_value(row, "fee_asset", "feeAsset", "fee_currency", "feeCurrency", "fee-deduct-currency", "commissionAsset") or "USDT").upper()
+        profit = self._to_float(
+            self._first_value(row, "profit", "realized_pnl", "realizedPnl", "real_profit", "realProfit", "trade_profit", "tradeProfit"),
+            0.0,
+        )
+        return {
+            "symbol": hb_symbol,
+            "market_type": market_type,
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "trade_id": trade_id,
+            "trade_time_ms": ts_ms,
+            "type": trade_type,
+            "price": price,
+            "amount": qty,
+            "value": value,
+            "commission": fee,
+            "commission_ccy": fee_ccy,
+            "profit": profit,
+            "raw": row,
+        }
+
+    def get_trade_history(self, *, symbol: str, start_ms: int = 0, end_ms: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
+        """Return normalized HTX fills for spot or USDT-M swap history."""
+        market_type = "spot" if self.market_type == "spot" else "swap"
+        size = max(1, min(int(limit or 100), 100))
+        rows: List[Dict[str, Any]] = []
+        if market_type == "spot":
+            params: Dict[str, Any] = {"symbol": to_htx_spot_symbol(symbol), "size": size}
+            if start_ms:
+                params["start-time"] = int(start_ms)
+            if end_ms:
+                params["end-time"] = int(end_ms)
+            try:
+                raw = self._spot_private_request("GET", "/v1/order/matchresults", params=params)
+            except Exception:
+                raw = self._spot_private_request("GET", "/v1/order/history", params=params)
+            rows = self._extract_rows(raw)
+        else:
+            contract_code = to_htx_contract_code(symbol)
+            v5_params: Dict[str, Any] = {"contract_code": contract_code, "limit": size}
+            if start_ms:
+                v5_params["start_time"] = int(start_ms)
+            if end_ms:
+                v5_params["end_time"] = int(end_ms)
+            last_err: Optional[Exception] = None
+            for path in ("/v5/trade/match-results", "/v5/trade/matchresults", "/v5/trade/history"):
+                try:
+                    raw = self._swap_v5_request("GET", path, params=v5_params)
+                    rows = self._extract_rows(raw)
+                    if rows:
+                        break
+                except Exception as e:
+                    last_err = e
+            if not rows:
+                body: Dict[str, Any] = {"contract_code": contract_code, "page_size": size}
+                if start_ms:
+                    body["start_time"] = int(start_ms)
+                if end_ms:
+                    body["end_time"] = int(end_ms)
+                try:
+                    raw = self._swap_private_request_raw("POST", "/linear-swap-api/v1/swap_matchresults", json_body=body)
+                    rows = self._extract_rows(raw)
+                except Exception as e:
+                    if last_err is not None:
+                        raise last_err
+                    raise e
+        out = [self._normalize_history_fill(r, symbol=symbol, market_type=market_type) for r in rows]
+        return [r for r in out if r.get("symbol") and float(r.get("amount") or 0.0) > 0]
+
     def wait_for_fill(
         self,
         *,

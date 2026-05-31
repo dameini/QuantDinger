@@ -242,6 +242,15 @@ def ensure_strategy_trades_close_reason_column() -> None:
         # render a dedicated "grid profit" column for grid/DCA bots.
         "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS matched_entry_price DECIMAL(20,8) DEFAULT 0",
         "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS grid_matched_profit DECIMAL(20,8) DEFAULT 0",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS source VARCHAR(32) DEFAULT 'local'",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS exchange_id VARCHAR(50) DEFAULT ''",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) DEFAULT ''",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS external_key VARCHAR(255) DEFAULT ''",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS exchange_order_id VARCHAR(120) DEFAULT ''",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS client_order_id VARCHAR(120) DEFAULT ''",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS exchange_trade_id VARCHAR(120) DEFAULT ''",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS attribution_status VARCHAR(32) DEFAULT 'strategy'",
+        "ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS raw_exchange_json TEXT DEFAULT ''",
     )
     for sql in statements:
         try:
@@ -252,6 +261,26 @@ def ensure_strategy_trades_close_reason_column() -> None:
                 cur.close()
         except Exception:
             pass
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_trades_user_external_key
+                ON qd_strategy_trades(user_id, external_key)
+                WHERE external_key IS NOT NULL AND external_key <> ''
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_strategy_trades_exchange_lookup
+                ON qd_strategy_trades(user_id, exchange_id, market_type, symbol, attribution_status, created_at)
+                """
+            )
+            db.commit()
+            cur.close()
+    except Exception:
+        pass
 
 
 def record_trade(
@@ -462,5 +491,4 @@ def apply_fill_to_local_position(
         return profit, _fetch_position(sid, sym_key, side), matched_entry
 
     return None, None, None
-
 

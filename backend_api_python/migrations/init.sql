@@ -369,12 +369,26 @@ CREATE TABLE IF NOT EXISTS qd_strategy_trades (
     close_reason VARCHAR(64) DEFAULT '',
     matched_entry_price DECIMAL(20,8) DEFAULT 0,
     grid_matched_profit DECIMAL(20,8) DEFAULT 0,
+    source VARCHAR(32) DEFAULT 'local',
+    exchange_id VARCHAR(50) DEFAULT '',
+    market_type VARCHAR(20) DEFAULT '',
+    external_key VARCHAR(255) DEFAULT '',
+    exchange_order_id VARCHAR(120) DEFAULT '',
+    client_order_id VARCHAR(120) DEFAULT '',
+    exchange_trade_id VARCHAR(120) DEFAULT '',
+    attribution_status VARCHAR(32) DEFAULT 'strategy',
+    raw_exchange_json TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_trades_user_id ON qd_strategy_trades(user_id);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy_id ON qd_strategy_trades(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_trades_created_at ON qd_strategy_trades(created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_trades_user_external_key
+    ON qd_strategy_trades(user_id, external_key)
+    WHERE external_key IS NOT NULL AND external_key <> '';
+CREATE INDEX IF NOT EXISTS idx_strategy_trades_exchange_lookup
+    ON qd_strategy_trades(user_id, exchange_id, market_type, symbol, attribution_status, created_at);
 
 -- Grid cell ladder state (P2). Pre-placed limit orders / user-stream driven
 -- fills will land here; today only the scaffolding lives in code (see
@@ -1000,6 +1014,20 @@ END $$;
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS close_reason VARCHAR(64) DEFAULT '';
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS matched_entry_price DECIMAL(20,8) DEFAULT 0;
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS grid_matched_profit DECIMAL(20,8) DEFAULT 0;
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS source VARCHAR(32) DEFAULT 'local';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS exchange_id VARCHAR(50) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS external_key VARCHAR(255) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS exchange_order_id VARCHAR(120) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS client_order_id VARCHAR(120) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS exchange_trade_id VARCHAR(120) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS attribution_status VARCHAR(32) DEFAULT 'strategy';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS raw_exchange_json TEXT DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_trades_user_external_key
+    ON qd_strategy_trades(user_id, external_key)
+    WHERE external_key IS NOT NULL AND external_key <> '';
+CREATE INDEX IF NOT EXISTS idx_strategy_trades_exchange_lookup
+    ON qd_strategy_trades(user_id, exchange_id, market_type, symbol, attribution_status, created_at);
 
 -- =============================================================================
 -- 21. Indicator Community Tables

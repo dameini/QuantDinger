@@ -791,14 +791,23 @@ def get_trades():
             lang = "en"
         else:
             lang = "zh"
-        
+
+        include_exchange = str(request.args.get("include_exchange") or "").strip().lower() in ("1", "true", "yes")
+        extra_cols = """
+                       source, exchange_id, market_type, external_key,
+                       exchange_order_id, client_order_id, exchange_trade_id,
+                       attribution_status,
+        """
+
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
-                """
+                f"""
                 SELECT id, strategy_id, symbol, type, price, amount, value,
                        commission, commission_ccy, profit, close_reason,
-                       matched_entry_price, grid_matched_profit, created_at
+                       matched_entry_price, grid_matched_profit,
+                       {extra_cols}
+                       created_at
                 FROM qd_strategy_trades
                 WHERE strategy_id = ?
                 ORDER BY id DESC
@@ -813,34 +822,168 @@ def get_trades():
         # the stored wall clock is UTC. Naive datetime must not use .timestamp() alone — that would
         # interpret it in the Python process local TZ and shift the instant (e.g. +8h on CN laptops).
         from datetime import datetime as _dt, timezone as _tz
-        processed_rows = []
-        for row in rows:
-            trade = dict(row)
-            created_at = trade.get('created_at')
-            if created_at:
-                if hasattr(created_at, 'timestamp'):
-                    dt = created_at
-                    if getattr(dt, 'tzinfo', None) is None:
-                        dt = dt.replace(tzinfo=_tz.utc)
-                    trade['created_at'] = int(dt.timestamp())
-                elif isinstance(created_at, str):
-                    try:
-                        dt = _dt.fromisoformat(created_at.replace('Z', '+00:00'))
+        def _process_trade_rows(input_rows):
+            processed = []
+            for row in input_rows:
+                trade = dict(row)
+                created_at = trade.get('created_at')
+                if created_at:
+                    if hasattr(created_at, 'timestamp'):
+                        dt = created_at
                         if getattr(dt, 'tzinfo', None) is None:
                             dt = dt.replace(tzinfo=_tz.utc)
                         trade['created_at'] = int(dt.timestamp())
+                    elif isinstance(created_at, str):
+                        try:
+                            dt = _dt.fromisoformat(created_at.replace('Z', '+00:00'))
+                            if getattr(dt, 'tzinfo', None) is None:
+                                dt = dt.replace(tzinfo=_tz.utc)
+                            trade['created_at'] = int(dt.timestamp())
+                        except Exception:
+                            pass
+                from app.utils.trade_close_reason import enrich_trade_row
+                trade = enrich_trade_row(trade, bot_type=bot_type, lang=lang)
+                processed.append(_normalize_trade_row_for_api(trade, leverage=leverage, market_type=market_type))
+            return processed
+
+        def _trade_source(row):
+            if str(row.get("attribution_status") or "") == "unassigned":
+                return "htx_unassigned"
+            return "htx" if str(row.get("source") or "local") == "htx" else "local"
+
+        def _compare_trade_rows(all_rows):
+            local_rows = [r for r in all_rows if _trade_source(r) == "local"]
+            cloud_rows = [r for r in all_rows if _trade_source(r) in ("htx", "htx_unassigned")]
+            used_cloud_ids = set()
+            time_limit = 300
+            for local in local_rows:
+                best = None
+                best_score = None
+                for cloud in cloud_rows:
+                    cid = cloud.get("id")
+                    if cid in used_cloud_ids:
+                        continue
+                    if normalize_strategy_symbol(str(local.get("symbol") or "")) != normalize_strategy_symbol(str(cloud.get("symbol") or "")):
+                        continue
+                    if str(local.get("type") or "").lower() != str(cloud.get("type") or "").lower():
+                        continue
+                    try:
+                        tdiff = abs(float(local.get("created_at") or 0) - float(cloud.get("created_at") or 0))
+                        adiff = abs(float(local.get("amount") or 0) - float(cloud.get("amount") or 0))
+                        pdiff = abs(float(local.get("price") or 0) - float(cloud.get("price") or 0))
                     except Exception:
-                        pass
-            from app.utils.trade_close_reason import enrich_trade_row
-            trade = enrich_trade_row(trade, bot_type=bot_type, lang=lang)
-            processed_rows.append(_normalize_trade_row_for_api(trade, leverage=leverage, market_type=market_type))
-        
+                        continue
+                    score = tdiff + adiff * 10_000 + pdiff * 10_000
+                    if best is None or score < best_score:
+                        best = (cloud, tdiff, adiff, pdiff)
+                        best_score = score
+                if not best:
+                    local["compare_status"] = "local_only"
+                    local["compare_note"] = "no_exchange_match"
+                    continue
+                cloud, tdiff, adiff, pdiff = best
+                amount_tol = max(1e-8, abs(float(local.get("amount") or 0)) * 0.001)
+                price_tol = max(1e-8, abs(float(local.get("price") or 0)) * 0.001)
+                matched = tdiff <= time_limit and adiff <= amount_tol and pdiff <= price_tol
+                status = "matched" if matched else "mismatch"
+                note = f"time_diff={round(tdiff, 3)}s amount_diff={round(adiff, 10)} price_diff={round(pdiff, 10)}"
+                local["compare_status"] = status
+                local["compare_note"] = note
+                local["matched_exchange_trade_id"] = cloud.get("id")
+                cloud["compare_status"] = status
+                cloud["compare_note"] = note
+                cloud["matched_local_trade_id"] = local.get("id")
+                used_cloud_ids.add(cloud.get("id"))
+            for cloud in cloud_rows:
+                if not cloud.get("compare_status"):
+                    cloud["compare_status"] = "cloud_only"
+                    cloud["compare_note"] = "no_local_match"
+            return all_rows
+
+        processed_rows = _process_trade_rows(rows)
+        unassigned_rows = []
+        unassigned_summary = {"count": 0, "value": 0.0, "commission": 0.0, "profit": 0.0}
+        if include_exchange:
+            from app.services.live_trading.records import normalize_strategy_symbol
+            sync_symbol = normalize_strategy_symbol(str(st.get("symbol") or trading_config.get("symbol") or ""))
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    f"""
+                    SELECT id, strategy_id, symbol, type, price, amount, value,
+                           commission, commission_ccy, profit, close_reason,
+                           matched_entry_price, grid_matched_profit,
+                           {extra_cols}
+                           created_at
+                    FROM qd_strategy_trades
+                    WHERE user_id = ?
+                      AND strategy_id IS NULL
+                      AND exchange_id = 'htx'
+                      AND attribution_status = 'unassigned'
+                      AND symbol = ?
+                    ORDER BY id DESC
+                    """,
+                    (user_id, sync_symbol),
+                )
+                unassigned_raw = cur.fetchall() or []
+                cur.close()
+            unassigned_rows = _process_trade_rows(unassigned_raw)
+            _compare_trade_rows(processed_rows + unassigned_rows)
+            for tr in unassigned_rows:
+                unassigned_summary["count"] += 1
+                unassigned_summary["value"] += float(tr.get("value") or 0.0)
+                unassigned_summary["commission"] += float(tr.get("commission") or 0.0)
+                unassigned_summary["profit"] += float(tr.get("profit") or 0.0)
+            for k in ("value", "commission", "profit"):
+                unassigned_summary[k] = round(float(unassigned_summary[k]), 8)
+
         # Frontend expects data.trades; keep data.items for compatibility with list-style components.
-        return jsonify({'code': 1, 'msg': 'success', 'data': {'trades': processed_rows, 'items': processed_rows}})
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'trades': processed_rows,
+                'items': processed_rows,
+                'exchange_unassigned_trades': unassigned_rows,
+                'exchange_unassigned_summary': unassigned_summary,
+            }
+        })
     except Exception as e:
         logger.error(f"get_trades failed: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': {'trades': [], 'items': []}}), 500
+
+
+@strategy_bp.route('/strategies/trades/sync', methods=['POST'])
+@login_required
+def sync_strategy_trades():
+    """Manually sync HTX exchange trade history into strategy trade records."""
+    try:
+        user_id = g.user_id
+        strategy_id = request.args.get('id', type=int)
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
+
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        payload = request.get_json(silent=True) or {}
+        from_ts = payload.get("from_ts") or request.args.get("from_ts")
+        to_ts = payload.get("to_ts") or request.args.get("to_ts")
+        from app.services.htx_trade_sync import HtxTradeSyncService
+        result = HtxTradeSyncService().sync_strategy(
+            user_id=int(user_id),
+            strategy_id=int(strategy_id),
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+        logger.info("sync_strategy_trades completed: user_id=%s strategy_id=%s result=%s", user_id, strategy_id, result)
+        return jsonify({'code': 1, 'msg': 'success', 'data': result})
+    except Exception as e:
+        logger.error(f"sync_strategy_trades failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
 @strategy_bp.route('/strategies/dry-run-deviation', methods=['GET'])
@@ -898,15 +1041,107 @@ def get_positions():
         market_type = str(trading_config.get("market_type") or st.get("market_type") or "swap").strip().lower()
         if is_derivatives_market(market_type):
             market_type = "swap"
+        include_exchange = str(request.args.get("include_exchange") or "").strip().lower() in ("1", "true", "yes")
+        sync_exchange = str(request.args.get("sync_exchange") or "").strip().lower() in ("1", "true", "yes")
 
         exchange_config = st.get("exchange_config") if isinstance(st.get("exchange_config"), dict) else {}
         from app.data_sources.crypto import resolve_crypto_venue
+        from app.services.live_trading.records import normalize_strategy_symbol
 
         price_exchange_id, price_market_type = resolve_crypto_venue(
             exchange_config=exchange_config,
             trading_config=trading_config,
             market_type=market_type,
         )
+
+        exchange_positions = []
+        sync_result = {"success": False, "error": ""}
+        if sync_exchange:
+            try:
+                from app import get_pending_order_worker
+                get_pending_order_worker()._sync_positions_best_effort(target_strategy_id=int(strategy_id))
+                sync_result["success"] = True
+            except Exception as e:
+                sync_result["error"] = str(e)
+                logger.warning("position exchange sync failed for strategy %s: %s", strategy_id, e)
+
+        if include_exchange:
+            try:
+                from app.services.exchange_execution import resolve_exchange_config
+                from app.services.live_trading.factory import create_client
+                from app.services.live_trading.htx import HtxClient
+
+                resolved_cfg = resolve_exchange_config(exchange_config, user_id=int(user_id))
+                exchange_id = str(resolved_cfg.get("exchange_id") or "").strip().lower()
+                symbol = normalize_strategy_symbol(str(st.get("symbol") or trading_config.get("symbol") or ""))
+                if exchange_id in ("htx", "huobi") and symbol:
+                    client = create_client(resolved_cfg, market_type=market_type)
+                    if isinstance(client, HtxClient):
+                        resp = client.get_positions(symbol=symbol)
+                        data = resp.get("data") if isinstance(resp, dict) else resp
+                        if isinstance(data, dict):
+                            data = data.get("data") or data.get("positions") or data.get("list") or []
+                        if not isinstance(data, list):
+                            data = []
+                        contract_size = 1.0
+                        if market_type == "swap":
+                            try:
+                                info = client.get_contract_info(symbol=symbol) or {}
+                                contract_size = float(info.get("contract_size") or info.get("contractSize") or 1.0)
+                                if contract_size <= 0:
+                                    contract_size = 1.0
+                            except Exception:
+                                contract_size = 1.0
+                        for idx, p in enumerate(data):
+                            if not isinstance(p, dict):
+                                continue
+                            raw_sym = str(p.get("contract_code") or p.get("symbol") or p.get("currency") or symbol).strip().upper()
+                            hb_sym = raw_sym.replace("-SWAP", "").replace("-", "/")
+                            if hb_sym.endswith("USDT") and len(hb_sym) > 4 and "/" not in hb_sym:
+                                hb_sym = f"{hb_sym[:-4]}/USDT"
+                            if "/" not in hb_sym and symbol:
+                                hb_sym = symbol
+                            raw_qty = 0.0
+                            for qty_key in ("volume", "qty", "position_qty", "positionQty", "amount", "position", "available", "avail_position", "bal"):
+                                try:
+                                    candidate = float(p.get(qty_key) or 0.0)
+                                except Exception:
+                                    candidate = 0.0
+                                if abs(candidate) > 0:
+                                    raw_qty = candidate
+                                    break
+                            if abs(raw_qty) <= 0:
+                                continue
+                            direction = str(p.get("direction") or p.get("side") or p.get("pos_side") or p.get("positionSide") or "").strip().lower()
+                            if direction in ("sell", "short"):
+                                side = "short"
+                            else:
+                                side = "long"
+                            size = abs(raw_qty) * (contract_size if market_type == "swap" else 1.0)
+                            entry_price = 0.0
+                            for price_key in ("entry_price", "open_avg_price", "avg_price", "trade_avg_price", "position_avg_price", "avg_open_price", "open_price", "cost_open"):
+                                try:
+                                    entry_price = float(p.get(price_key) or 0.0)
+                                except Exception:
+                                    entry_price = 0.0
+                                if entry_price > 0:
+                                    break
+                            exchange_positions.append({
+                                "id": f"htx-{idx}",
+                                "strategy_id": int(strategy_id),
+                                "symbol": hb_sym,
+                                "side": side,
+                                "size": float(size),
+                                "entry_price": float(entry_price),
+                                "current_price": 0.0,
+                                "unrealized_pnl": 0.0,
+                                "pnl_percent": 0.0,
+                                "source": "htx",
+                                "attribution_status": "strategy",
+                                "raw_exchange_json": p,
+                            })
+            except Exception as e:
+                logger.warning("fetch exchange positions failed for strategy %s: %s", strategy_id, e)
         
         with get_db_connection() as db:
             cur = db.cursor()
@@ -1010,7 +1245,55 @@ def get_positions():
             db.commit()
             cur.close()
 
-        return jsonify({'code': 1, 'msg': 'success', 'data': {'positions': out, 'items': out}})
+        if include_exchange:
+            for rr in out:
+                rr["source"] = "local"
+                rr["compare_status"] = "local_only"
+                rr["compare_note"] = "no_exchange_position"
+            for ep in exchange_positions:
+                ep_sym = normalize_strategy_symbol(str(ep.get("symbol") or ""))
+                ep_side = str(ep.get("side") or "").lower()
+                ep_size = float(ep.get("size") or 0.0)
+                ep_entry = float(ep.get("entry_price") or 0.0)
+                matched_local = None
+                for rr in out:
+                    if normalize_strategy_symbol(str(rr.get("symbol") or "")) != ep_sym:
+                        continue
+                    if str(rr.get("side") or "").lower() != ep_side:
+                        continue
+                    matched_local = rr
+                    break
+                if matched_local:
+                    try:
+                        size_diff = abs(float(matched_local.get("size") or 0.0) - ep_size)
+                        price_diff = abs(float(matched_local.get("entry_price") or 0.0) - ep_entry)
+                    except Exception:
+                        size_diff = 0.0
+                        price_diff = 0.0
+                    size_tol = max(1e-8, ep_size * 0.001)
+                    price_tol = max(1e-8, ep_entry * 0.001)
+                    status = "matched" if size_diff <= size_tol and (ep_entry <= 0 or price_diff <= price_tol) else "mismatch"
+                    note = f"size_diff={round(size_diff, 10)} entry_diff={round(price_diff, 10)}"
+                    ep["compare_status"] = status
+                    ep["compare_note"] = note
+                    ep["matched_local_position_id"] = matched_local.get("id")
+                    matched_local["compare_status"] = status
+                    matched_local["compare_note"] = note
+                    matched_local["matched_exchange_position_id"] = ep.get("id")
+                else:
+                    ep["compare_status"] = "cloud_only"
+                    ep["compare_note"] = "no_local_position"
+
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'positions': out,
+                'items': out,
+                'exchange_positions': exchange_positions,
+                'exchange_sync': sync_result,
+            }
+        })
     except Exception as e:
         logger.error(f"get_positions failed: {str(e)}")
         logger.error(traceback.format_exc())
