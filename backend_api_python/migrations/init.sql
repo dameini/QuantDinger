@@ -393,13 +393,6 @@ CREATE TABLE IF NOT EXISTS qd_strategy_trades (
 CREATE INDEX IF NOT EXISTS idx_trades_user_id ON qd_strategy_trades(user_id);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy_id ON qd_strategy_trades(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_trades_created_at ON qd_strategy_trades(created_at);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_trades_user_external_key
-    ON qd_strategy_trades(user_id, external_key)
-    WHERE external_key IS NOT NULL AND external_key <> '';
-CREATE INDEX IF NOT EXISTS idx_strategy_trades_exchange_lookup
-    ON qd_strategy_trades(user_id, exchange_id, market_type, symbol, attribution_status, created_at);
-CREATE INDEX IF NOT EXISTS idx_trades_strategy_symbol_canon ON qd_strategy_trades (strategy_id, market_type, symbol_canonical);
-CREATE INDEX IF NOT EXISTS idx_positions_strategy_leg ON qd_strategy_positions (strategy_id, market_type, symbol_canonical, side);
 
 -- L1 account position mirror (exchange truth per credential + inst_id + side)
 CREATE TABLE IF NOT EXISTS qd_account_positions (
