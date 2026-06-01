@@ -9,10 +9,27 @@ For the machine-readable contract, see [agent-openapi.json](agent-openapi.json).
 
 ---
 
-## 1. Issue an agent token (one-time, admin)
+## 1. Issue an agent token (one-time)
 
-Tokens are minted by the human admin, never by an agent. Get a normal admin
-JWT first (login UI or `/api/auth/login`), then:
+Tokens are minted by a logged-in human user (Profile → **My Agent Token**) or
+by an admin via `/api/agent/v1/admin/tokens`. Agents never mint tokens for
+themselves. Get a normal JWT first (login UI or `/api/auth/login`), then:
+
+```bash
+curl -X POST http://localhost:8888/api/agent/v1/me/tokens \
+  -H "Authorization: Bearer <USER_JWT>" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "my-research-bot",
+        "scopes": "R,B",
+        "markets": "Crypto,USStock",
+        "instruments": "*",
+        "rate_limit_per_min": 120,
+        "expires_in_days": 30
+      }'
+```
+
+Admin equivalent (may include `C` scope):
 
 ```bash
 curl -X POST http://localhost:8888/api/agent/v1/admin/tokens \

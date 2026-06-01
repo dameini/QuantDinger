@@ -21,7 +21,8 @@ import traceback
 import uuid
 from typing import Any, Dict, List, Optional, Optional
 
-from flask import Blueprint, g, jsonify, request
+from flask import g, jsonify, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
@@ -161,7 +162,7 @@ def _merge_balance_leg_errors(
     }
 
 
-quick_trade_bp = Blueprint('quick_trade', __name__)
+quick_trade_blp = Blueprint('quick_trade', __name__)
 
 
 # ────────── helpers ──────────
@@ -551,7 +552,7 @@ def _record_quick_trade(
 
 # ────────── endpoints ──────────
 
-@quick_trade_bp.route('/place-order', methods=['POST'])
+@quick_trade_blp.route('/place-order', methods=['POST'])
 @login_required
 def place_order():
     """
@@ -1054,7 +1055,7 @@ def _fetch_balance_raw(
     return result
 
 
-@quick_trade_bp.route('/balance', methods=['GET'])
+@quick_trade_blp.route('/balance', methods=['GET'])
 @login_required
 def get_balance():
     """
@@ -1684,7 +1685,7 @@ def _fetch_exchange_positions_raw(
     return None
 
 
-@quick_trade_bp.route('/position', methods=['GET'])
+@quick_trade_blp.route('/position', methods=['GET'])
 @login_required
 def get_position():
     """
@@ -1977,7 +1978,7 @@ def _quick_trade_net_base_qty(
     return max(0.0, float(net))
 
 
-@quick_trade_bp.route('/close-position', methods=['POST'])
+@quick_trade_blp.route('/close-position', methods=['POST'])
 @login_required
 def close_position():
     """
@@ -2264,7 +2265,7 @@ def close_position():
         return jsonify(resp), 500
 
 
-@quick_trade_bp.route('/history', methods=['GET'])
+@quick_trade_blp.route('/history', methods=['GET'])
 @login_required
 def get_history():
     """
@@ -2325,3 +2326,6 @@ def get_history():
     except Exception as e:
         logger.error(f"get_history failed: {e}")
         return jsonify({"code": 0, "msg": str(e)}), 500
+
+# openapi-compat: legacy import name
+quick_trade_bp = quick_trade_blp

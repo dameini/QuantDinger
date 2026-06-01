@@ -16,14 +16,15 @@ import re
 import time
 import traceback
 from typing import Any, Dict, List
-from flask import Blueprint, Response, jsonify, request, g
+from flask import Response, g, jsonify, request
+from app.openapi.blueprint import HumanBlueprint as Blueprint
 import pandas as pd
 import numpy as np
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.auth import login_required
-from app.services.indicator_params import IndicatorCaller, IndicatorParamsParser
+from app.services.indicator_params import IndicatorParamsParser
 from app.services.indicator_translator import (
     translate_indicator,
     SUPPORTED_LANGUAGES as _SUPPORTED_LANGUAGES_FOR_TRANSLATE,
@@ -32,7 +33,7 @@ import requests
 
 logger = get_logger(__name__)
 
-indicator_bp = Blueprint("indicator", __name__)
+indicator_blp = Blueprint("indicator", __name__)
 
 
 def _now_ts() -> int:
@@ -129,7 +130,7 @@ def _merge_indicator_params(code: str, user_params: Dict[str, Any] | None = None
 
 def _validate_indicator_code_internal(code: str, user_params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """
-    Shared validation for indicator code generation and verifyCode.
+    Shared validation for indicator code generation and strategy verify-code.
 
     Returns:
       {
@@ -470,7 +471,7 @@ def _indicator_human_summary(
     }
 
 
-@indicator_bp.route("/getIndicators", methods=["GET"])
+@indicator_blp.route("/getIndicators", methods=["GET"])
 @login_required
 def get_indicators():
     """
@@ -512,7 +513,7 @@ def get_indicators():
         return jsonify({"code": 0, "msg": str(e), "data": []}), 500
 
 
-@indicator_bp.route("/saveIndicator", methods=["POST"])
+@indicator_blp.route("/saveIndicator", methods=["POST"])
 @login_required
 def save_indicator():
     """
@@ -729,7 +730,7 @@ def save_indicator():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-@indicator_bp.route("/deleteIndicator", methods=["POST"])
+@indicator_blp.route("/deleteIndicator", methods=["POST"])
 @login_required
 def delete_indicator():
     """Delete an indicator by id for the current user."""
@@ -755,62 +756,24 @@ def delete_indicator():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-@indicator_bp.route("/applyParamDefaults", methods=["POST"])
-@login_required
-def apply_param_defaults():
-    """
-    Apply tuned indicator parameter values into ``# @param`` lines in source code.
-
-    Body: { "code": "...", "indicatorParams": { "sma_short": 11, "sma_long": 35 } }
-    or flat keys: { "indicator_params.sma_short": 11, ... }
-    """
-    try:
-        data = request.get_json() or {}
-        code = str(data.get("code") or "")
-        if not code.strip():
-            return jsonify({"code": 0, "msg": "code is required", "data": None}), 400
-
-        params = data.get("indicatorParams") or data.get("indicator_params") or {}
-        if not isinstance(params, dict):
-            params = {}
-        for key, value in list((data.get("overrides") or {}).items()):
-            k = str(key or "")
-            if k.startswith("indicator_params."):
-                params[k.split(".", 1)[1]] = value
-
-        from app.services.experiment.overrides import enrich_experiment_overrides
-
-        nested = enrich_experiment_overrides({"indicatorParams": params}).get("indicatorParams") or params
-        new_code = IndicatorParamsParser.apply_defaults_to_code(code, nested)
-        changed = new_code != code
-        return jsonify({
-            "code": 1,
-            "msg": "success",
-            "data": {"code": new_code, "changed": changed, "indicatorParams": nested},
-        })
-    except Exception as e:
-        logger.error("apply_param_defaults failed: %s", e, exc_info=True)
-        return jsonify({"code": 0, "msg": str(e), "data": None}), 500
-
-
-@indicator_bp.route("/getIndicatorParams", methods=["GET"])
+@indicator_blp.route("/getIndicatorParams", methods=["GET"])
 @login_required
 def get_indicator_params():
     """
-    获取指标的参数声明
-    
-    用于前端在策略创建时显示可配置的参数表单。
-    
+    Return declared `# @param` fields for an indicator.
+
+    Used by the strategy builder to render a parameter form.
+
     Query params:
-        indicator_id: 指标ID
-        
+        indicator_id: Indicator ID
+
     Returns:
         params: [
             {
                 "name": "ma_fast",
                 "type": "int",
                 "default": 5,
-                "description": "短期均线周期"
+                "description": "Fast MA period"
             },
             ...
         ]
@@ -835,51 +798,7 @@ def get_indicator_params():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-@indicator_bp.route("/verifyCode", methods=["POST"])
-@login_required
-def verify_code():
-    """
-    Verify/Dry-run indicator code with mock data.
-    Checks for:
-    - Syntax errors
-    - Runtime errors
-    - Output format (must define 'output' dict)
-    """
-    try:
-        data = request.get_json() or {}
-        code = data.get("code") or ""
-        
-        if not code or not str(code).strip():
-            return jsonify({"code": 0, "msg": "Code is empty", "data": None}), 400
-
-        validation = _validate_indicator_code_internal(code, data.get("params") or {})
-        if not validation["success"]:
-            return jsonify({
-                "code": 0,
-                "msg": validation["msg"],
-                "data": {
-                    "type": validation["error_type"],
-                    "details": validation["details"],
-                    "hints": validation.get("hints", []),
-                }
-            })
-
-        return jsonify({
-            "code": 1,
-            "msg": validation["msg"],
-            "data": {
-                "plots_count": validation["plots_count"],
-                "signals_count": validation["signals_count"],
-                "hints": validation.get("hints", []),
-            }
-        })
-
-    except Exception as e:
-        logger.error(f"verify_code failed: {str(e)}", exc_info=True)
-        return jsonify({"code": 0, "msg": f"System Error: {str(e)}", "data": None}), 500
-
-
-@indicator_bp.route("/aiGenerate", methods=["POST"])
+@indicator_blp.route("/aiGenerate", methods=["POST"])
 @login_required
 def ai_generate():
     """
@@ -909,7 +828,7 @@ def ai_generate():
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # QuantDinger indicator IDE: chart render + backtest; must pass server verifyCode + safe_exec rules.
+    # QuantDinger indicator IDE: chart render + backtest; must pass server verify-code + safe_exec rules.
     SYSTEM_PROMPT = """# Role
 
 You write production-ready **QuantDinger** indicator scripts: Python that runs in the Indicator IDE, renders on the K-line chart, and drives **backtest entries/exits** via boolean signals. Code must be syntactically valid, safe for the host sandbox, and match the exact I/O contract below.
@@ -1356,48 +1275,17 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
     )
 
 
-@indicator_bp.route("/defaultTemplate", methods=["GET"])
-@login_required
-def get_default_indicator_template():
-    """
-    Return the platform default indicator starter (four-way, contract v1).
-
-    GET /api/indicator/defaultTemplate
-    Optional query: name=...&description=...
-    """
-    from app.services.indicator_default_template import build_default_indicator_template
-
-    args = request.args or {}
-    name = (args.get("name") or "").strip() or "策略模板（四路信号）"
-    description = (args.get("description") or "").strip() or (
-        "双均线金叉/死叉：四路显式信号 + 边缘触发 + 引擎风控。"
-    )
-    code = build_default_indicator_template(name=name, description=description)
-    return jsonify(
-        {
-            "code": 1,
-            "msg": "success",
-            "data": {"code": code, "name": name, "description": description},
-        }
-    )
-
-
-@indicator_bp.route("/codeQualityHints", methods=["POST"])
+@indicator_blp.route("/codeQualityHints", methods=["POST"])
 @login_required
 def code_quality_hints():
     """
     Heuristic hints + runtime smoke-execution for indicator code.
 
-    POST /api/indicator/codeQualityHints
-    Body:  { "code": "..." }
-    Returns: { "code": 1, "data": { "hints": [ { "severity", "code", "params" } ] } }
+    Request body:
+        code (required): Indicator source code
 
-    The static pass catches structural/@strategy issues. We also do a short
-    sandboxed dry-run against a mock K-line frame so runtime errors (e.g.
-    `AttributeError: 'numpy.ndarray' has no attribute 'rolling'`) surface as
-    hints instead of staying invisible until backtest time. Static `error`
-    hints suppress the dry-run because they would deterministically fail
-    anyway and we want a fast response.
+    Returns hints with severity, code, and params. Static analysis catches
+    structural issues; a sandboxed dry-run surfaces runtime errors before backtest.
     """
     from app.services.indicator_code_quality import analyze_indicator_code_quality
 
@@ -1443,114 +1331,5 @@ def code_quality_hints():
     return jsonify({"code": 1, "data": {"hints": hints}})
 
 
-@indicator_bp.route("/parseStrategyConfig", methods=["POST"])
-@login_required
-def parse_strategy_config():
-    """
-    Parse @strategy annotations from indicator code and return strategy config.
-    POST /api/indicator/parseStrategyConfig
-    Body: { "code": "..." }
-    Returns: { "code": 1, "data": { "strategyConfig": {...}, "indicatorParams": [...] } }
-    """
-    from app.services.indicator_params import StrategyConfigParser, IndicatorParamsParser
-    data = request.get_json() or {}
-    code_str = (data.get("code") or "").strip()
-    strategy_cfg = StrategyConfigParser.parse(code_str) if code_str else {}
-    indicator_params = IndicatorParamsParser.parse_params(code_str) if code_str else []
-    return jsonify({
-        "code": 1,
-        "data": {
-            "strategyConfig": strategy_cfg,
-            "indicatorParams": indicator_params
-        }
-    })
-
-
-@indicator_bp.route("/callIndicator", methods=["POST"])
-@login_required
-def call_indicator():
-    """
-    调用另一个指标（供前端 Pyodide 环境使用）
-    
-    POST /api/indicator/callIndicator
-    Body: {
-        "indicatorRef": int | str,  # 指标ID或名称
-        "klineData": List[Dict],      # K线数据
-        "params": Dict,              # 传递给被调用指标的参数（可选）
-        "currentIndicatorId": int     # 当前指标ID（用于循环依赖检测，可选）
-    }
-    
-    Returns:
-        {
-            "code": 1,
-            "data": {
-                "df": List[Dict],    # 执行后的DataFrame（转换为JSON）
-                "columns": List[str]  # DataFrame的列名
-            }
-        }
-    """
-    try:
-        data = request.get_json() or {}
-        indicator_ref = data.get("indicatorRef")
-        kline_data = data.get("klineData", [])
-        params = data.get("params") or {}
-        current_indicator_id = data.get("currentIndicatorId")
-        
-        if not indicator_ref:
-            return jsonify({
-                "code": 0,
-                "msg": "indicatorRef is required",
-                "data": None
-            }), 400
-        
-        if not kline_data or not isinstance(kline_data, list):
-            return jsonify({
-                "code": 0,
-                "msg": "klineData must be a non-empty list",
-                "data": None
-            }), 400
-        
-        # 获取用户ID
-        user_id = g.user_id
-        
-        # 创建 IndicatorCaller
-        indicator_caller = IndicatorCaller(user_id, current_indicator_id)
-        
-        # 将前端传入的K线数据转换为DataFrame
-        df = pd.DataFrame(kline_data)
-        
-        # 确保必要的列存在
-        required_columns = ['open', 'high', 'low', 'close', 'volume']
-        for col in required_columns:
-            if col not in df.columns:
-                df[col] = 0.0
-        
-        # 转换数据类型
-        df['open'] = df['open'].astype('float64')
-        df['high'] = df['high'].astype('float64')
-        df['low'] = df['low'].astype('float64')
-        df['close'] = df['close'].astype('float64')
-        df['volume'] = df['volume'].astype('float64')
-        
-        # 调用指标
-        result_df = indicator_caller.call_indicator(indicator_ref, df, params)
-        
-        # 将DataFrame转换为JSON格式（前端可以使用的格式）
-        result_dict = result_df.to_dict(orient='records')
-        
-        return jsonify({
-            "code": 1,
-            "msg": "success",
-            "data": {
-                "df": result_dict,
-                "columns": list(result_df.columns)
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Error calling indicator: {e}", exc_info=True)
-        return jsonify({
-            "code": 0,
-            "msg": str(e),
-            "data": None
-        }), 500
+# openapi-compat: legacy import name
+indicator_bp = indicator_blp

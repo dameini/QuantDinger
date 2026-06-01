@@ -927,12 +927,20 @@ class StrategyService:
                 self._display_item('amountPerGrid', 'trading-bot.grid.amountPerGrid', self._to_float(params.get('amountPerGrid'), 0.0), 'usdt'),
                 self._display_item('gridMode', 'trading-bot.grid.mode', params.get('gridMode') or 'arithmetic', 'enum', f"trading-bot.grid.{params.get('gridMode') or 'arithmetic'}"),
                 self._display_item('gridDirection', 'trading-bot.grid.direction', params.get('gridDirection') or 'neutral', 'enum', f"trading-bot.grid.{params.get('gridDirection') or 'neutral'}"),
+                self._display_item('initialPositionPct', 'trading-bot.grid.initialPositionPct', self._to_float(params.get('initialPositionPct'), 0.0), 'percent'),
+                self._display_item('boundaryAction', 'trading-bot.grid.boundaryAction', params.get('boundaryAction') or 'pause', 'enum', {
+                    'pause': 'trading-bot.grid.boundaryPause',
+                    'stop_loss': 'trading-bot.grid.boundaryStopLoss',
+                    'hold': 'trading-bot.grid.boundaryHold',
+                }.get(params.get('boundaryAction') or 'pause', 'trading-bot.grid.boundaryPause')),
+            ]
+            display['strategy_params'].extend([
                 self._display_item('orderMode', 'trading-bot.grid.orderType', params.get('orderMode') or 'maker', 'enum', 'trading-bot.grid.limitOrder' if (params.get('orderMode') or 'maker') == 'maker' else 'trading-bot.grid.marketOrder'),
                 self._display_item('adaptiveBounds', 'trading-bot.grid.adaptiveBounds', bool(params.get('adaptiveBounds', True)), 'boolean'),
                 self._display_item('adaptiveAtrMult', 'trading-bot.grid.adaptiveAtrMult', self._to_float(params.get('adaptiveAtrMult'), 2.0), 'number'),
                 self._display_item('waterfallProtection', 'trading-bot.grid.waterfallProtection', bool(params.get('waterfallProtection', True)), 'boolean'),
                 self._display_item('waterfallDropPct', 'trading-bot.grid.waterfallDropPct', self._to_float(params.get('waterfallDropPct'), 0.03) * 100, 'percent'),
-            ]
+            ])
         elif bot_type == 'trend':
             direction = params.get('direction') or 'long'
             direction_key = {
@@ -1063,6 +1071,7 @@ class StrategyService:
                 init_cap = float(r.get('initial_capital') or 0.0)
                 current_equity = max(0.0, init_cap + m['realized_pnl'] + m['unrealized_pnl'])
                 total_pnl = m['realized_pnl'] + m['unrealized_pnl']
+                total_pnl_pct = round(total_pnl / init_cap * 100.0, 2) if init_cap > 0 else 0.0
                 out.append({
                     **r,
                     'exchange_config': ex,
@@ -1074,6 +1083,7 @@ class StrategyService:
                     'realized_pnl': m['realized_pnl'],
                     'unrealized_pnl': m['unrealized_pnl'],
                     'total_pnl': total_pnl,
+                    'total_pnl_pct': total_pnl_pct,
                     'current_equity': current_equity,
                 })
             return out
@@ -1108,6 +1118,7 @@ class StrategyService:
                 r['realized_pnl'] = rp
                 r['unrealized_pnl'] = up
                 r['total_pnl'] = rp + up
+                r['total_pnl_pct'] = round((rp + up) / init_cap * 100.0, 2) if init_cap > 0 else 0.0
                 r['current_equity'] = max(0.0, init_cap + rp + up)
             except Exception:
                 pass

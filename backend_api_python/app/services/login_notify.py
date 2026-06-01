@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import requests
 
 from app.utils.db import get_db_connection
+from app.utils.notification_display import with_display
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -70,7 +71,7 @@ def _lookup_geo(ip: str) -> Dict[str, str]:
     try:
         resp = requests.get(
             f"http://ip-api.com/json/{ip}",
-            params={"fields": "status,country,regionName,city,isp", "lang": "zh-CN"},
+            params={"fields": "status,country,regionName,city,isp", "lang": "en"},
             timeout=3,
         )
         if resp.status_code != 200:
@@ -242,25 +243,58 @@ def _send_login_alerts(
     user = get_user_service().get_user_by_id(user_id) or {}
     nickname = user.get("nickname") or user.get("username") or "User"
     location = geo.get("location") or ip_address or "—"
-    method = _action_label(action, details, zh=True)
 
     reasons: List[str] = []
     if is_new_device:
-        reasons.append("新设备")
+        reasons.append("newDevice")
     if is_new_region:
-        reasons.append("新地区")
-    reason_text = "、".join(reasons) if reasons else "异常登录"
+        reasons.append("newRegion")
+    if len(reasons) >= 2:
+        reason_key = "both"
+    elif reasons:
+        reason_key = reasons[0]
+    else:
+        reason_key = "unknown"
 
-    title = f"QuantDinger 登录提醒 · {reason_text}"
+    method = _action_label(action, details, zh=False)
+    reason_text = {
+        "newDevice": "new device",
+        "newRegion": "new region",
+        "both": "new device and region",
+    }.get(reason_key, "unusual sign-in")
+
+    title = f"QuantDinger login alert · {reason_key}"
     message = (
-        f"账号 {nickname} 于新环境登录。\n"
-        f"方式：{method}\n"
-        f"设备：{device_label}\n"
-        f"位置：{location}\n"
-        f"IP：{ip_address or '—'}\n"
-        f"如非本人操作，请立即修改密码并检查交易所 API 权限。"
+        f"Account {nickname} signed in from a new environment.\n"
+        f"Method: {method}\n"
+        f"Device: {device_label}\n"
+        f"Location: {location}\n"
+        f"IP: {ip_address or '—'}\n"
+        f"If this was not you, change your password and review exchange API permissions."
     )
-    html_message = message.replace("\n", "<br>")
+
+    alert_payload = with_display(
+        {
+            "event": "security.login",
+            "action": action,
+            "ip": ip_address,
+            "device": device_label,
+            "location": location,
+            "is_new_device": is_new_device,
+            "is_new_region": is_new_region,
+            "details": details,
+        },
+        "security.login",
+        {
+            "nickname": nickname,
+            "action": action,
+            "provider": str(details.get("provider") or "").strip(),
+            "device": device_label,
+            "location": location,
+            "ip": ip_address or "—",
+            "reasonKey": reason_key,
+        },
+    )
 
     # In-app (browser) notification
     try:
@@ -272,17 +306,8 @@ def _send_login_alerts(
             signal_type="security_login",
             channels=["browser"],
             title=title,
-            message=html_message,
-            payload={
-                "event": "security.login",
-                "action": action,
-                "ip": ip_address,
-                "device": device_label,
-                "location": location,
-                "is_new_device": is_new_device,
-                "is_new_region": is_new_region,
-                "details": details,
-            },
+            message=message,
+            payload=alert_payload,
             user_id=user_id,
         )
     except Exception as e:
@@ -303,7 +328,7 @@ def _send_login_alerts(
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
             <h2 style="color: #d4380d;">登录安全提醒</h2>
             <p>您好，{nickname}：</p>
-            <p>检测到您的 QuantDinger 账号在<strong>{reason_text}</strong>下登录：</p>
+            <p>We detected a sign-in to your QuantDinger account from a <strong>{reason_text}</strong>:</p>
             <ul>
                 <li>登录方式：{method}</li>
                 <li>设备：{device_label}</li>

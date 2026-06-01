@@ -31,12 +31,22 @@ Best for: trying QuantDinger from Cursor / Claude Code without installing
 anything; demos; research notebooks against shared datasets.
 
 1. Sign up at [ai.quantdinger.com](https://ai.quantdinger.com).
-2. Open **Sidebar → Agent Tokens** → **Issue Token**.
+2. Open **Profile → My Agent Token** → **Issue Token**.
 3. `QUANTDINGER_BASE_URL=https://ai.quantdinger.com`.
 
-The hosted instance is locked to `paper_only=true` and the **T** (Trading)
-scope is rejected at issuance — agents can read markets, manage strategies in
-your tenant, and run backtests, but never route real-money orders.
+The hosted SaaS instance allows **T** (Trading) scope for each user’s own
+tenant. Tokens are **paper-only by default**; live execution still requires
+`paper_only=false`, `ack_live_trading_risk=true` at issuance, and
+`AGENT_LIVE_TRADING_ENABLED=true` on the server.
+
+**SaaS risks (system + funds):**
+
+- **User funds:** Agent misconfiguration or prompt injection can trigger real
+  orders once live mode is enabled; a leaked token grants API access within its
+  scopes until revoked.
+- **System / multi-tenant:** Many concurrent agents stress DB pools, job workers,
+  and exchange rate limits; audit logs do not replace human review; opening T on
+  SaaS expands platform operational and compliance responsibility.
 
 ### Path B · Self-hosted (this repo) — production, private data, live trading
 
@@ -45,7 +55,7 @@ strategies/data, teams behind a VPN, or anyone who eventually wants live
 execution.
 
 1. Bring up the stack per the [root README's "Try in 2 minutes"](../../README.md#try-in-2-minutes).
-2. Log in as admin, open **Sidebar → Agent Tokens** (or `http://localhost:8888/#/agent-tokens`).
+2. Log in, open **Profile → My Agent Token** (admins may also use **Sidebar → Agent Tokens** at `/agent-tokens` for audit).
 3. `QUANTDINGER_BASE_URL=http://localhost:8888` (or your LAN URL).
 
 You decide scopes (incl. **T**), market/instrument allowlists, rate limits,

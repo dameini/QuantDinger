@@ -334,6 +334,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_positions (
     user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
     strategy_id INTEGER REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
     symbol VARCHAR(50),
+    symbol_canonical VARCHAR(50) DEFAULT '',
     side VARCHAR(10),  -- long/short
     size DECIMAL(20,8),
     entry_price DECIMAL(20,8),
@@ -343,6 +344,9 @@ CREATE TABLE IF NOT EXISTS qd_strategy_positions (
     unrealized_pnl DECIMAL(20,8) DEFAULT 0,
     pnl_percent DECIMAL(10,4) DEFAULT 0,
     equity DECIMAL(20,8) DEFAULT 0,
+    market_type VARCHAR(20) DEFAULT 'swap',
+    credential_id INTEGER DEFAULT 0,
+    inst_id VARCHAR(80) DEFAULT '',
     updated_at TIMESTAMP DEFAULT NOW(),
     UNIQUE(strategy_id, symbol, side)
 );
@@ -359,6 +363,7 @@ CREATE TABLE IF NOT EXISTS qd_strategy_trades (
     user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
     strategy_id INTEGER REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
     symbol VARCHAR(50),
+    symbol_canonical VARCHAR(50) DEFAULT '',
     type VARCHAR(30),  -- open_long, close_short, etc.
     price DECIMAL(20,8),
     amount DECIMAL(20,8),
@@ -371,13 +376,17 @@ CREATE TABLE IF NOT EXISTS qd_strategy_trades (
     grid_matched_profit DECIMAL(20,8) DEFAULT 0,
     source VARCHAR(32) DEFAULT 'local',
     exchange_id VARCHAR(50) DEFAULT '',
-    market_type VARCHAR(20) DEFAULT '',
     external_key VARCHAR(255) DEFAULT '',
     exchange_order_id VARCHAR(120) DEFAULT '',
     client_order_id VARCHAR(120) DEFAULT '',
     exchange_trade_id VARCHAR(120) DEFAULT '',
     attribution_status VARCHAR(32) DEFAULT 'strategy',
     raw_exchange_json TEXT DEFAULT '',
+    market_type VARCHAR(20) DEFAULT 'swap',
+    credential_id INTEGER DEFAULT 0,
+    inst_id VARCHAR(80) DEFAULT '',
+    fill_source VARCHAR(32) DEFAULT '',
+    pending_order_id INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT NOW()
 );
 
@@ -389,6 +398,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_trades_user_external_key
     WHERE external_key IS NOT NULL AND external_key <> '';
 CREATE INDEX IF NOT EXISTS idx_strategy_trades_exchange_lookup
     ON qd_strategy_trades(user_id, exchange_id, market_type, symbol, attribution_status, created_at);
+CREATE INDEX IF NOT EXISTS idx_trades_strategy_symbol_canon ON qd_strategy_trades (strategy_id, market_type, symbol_canonical);
+CREATE INDEX IF NOT EXISTS idx_positions_strategy_leg ON qd_strategy_positions (strategy_id, market_type, symbol_canonical, side);
+
+-- L1 account position mirror (exchange truth per credential + inst_id + side)
+CREATE TABLE IF NOT EXISTS qd_account_positions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
+    credential_id INTEGER NOT NULL DEFAULT 0,
+    exchange_id VARCHAR(40) NOT NULL DEFAULT '',
+    market_type VARCHAR(20) NOT NULL DEFAULT 'swap',
+    inst_id VARCHAR(80) NOT NULL DEFAULT '',
+    symbol VARCHAR(50) NOT NULL DEFAULT '',
+    side VARCHAR(10) NOT NULL DEFAULT '',
+    size DECIMAL(24, 8) NOT NULL DEFAULT 0,
+    entry_price DECIMAL(24, 8) DEFAULT 0,
+    mark_price DECIMAL(24, 8) DEFAULT 0,
+    unrealized_pnl DECIMAL(24, 8) DEFAULT 0,
+    raw_json JSONB DEFAULT '{}'::jsonb,
+    synced_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (credential_id, market_type, inst_id, side)
+);
+CREATE INDEX IF NOT EXISTS idx_account_pos_user ON qd_account_positions(user_id);
+CREATE INDEX IF NOT EXISTS idx_account_pos_cred ON qd_account_positions(credential_id, market_type);
 
 -- Grid cell ladder state (P2). Pre-placed limit orders / user-stream driven
 -- fills will land here; today only the scaffolding lives in code (see
@@ -410,6 +442,30 @@ CREATE TABLE IF NOT EXISTS qd_grid_cells (
 );
 CREATE INDEX IF NOT EXISTS idx_grid_cells_strategy ON qd_grid_cells(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_grid_cells_state ON qd_grid_cells(strategy_id, state);
+
+CREATE TABLE IF NOT EXISTS qd_grid_resting_orders (
+    id SERIAL PRIMARY KEY,
+    strategy_id INTEGER NOT NULL REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
+    symbol VARCHAR(50) NOT NULL,
+    cell_index INTEGER NOT NULL DEFAULT 0,
+    purpose VARCHAR(24) NOT NULL,
+    side VARCHAR(8) NOT NULL,
+    pos_side VARCHAR(8) NOT NULL DEFAULT '',
+    reduce_only BOOLEAN NOT NULL DEFAULT FALSE,
+    price DECIMAL(24, 8) NOT NULL,
+    quantity DECIMAL(24, 8) NOT NULL DEFAULT 0,
+    quote_amount DECIMAL(24, 8) NOT NULL DEFAULT 0,
+    client_order_id VARCHAR(64) NOT NULL DEFAULT '',
+    exchange_order_id VARCHAR(64) NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    filled_quantity DECIMAL(24, 8) NOT NULL DEFAULT 0,
+    avg_fill_price DECIMAL(24, 8) NOT NULL DEFAULT 0,
+    processed_fill_qty DECIMAL(24, 8) NOT NULL DEFAULT 0,
+    extra JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_grid_resting_strategy ON qd_grid_resting_orders(strategy_id, status);
 
 -- =============================================================================
 -- 5. Pending Orders Queue
@@ -1016,7 +1072,6 @@ ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS matched_entry_price DECI
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS grid_matched_profit DECIMAL(20,8) DEFAULT 0;
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS source VARCHAR(32) DEFAULT 'local';
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS exchange_id VARCHAR(50) DEFAULT '';
-ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) DEFAULT '';
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS external_key VARCHAR(255) DEFAULT '';
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS exchange_order_id VARCHAR(120) DEFAULT '';
 ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS client_order_id VARCHAR(120) DEFAULT '';
@@ -1028,6 +1083,39 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_strategy_trades_user_external_key
     WHERE external_key IS NOT NULL AND external_key <> '';
 CREATE INDEX IF NOT EXISTS idx_strategy_trades_exchange_lookup
     ON qd_strategy_trades(user_id, exchange_id, market_type, symbol, attribution_status, created_at);
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) DEFAULT 'swap';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS credential_id INTEGER DEFAULT 0;
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS inst_id VARCHAR(80) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS symbol_canonical VARCHAR(50) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS fill_source VARCHAR(32) DEFAULT '';
+ALTER TABLE qd_strategy_trades ADD COLUMN IF NOT EXISTS pending_order_id INTEGER DEFAULT 0;
+ALTER TABLE qd_strategy_positions ADD COLUMN IF NOT EXISTS market_type VARCHAR(20) DEFAULT 'swap';
+ALTER TABLE qd_strategy_positions ADD COLUMN IF NOT EXISTS credential_id INTEGER DEFAULT 0;
+ALTER TABLE qd_strategy_positions ADD COLUMN IF NOT EXISTS inst_id VARCHAR(80) DEFAULT '';
+ALTER TABLE qd_strategy_positions ADD COLUMN IF NOT EXISTS symbol_canonical VARCHAR(50) DEFAULT '';
+ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS credential_id INTEGER DEFAULT 0;
+ALTER TABLE pending_orders ADD COLUMN IF NOT EXISTS inst_id VARCHAR(80) DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_trades_strategy_symbol_canon ON qd_strategy_trades (strategy_id, market_type, symbol_canonical);
+CREATE INDEX IF NOT EXISTS idx_positions_strategy_leg ON qd_strategy_positions (strategy_id, market_type, symbol_canonical, side);
+CREATE TABLE IF NOT EXISTS qd_account_positions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
+    credential_id INTEGER NOT NULL DEFAULT 0,
+    exchange_id VARCHAR(40) NOT NULL DEFAULT '',
+    market_type VARCHAR(20) NOT NULL DEFAULT 'swap',
+    inst_id VARCHAR(80) NOT NULL DEFAULT '',
+    symbol VARCHAR(50) NOT NULL DEFAULT '',
+    side VARCHAR(10) NOT NULL DEFAULT '',
+    size DECIMAL(24, 8) NOT NULL DEFAULT 0,
+    entry_price DECIMAL(24, 8) DEFAULT 0,
+    mark_price DECIMAL(24, 8) DEFAULT 0,
+    unrealized_pnl DECIMAL(24, 8) DEFAULT 0,
+    raw_json JSONB DEFAULT '{}'::jsonb,
+    synced_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (credential_id, market_type, inst_id, side)
+);
+CREATE INDEX IF NOT EXISTS idx_account_pos_user ON qd_account_positions(user_id);
+CREATE INDEX IF NOT EXISTS idx_account_pos_cred ON qd_account_positions(credential_id, market_type);
 
 -- =============================================================================
 -- 21. Indicator Community Tables

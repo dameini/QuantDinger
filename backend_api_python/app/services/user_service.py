@@ -626,7 +626,43 @@ class UserService:
             logger.error(f"delete_user failed: {e}")
             return False
     
-    def list_users(self, page: int = 1, page_size: int = 20, search: str = None) -> Dict[str, Any]:
+    @staticmethod
+    def _build_user_list_filter(search: str = None, user_id: int = None) -> tuple:
+        """WHERE clause + params for admin user list (supports exact user id)."""
+        clauses = []
+        params = []
+        if user_id is not None:
+            try:
+                uid = int(user_id)
+            except (TypeError, ValueError):
+                uid = 0
+            if uid > 0:
+                clauses.append("id = ?")
+                params.append(uid)
+        if search and str(search).strip():
+            raw = str(search).strip()
+            like_val = f"%{raw}%"
+            parts = ["username ILIKE ?", "email ILIKE ?", "nickname ILIKE ?"]
+            part_params = [like_val, like_val, like_val]
+            if raw.isdigit():
+                parts.extend(["id = ?", "CAST(id AS TEXT) ILIKE ?"])
+                part_params.extend([int(raw), f"%{raw}%"])
+            else:
+                parts.append("CAST(id AS TEXT) ILIKE ?")
+                part_params.append(f"%{raw}%")
+            clauses.append("(" + " OR ".join(parts) + ")")
+            params.extend(part_params)
+        if not clauses:
+            return "", []
+        return "WHERE " + " AND ".join(clauses), params
+
+    def list_users(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        search: str = None,
+        user_id: int = None,
+    ) -> Dict[str, Any]:
         """List all users with pagination and optional search"""
         offset = (page - 1) * page_size
         
@@ -634,13 +670,7 @@ class UserService:
             with get_db_connection() as db:
                 cur = db.cursor()
                 
-                # Build WHERE clause for search
-                where_clause = ""
-                params = []
-                if search and search.strip():
-                    search_term = f"%{search.strip()}%"
-                    where_clause = "WHERE username LIKE ? OR email LIKE ? OR nickname LIKE ?"
-                    params = [search_term, search_term, search_term]
+                where_clause, params = self._build_user_list_filter(search, user_id)
                 
                 # Get total count
                 count_sql = f"SELECT COUNT(*) as count FROM qd_users {where_clause}"
@@ -701,18 +731,13 @@ class UserService:
             logger.error(f"list_users failed: {e}")
             return {'items': [], 'total': 0, 'page': 1, 'page_size': page_size, 'total_pages': 0}
 
-    def list_all_users_for_export(self, search: str = None) -> List[Dict[str, Any]]:
+    def list_all_users_for_export(self, search: str = None, user_id: int = None) -> List[Dict[str, Any]]:
         """List all users for export with the same fields as the admin user table."""
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
 
-                where_clause = ""
-                params = []
-                if search and search.strip():
-                    search_term = f"%{search.strip()}%"
-                    where_clause = "WHERE username LIKE ? OR email LIKE ? OR nickname LIKE ?"
-                    params = [search_term, search_term, search_term]
+                where_clause, params = self._build_user_list_filter(search, user_id)
 
                 query_sql = f"""
                     SELECT id, username, email, nickname, avatar, status, role,

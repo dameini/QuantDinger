@@ -49,6 +49,31 @@ def _coerce_bool(value: Any, default: bool = False) -> bool:
     return bool(default)
 
 
+def _kline_boundary_poll_offset_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("KLINE_BOUNDARY_POLL_OFFSET_SEC", "2")))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def next_kline_boundary_poll_ts(
+    now_ts: float,
+    timeframe_seconds: int,
+    offset_sec: Optional[float] = None,
+) -> float:
+    """
+    Next wall-clock time to poll K-lines: just after the upcoming bar close.
+
+    Bars are aligned to Unix epoch buckets (matches crypto exchange 30m/1H grids).
+    Example for 30m + 2s offset: … 17:00:02, 17:30:02, 18:00:02 …
+    """
+    tf = max(1, int(timeframe_seconds or 60))
+    offset = _kline_boundary_poll_offset_sec() if offset_sec is None else max(0.0, float(offset_sec))
+    ts = float(now_ts)
+    next_close = (int(ts) // tf + 1) * tf
+    return next_close + offset
+
+
 def normalize_trading_execution_modes(trading_config: Optional[Dict[str, Any]]) -> None:
     """
     Align live execution knobs with the UI ``strict_mode`` toggle.
@@ -105,6 +130,8 @@ class TradingExecutor:
         self.max_threads = int(os.getenv('STRATEGY_MAX_THREADS', '64'))
         # 最近一次 start_strategy(False) 的原因（供 API 返回给用户）
         self._last_start_failure: str = ""
+        # 线程退出原因（供启动后健康检查返回给用户）
+        self._last_exit_reason: Dict[int, str] = {}
 
         # Per-strategy exchange fee-rate cache: {strategy_id: {"maker": float, "taker": float}}
         self._exchange_fee_cache: Dict[int, Optional[Dict[str, float]]] = {}
@@ -165,6 +192,12 @@ class TradingExecutor:
                 cursor.close()
         except Exception as e:
             logger.error(f"Failed to check/ensure DB columns: {str(e)}")
+        try:
+            from app.services.live_trading.records import ensure_position_ledger_schema
+
+            ensure_position_ledger_schema()
+        except Exception as e:
+            logger.warning("ensure_position_ledger_schema failed: %s", e)
 
     def _normalize_trade_symbol(self, exchange: Any, symbol: str, market_type: str, exchange_id: str) -> str:
         """
@@ -598,6 +631,69 @@ class TradingExecutor:
             logger.error(f"Failed to start strategy {strategy_id}: {str(e)}")
             logger.error(traceback.format_exc())
             return False
+
+    def _fetch_recent_strategy_log_hint(self, strategy_id: int) -> str:
+        """Best-effort: read recent runtime log for start-failure diagnosis."""
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT message FROM qd_strategy_logs
+                    WHERE strategy_id = %s
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 8
+                    """,
+                    (int(strategy_id),),
+                )
+                rows = cur.fetchall() or []
+                cur.close()
+            skip = {
+                "strategy execution thread started",
+                "strategy execution loop exited",
+            }
+            for row in rows:
+                msg = str((row or {}).get("message") or "").strip()
+                if not msg:
+                    continue
+                low = msg.lower()
+                if low in skip:
+                    continue
+                if "auto-stopped:" in low:
+                    return msg.split(":", 1)[-1].strip()[:500]
+                return msg[:500]
+        except Exception:
+            pass
+        return ""
+
+    def wait_strategy_running(self, strategy_id: int, timeout: float = 3.0) -> Tuple[bool, str]:
+        """
+        Poll briefly after start_strategy() to catch threads that exit during init.
+        Returns (still_running, hint_if_not).
+        """
+        sid = int(strategy_id)
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        while time.monotonic() < deadline:
+            with self.lock:
+                th = self.running_strategies.get(sid)
+                alive = th is not None and th.is_alive()
+            if not alive:
+                reason = (self._last_exit_reason.pop(sid, None) or "").strip()
+                if not reason:
+                    reason = self._fetch_recent_strategy_log_hint(sid)
+                return False, reason or (
+                    "执行线程已退出（常见：策略脚本/指标为空、K线拉取失败、类型不支持实盘）"
+                )
+            time.sleep(0.25)
+        with self.lock:
+            th = self.running_strategies.get(sid)
+            alive = th is not None and th.is_alive()
+        if alive:
+            return True, ""
+        reason = (self._last_exit_reason.pop(sid, None) or "").strip()
+        if not reason:
+            reason = self._fetch_recent_strategy_log_hint(sid)
+        return False, reason or "执行线程已退出"
     
     def stop_strategy(self, strategy_id: int) -> bool:
         """
@@ -626,6 +722,13 @@ class TradingExecutor:
                 if had_thread:
                     del self.running_strategies[strategy_id]
                     self._exchange_fee_cache.pop(strategy_id, None)
+                    try:
+                        from app.services.grid.runner import get_runner
+                        gr = get_runner(strategy_id)
+                        if gr:
+                            gr.shutdown()
+                    except Exception:
+                        pass
                     logger.info(f"Strategy {strategy_id} stopped")
                     self._console_print(f"[strategy:{strategy_id}] stopped (requested)")
                     append_strategy_log(strategy_id, "info", "Strategy stop requested (run flag cleared)")
@@ -724,10 +827,19 @@ class TradingExecutor:
         """Fill missing grid legs from the exchange when local DB snapshot is empty."""
         if db_had_long and db_had_short:
             return
-        ex_cfg = trading_config.get("exchange_config") or {}
-        if not isinstance(ex_cfg, dict) or not (
-            ex_cfg.get("api_key") or ex_cfg.get("apiKey")
-        ):
+        try:
+            from app.services.exchange_execution import load_strategy_configs, resolve_exchange_config
+
+            sc = load_strategy_configs(int(strategy_id))
+            raw_ex = trading_config.get("exchange_config") or sc.get("exchange_config") or {}
+            ex_cfg = resolve_exchange_config(
+                raw_ex if isinstance(raw_ex, dict) else {},
+                user_id=int(sc.get("user_id") or 1),
+            )
+        except Exception as e:
+            logger.warning("Grid exchange hydrate resolve failed for sid=%s: %s", strategy_id, e)
+            return
+        if not isinstance(ex_cfg, dict) or not (ex_cfg.get("api_key") or ex_cfg.get("apiKey")):
             return
         market_type = str(trading_config.get("market_type") or "swap").strip().lower()
         try:
@@ -846,6 +958,134 @@ class TradingExecutor:
 
     def _bot_type_key(self, trading_config: Optional[Dict[str, Any]]) -> str:
         return str((trading_config or {}).get("bot_type") or "").strip().lower()
+
+    def _is_live_grid_resting(
+        self,
+        trading_config: Optional[Dict[str, Any]],
+        execution_mode: str,
+        market_category: str = "Crypto",
+    ) -> bool:
+        """Live grid bots always use the resting limit-order engine."""
+        if str(execution_mode or "").strip().lower() != "live":
+            return False
+        if self._bot_type_key(trading_config) != "grid":
+            return False
+        mc = str(market_category or "Crypto").strip()
+        return mc in ("Crypto", "Forex", "Futures")
+
+    def _grid_enqueue_market(
+        self,
+        strategy_id: int,
+        symbol: str,
+        signal_type: str,
+        usdt_amount: float,
+        price: float,
+        reason: str,
+        *,
+        trading_config: Dict[str, Any],
+        execution_mode: str,
+        market_type: str,
+        market_category: str,
+        leverage: float,
+        notification_config: Dict[str, Any],
+        kline_exchange_id: Optional[str],
+    ) -> bool:
+        try:
+            lev = float(leverage or 1.0)
+            qty = (float(usdt_amount or 0) * lev / float(price)) if price > 0 and market_type != "spot" else (float(usdt_amount or 0) / float(price) if price > 0 else 0)
+            if signal_type.startswith("close_"):
+                qty = 0
+            bp = trading_config if isinstance(trading_config, dict) else {}
+            order_mode = str(bp.get("order_mode") or (bp.get("bot_params") or {}).get("orderMode") or "market")
+            res = self._execute_exchange_order(
+                exchange=None,
+                strategy_id=strategy_id,
+                symbol=symbol,
+                signal_type=signal_type,
+                amount=qty if not signal_type.startswith("close_") else 0,
+                ref_price=float(price or 0),
+                market_type=market_type,
+                market_category=market_category,
+                leverage=lev,
+                execution_mode=execution_mode,
+                notification_config=notification_config,
+                signal_reason=reason,
+                signal_ts=int(time.time()),
+                price_exchange_id=kline_exchange_id,
+                order_mode=order_mode if order_mode != "maker" else "market",
+            )
+            return bool(res and res.get("success"))
+        except Exception as e:
+            logger.warning("grid enqueue market sid=%s: %s", strategy_id, e)
+            return False
+
+    def _setup_grid_resting_runner(
+        self,
+        strategy_id: int,
+        symbol: str,
+        trading_config: Dict[str, Any],
+        exchange_config: Dict[str, Any],
+        *,
+        user_id: int = 1,
+        initial_capital: float,
+        execution_mode: str,
+        market_type: str,
+        market_category: str,
+        leverage: float,
+        notification_config: Dict[str, Any],
+        kline_exchange_id: Optional[str],
+    ):
+        from app.services.grid.runner import GridRestingRunner
+        from app.services.exchange_execution import resolve_exchange_config
+        from app.services.live_trading.factory import create_client
+
+        ex_cfg = resolve_exchange_config(
+            exchange_config if isinstance(exchange_config, dict) else {},
+            user_id=int(user_id or 1),
+        )
+        mt = str(market_type or "swap")
+
+        def _create_client():
+            return create_client(ex_cfg, market_type=mt)
+
+        def _enqueue(sig: str, usdt: float, px: float, reason: str) -> bool:
+            return self._grid_enqueue_market(
+                strategy_id,
+                symbol,
+                sig,
+                usdt,
+                px,
+                reason,
+                trading_config=trading_config,
+                execution_mode=execution_mode,
+                market_type=mt,
+                market_category=market_category,
+                leverage=leverage,
+                notification_config=notification_config,
+                kline_exchange_id=kline_exchange_id,
+            )
+
+        def _risk_exits(px: float):
+            return self._grid_bot_risk_exits(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                current_price=float(px),
+                trading_config=trading_config,
+                timeframe_seconds=60,
+                initial_capital=float(initial_capital or 0),
+            )
+
+        return GridRestingRunner(
+            strategy_id,
+            symbol,
+            trading_config,
+            ex_cfg,
+            user_id=int(user_id or 1),
+            initial_capital=float(initial_capital or 0),
+            enqueue_market_fn=_enqueue,
+            create_client_fn=_create_client,
+            risk_exit_fn=_risk_exits,
+        )
 
     def _bot_has_market_guards(self, trading_config: Optional[Dict[str, Any]]) -> bool:
         return self._bot_type_key(trading_config) in ("grid", "martingale")
@@ -1221,6 +1461,35 @@ class TradingExecutor:
         for log in logs:
             append_strategy_log(strategy_id, "info", log)
 
+    def _maybe_log_bar_close_ui(
+        self,
+        strategy_id: int,
+        *,
+        symbol: str,
+        timeframe: str,
+        close_price: float,
+        pending_count: int,
+        bar_ts: int,
+    ) -> None:
+        """One UI log line per closed bar so users can see the loop is alive."""
+        try:
+            sid = int(strategy_id)
+            ts = int(bar_ts or 0)
+            if ts <= 0:
+                return
+            last = self._strategy_ui_log_last_tick_ts.get(sid, 0)
+            if ts <= last:
+                return
+            self._strategy_ui_log_last_tick_ts[sid] = ts
+            append_strategy_log(
+                sid,
+                "info",
+                f"Bar closed {symbol} {timeframe} close={float(close_price or 0):.6f} "
+                f"pending_signals={int(pending_count or 0)}",
+            )
+        except Exception:
+            pass
+
     def _script_evaluate_in_progress_bar(
         self,
         df: pd.DataFrame,
@@ -1456,6 +1725,12 @@ class TradingExecutor:
             except Exception as e:
                 logger.warning("position protection failed for strategy %s: %s", strategy_id, e)
 
+        def _abort_loop(reason: str) -> None:
+            nonlocal exit_reason
+            exit_reason = reason
+            logger.error(f"Strategy {strategy_id} abort: {reason}")
+            _set_db_stopped_best_effort(reason)
+
         def _is_fatal_error(err: Exception, msg: str) -> bool:
             # Config errors from data sources should stop immediately.
             if isinstance(err, UnsupportedMarketError):
@@ -1498,15 +1773,17 @@ class TradingExecutor:
             return False
 
         try:
+            grid_resting_runner = None
+            use_grid_resting = False
             # 加载策略配置
             strategy = self._load_strategy(strategy_id)
             if not strategy:
-                logger.error(f"Strategy {strategy_id} not found")
+                _abort_loop("strategy not found")
                 return
             
             stype = strategy.get('strategy_type') or ''
             if stype not in ('IndicatorStrategy', 'ScriptStrategy'):
-                logger.error(f"Strategy {strategy_id} has unsupported strategy_type for realtime execution: {stype}")
+                _abort_loop(f"unsupported strategy_type for realtime execution: {stype or '(empty)'}")
                 return
             is_script = stype == 'ScriptStrategy'
 
@@ -1557,7 +1834,7 @@ class TradingExecutor:
             # 获取市场类型，严格以策略配置为准，不再通过杠杆反推。
             market_type = trading_config.get('market_type', 'swap')
             if market_type not in ['swap', 'spot']:
-                logger.error(f"Strategy {strategy_id} invalid market_type={market_type} (only swap/spot supported); refusing to start")
+                _abort_loop(f"invalid market_type={market_type} (only swap/spot supported)")
                 return
             if market_type == 'swap':
                 # 合约市场统一使用 swap（永续），避免 futures/delivery 混淆导致持仓/下单查错市场
@@ -1604,7 +1881,7 @@ class TradingExecutor:
             if is_script:
                 strategy_code = (strategy.get('strategy_code') or '').strip()
                 if not strategy_code:
-                    logger.error(f"Strategy {strategy_id} strategy_code is empty")
+                    _abort_loop("strategy_code is empty")
                     return
                 if '\\n' in strategy_code and '\n' not in strategy_code:
                     try:
@@ -1619,7 +1896,7 @@ class TradingExecutor:
                 try:
                     on_init_script, on_bar_script = compile_strategy_script_handlers(strategy_code)
                 except Exception as e:
-                    logger.error(f"Strategy {strategy_id} script compile failed: {e}")
+                    _abort_loop(f"script compile failed: {e}")
                     logger.error(traceback.format_exc())
                     return
             else:
@@ -1629,7 +1906,7 @@ class TradingExecutor:
                 if not indicator_code and indicator_id:
                     indicator_code = self._get_indicator_code_from_db(indicator_id)
                 if not indicator_code:
-                    logger.error(f"Strategy {strategy_id} indicator_code is empty")
+                    _abort_loop("indicator_code is empty")
                     return
                 if not isinstance(indicator_code, str):
                     indicator_code = str(indicator_code)
@@ -1655,6 +1932,23 @@ class TradingExecutor:
                         trading_config["trade_direction"] = td
                     strategy["trading_config"] = trading_config
 
+            # Resolve credential references before any strategy branch (grid / bots / cross-sectional).
+            exchange_config = strategy.get('exchange_config') or {}
+            try:
+                from app.services.exchange_execution import resolve_exchange_config
+
+                exchange_config = resolve_exchange_config(
+                    exchange_config if isinstance(exchange_config, dict) else {},
+                    user_id=int(strategy_user_id or strategy.get('user_id') or 1),
+                )
+                strategy['exchange_config'] = exchange_config
+            except Exception as e:
+                logger.warning(f"Strategy {strategy_id} resolve exchange_config failed: {e}")
+            if isinstance(trading_config, dict):
+                trading_config.setdefault('execution_mode', execution_mode)
+                if exchange_config:
+                    trading_config['exchange_config'] = exchange_config
+
             # Check if this is a cross-sectional strategy（仅指标策略支持）
             cs_strategy_type = trading_config.get('cs_strategy_type', 'single')
             if (not is_script) and cs_strategy_type == 'cross_sectional':
@@ -1667,24 +1961,19 @@ class TradingExecutor:
                 return
 
             if is_script and cs_strategy_type == 'cross_sectional':
-                logger.error(f"Strategy {strategy_id} ScriptStrategy does not support cross_sectional mode")
+                _abort_loop("ScriptStrategy does not support cross_sectional mode")
                 return
 
             # 初始化交易所连接（信号模式下无需真实连接）
             exchange = None
 
-            # Best-effort: query the real fee tier from the exchange (cached per strategy)
-            exchange_config = strategy.get('exchange_config') or {}
-            if isinstance(trading_config, dict):
-                trading_config.setdefault('execution_mode', execution_mode)
-                if exchange_config:
-                    trading_config.setdefault('exchange_config', exchange_config)
             kline_exchange_id, kline_market_type = self._live_crypto_kline_params(
                 market_category=market_category,
                 market_type=market_type,
                 execution_mode=execution_mode,
                 exchange_config=exchange_config,
                 trading_config=trading_config,
+                user_id=int(strategy_user_id or strategy.get('user_id') or 1),
             )
             self._log_crypto_kline_source(
                 strategy_id, market_category, execution_mode, kline_exchange_id, kline_market_type
@@ -1705,20 +1994,14 @@ class TradingExecutor:
                 exchange_id=kline_exchange_id, market_type=kline_market_type,
             )
             if not klines or len(klines) < 2:
-                logger.error(f"Strategy {strategy_id} failed to fetch K-lines")
-                exit_reason = "failed to fetch K-lines during init"
-                logger.error(f"Strategy {strategy_id} {exit_reason}")
-                _set_db_stopped_best_effort(exit_reason)
+                _abort_loop("failed to fetch K-lines (need at least 2 bars)")
                 return
             logger.info(rf'Strategy {strategy_id} history kline number: {len(klines)}')
             
             # 转换为DataFrame
             df = self._klines_to_dataframe(klines)
             if len(df) == 0:
-                logger.error(f"Strategy {strategy_id} K-lines are empty after normalization")
-                exit_reason = "K-lines empty after normalization during init"
-                logger.error(f"Strategy {strategy_id} {exit_reason}")
-                _set_db_stopped_best_effort(exit_reason)
+                _abort_loop("K-lines are empty after normalization")
                 return
 
             # ============================================
@@ -1815,7 +2098,7 @@ class TradingExecutor:
                     initial_last_add_price=initial_last_add_price
                 )
                 if indicator_result is None:
-                    logger.error(f"Strategy {strategy_id} indicator execution failed")
+                    _abort_loop("indicator execution failed")
                     return
                 pending_signals = indicator_result.get('pending_signals', [])
                 last_kline_time = indicator_result.get('last_kline_time', 0)
@@ -1825,6 +2108,48 @@ class TradingExecutor:
             logger.info(f"Strategy {strategy_id} initialized; pending_signals={len(pending_signals)}")
             if pending_signals:
                 logger.info(f"Initial signals: {pending_signals}")
+
+            grid_resting_runner = None
+            use_grid_resting = self._is_live_grid_resting(trading_config, execution_mode, market_category)
+            if self._bot_type_key(trading_config) == "grid" and execution_mode == "live" and not use_grid_resting:
+                _abort_loop(
+                    f"Live grid requires resting engine; unsupported market_category={market_category}"
+                )
+                return
+            if use_grid_resting:
+                try:
+                    init_px = float(df['close'].iloc[-1]) if df is not None and len(df) > 0 else 0.0
+                    grid_resting_runner = self._setup_grid_resting_runner(
+                        strategy_id,
+                        symbol,
+                        trading_config,
+                        exchange_config,
+                        user_id=int(strategy_user_id or strategy.get('user_id') or 1),
+                        initial_capital=initial_capital,
+                        execution_mode=execution_mode,
+                        market_type=market_type,
+                        market_category=market_category,
+                        leverage=leverage,
+                        notification_config=notification_config,
+                        kline_exchange_id=kline_exchange_id,
+                    )
+                    ok_gr, err_gr = grid_resting_runner.startup(init_px, bars_df=df)
+                    if not ok_gr:
+                        _abort_loop(f"grid resting startup failed: {err_gr}")
+                        return
+                    if grid_resting_runner.should_stop:
+                        _abort_loop("Grid auto-stopped during startup: exchange error")
+                        return
+                    pending_signals = []
+                    append_strategy_log(
+                        strategy_id,
+                        "info",
+                        f"Grid resting live active on {symbol} (limit orders + fill poller)",
+                    )
+                except Exception as e:
+                    _abort_loop(f"grid resting setup failed: {e}")
+                    return
+
             append_strategy_log(
                 strategy_id,
                 "info",
@@ -1849,27 +2174,41 @@ class TradingExecutor:
                 env_tick = 10
 
             _bot_type_for_tick = str((trading_config or {}).get('bot_type') or '').strip().lower()
-            tick_interval_sec = None
-            try:
-                tc_override = (trading_config or {}).get('tick_interval_sec')
-                if tc_override is not None:
-                    tick_interval_sec = int(tc_override)
-            except Exception:
+            # Grid bots use a fixed server-side tick (price-driven); not user-configurable.
+            if _bot_type_for_tick == 'grid':
+                try:
+                    tick_interval_sec = max(1, int(os.getenv('GRID_STRATEGY_TICK_SEC', '1')))
+                except Exception:
+                    tick_interval_sec = 1
+            else:
                 tick_interval_sec = None
-            if tick_interval_sec is None and _bot_type_for_tick in ('grid', 'dca'):
-                tick_interval_sec = 1
-            if tick_interval_sec is None:
-                tick_interval_sec = env_tick
+                try:
+                    tc_override = (trading_config or {}).get('tick_interval_sec')
+                    if tc_override is not None:
+                        tick_interval_sec = int(tc_override)
+                except Exception:
+                    tick_interval_sec = None
+                if tick_interval_sec is None and _bot_type_for_tick == 'dca':
+                    tick_interval_sec = 1
+                if tick_interval_sec is None:
+                    tick_interval_sec = env_tick
             if tick_interval_sec < 1:
                 tick_interval_sec = 1
 
             last_tick_time = 0.0
-            last_kline_update_time = time.time()
-            
+
             # 计算K线周期（秒）
             from app.data_sources.base import TIMEFRAME_SECONDS
             timeframe_seconds = TIMEFRAME_SECONDS.get(timeframe, 3600)
-            kline_update_interval = timeframe_seconds  # 每个K线周期更新一次
+
+            kline_poll_offset = _kline_boundary_poll_offset_sec()
+            next_kline_poll_at = next_kline_boundary_poll_ts(
+                time.time(), timeframe_seconds, kline_poll_offset,
+            )
+            logger.info(
+                f"Strategy {strategy_id} K-line poll aligned to bar boundaries "
+                f"(tf={timeframe}, offset={kline_poll_offset}s, next={datetime.fromtimestamp(next_kline_poll_at).isoformat()})"
+            )
             
             while True:
                 try:
@@ -1918,89 +2257,158 @@ class TradingExecutor:
                         continue
 
                     # ============================================
-                    # 2. 检查是否需要更新K线（每个K线周期更新一次，从API拉取）
+                    # 2. 检查是否需要更新K线（对齐 K 线周期边界 + 小偏移后拉取）
                     # ============================================
-                    if current_time - last_kline_update_time >= kline_update_interval:
+                    if current_time >= next_kline_poll_at:
                         klines = self._fetch_latest_kline(
                             symbol, timeframe, limit=history_limit, market_category=market_category,
                             exchange_id=kline_exchange_id, market_type=kline_market_type,
                         )
-                        if klines and len(klines) >= 2:
-                            df = self._klines_to_dataframe(klines)
-                            if len(df) > 0:
-                                if is_script:
-                                    new_sig, last_script_closed_ts = self._script_evaluate_new_closed_bar(
-                                        df, script_ctx, on_bar_script, trade_direction,
-                                        last_script_closed_ts, strategy_id, symbol, trading_config,
-                                    )
-                                    pending_signals = new_sig
-                                    if not strict_mode:
-                                        try:
-                                            rt_df = self._update_dataframe_with_current_price(
-                                                df.copy(), current_price, timeframe,
-                                            )
-                                            ip_sig = self._script_evaluate_in_progress_bar(
-                                                rt_df, script_ctx, on_bar_script, trade_direction,
-                                                strategy_id, symbol, trading_config,
-                                            )
-                                            if ip_sig:
-                                                pending_signals = ip_sig
-                                        except Exception as e:
-                                            logger.warning(
-                                                f"Strategy {strategy_id} script kline in-progress eval failed: {e}"
-                                            )
-                                    try:
-                                        last_kline_time = int(df.index[-1].timestamp())
-                                    except Exception:
-                                        last_kline_time = int(time.time())
-                                    last_kline_update_time = current_time
-                                else:
-                                    current_pos_list = self._get_current_positions(strategy_id, symbol)
-                                    initial_highest = 0.0
-                                    initial_position = 0
-                                    initial_avg_entry_price = 0.0
-                                    initial_position_count = 0
-                                    initial_last_add_price = 0.0
-
-                                    if current_pos_list:
-                                        pos = current_pos_list[0]
-                                        initial_highest = float(pos.get('highest_price', 0) or 0)
-                                        pos_side = pos.get('side', 'long')
-                                        initial_position = 1 if pos_side == 'long' else -1
-                                        initial_avg_entry_price = float(pos.get('entry_price', 0) or 0)
-                                        initial_position_count = 1
-                                        initial_last_add_price = initial_avg_entry_price
-
-                                    indicator_result = self._execute_indicator_with_prices(
-                                        indicator_code, df, trading_config,
-                                        initial_highest_price=initial_highest,
-                                        initial_position=initial_position,
-                                        initial_avg_entry_price=initial_avg_entry_price,
-                                        initial_position_count=initial_position_count,
-                                        initial_last_add_price=initial_last_add_price
-                                    )
-                                    if indicator_result:
-                                        pending_signals = indicator_result.get('pending_signals', [])
-                                        last_kline_time = indicator_result.get('last_kline_time', 0)
-                                        new_hp = indicator_result.get('new_highest_price', 0)
-
-                                        last_kline_update_time = current_time
-
-                                        if new_hp > 0 and current_pos_list:
-                                            current_close = float(df['close'].iloc[-1])
-                                            for p in current_pos_list:
-                                                self._update_position(
-                                                    strategy_id, p['symbol'], p['side'],
-                                                    float(p['size']), float(p['entry_price']),
-                                                    current_close,
-                                                    highest_price=new_hp
+                        try:
+                            if klines and len(klines) >= 2:
+                                df = self._klines_to_dataframe(klines)
+                                if len(df) > 0:
+                                    if is_script:
+                                        if use_grid_resting and grid_resting_runner is not None:
+                                            try:
+                                                bar_h = float(df['high'].iloc[-1])
+                                                bar_l = float(df['low'].iloc[-1])
+                                                grid_resting_runner.tick(
+                                                    float(current_price),
+                                                    high=bar_h,
+                                                    low=bar_l,
+                                                    bars_df=df,
+                                                    is_closed_bar=True,
                                                 )
+                                            except Exception as e:
+                                                logger.warning(
+                                                    f"Strategy {strategy_id} grid resting kline tick error: {e}"
+                                                )
+                                            pending_signals = []
+                                            if grid_resting_runner.should_stop:
+                                                exit_reason = "Grid auto-stopped: exchange error"
+                                                logger.error(f"Strategy {strategy_id} {exit_reason}")
+                                                _set_db_stopped_best_effort(exit_reason)
+                                                break
+                                            try:
+                                                last_kline_time = int(df.index[-1].timestamp())
+                                            except Exception:
+                                                last_kline_time = int(time.time())
+                                        elif self._bot_type_key(trading_config) != "grid":
+                                            new_sig, last_script_closed_ts = self._script_evaluate_new_closed_bar(
+                                                df, script_ctx, on_bar_script, trade_direction,
+                                                last_script_closed_ts, strategy_id, symbol, trading_config,
+                                            )
+                                            pending_signals = new_sig
+                                            if not strict_mode:
+                                                try:
+                                                    rt_df = self._update_dataframe_with_current_price(
+                                                        df.copy(), current_price, timeframe,
+                                                    )
+                                                    ip_sig = self._script_evaluate_in_progress_bar(
+                                                        rt_df, script_ctx, on_bar_script, trade_direction,
+                                                        strategy_id, symbol, trading_config,
+                                                    )
+                                                    if ip_sig:
+                                                        pending_signals = ip_sig
+                                                except Exception as e:
+                                                    logger.warning(
+                                                        f"Strategy {strategy_id} script kline in-progress eval failed: {e}"
+                                                    )
+                                            try:
+                                                last_kline_time = int(df.index[-1].timestamp())
+                                            except Exception:
+                                                last_kline_time = int(time.time())
+                                    else:
+                                        current_pos_list = self._get_current_positions(strategy_id, symbol)
+                                        initial_highest = 0.0
+                                        initial_position = 0
+                                        initial_avg_entry_price = 0.0
+                                        initial_position_count = 0
+                                        initial_last_add_price = 0.0
+
+                                        if current_pos_list:
+                                            pos = current_pos_list[0]
+                                            initial_highest = float(pos.get('highest_price', 0) or 0)
+                                            pos_side = pos.get('side', 'long')
+                                            initial_position = 1 if pos_side == 'long' else -1
+                                            initial_avg_entry_price = float(pos.get('entry_price', 0) or 0)
+                                            initial_position_count = 1
+                                            initial_last_add_price = initial_avg_entry_price
+
+                                        indicator_result = self._execute_indicator_with_prices(
+                                            indicator_code, df, trading_config,
+                                            initial_highest_price=initial_highest,
+                                            initial_position=initial_position,
+                                            initial_avg_entry_price=initial_avg_entry_price,
+                                            initial_position_count=initial_position_count,
+                                            initial_last_add_price=initial_last_add_price
+                                        )
+                                        if indicator_result:
+                                            pending_signals = indicator_result.get('pending_signals', [])
+                                            last_kline_time = indicator_result.get('last_kline_time', 0)
+                                            new_hp = indicator_result.get('new_highest_price', 0)
+
+                                            if new_hp > 0 and current_pos_list:
+                                                current_close = float(df['close'].iloc[-1])
+                                                for p in current_pos_list:
+                                                    self._update_position(
+                                                        strategy_id, p['symbol'], p['side'],
+                                                        float(p['size']), float(p['entry_price']),
+                                                        current_close,
+                                                        highest_price=new_hp,
+                                                        execution_mode=execution_mode,
+                                                    )
+                                            try:
+                                                bar_ts = int(
+                                                    indicator_result.get('last_kline_time', 0)
+                                                    or df.index[-1].timestamp()
+                                                )
+                                            except Exception:
+                                                bar_ts = 0
+                                            self._maybe_log_bar_close_ui(
+                                                strategy_id,
+                                                symbol=symbol,
+                                                timeframe=timeframe,
+                                                close_price=float(df['close'].iloc[-1]),
+                                                pending_count=len(pending_signals or []),
+                                                bar_ts=bar_ts,
+                                            )
+                        finally:
+                            next_kline_poll_at = next_kline_boundary_poll_ts(
+                                max(current_time, next_kline_poll_at),
+                                timeframe_seconds,
+                                kline_poll_offset,
+                            )
                     else:
                         # ============================================
                         # 3. 非K线更新 tick
                         # ============================================
-                        # 3a. Bot-mode scripts: evaluate on every tick (grid/martingale need real-time price tracking)
-                        if is_script and is_bot_mode and on_bar_script and script_ctx is not None:
+                        # 3a. Grid resting live: limit-order engine
+                        if use_grid_resting and grid_resting_runner is not None:
+                            try:
+                                grid_resting_runner.tick(
+                                    float(current_price),
+                                    high=float(current_price),
+                                    low=float(current_price),
+                                    bars_df=df if 'df' in locals() else None,
+                                )
+                                pending_signals = []
+                            except Exception as e:
+                                logger.warning(f"Strategy {strategy_id} grid resting tick error: {e}")
+                            if grid_resting_runner.should_stop:
+                                exit_reason = "Grid auto-stopped: exchange error"
+                                logger.error(f"Strategy {strategy_id} {exit_reason}")
+                                _set_db_stopped_best_effort(exit_reason)
+                                break
+                        # 3a2. Bot-mode scripts (martingale / DCA tick; grid uses resting engine)
+                        elif (
+                            is_script
+                            and is_bot_mode
+                            and on_bar_script
+                            and script_ctx is not None
+                            and self._bot_type_key(trading_config) != "grid"
+                        ):
                             try:
                                 self._hydrate_script_ctx_from_positions(
                                     script_ctx, strategy_id, symbol,
@@ -2144,7 +2552,8 @@ class TradingExecutor:
                                                 strategy_id, p['symbol'], p['side'],
                                                 float(p['size']), float(p['entry_price']),
                                                 current_price,
-                                                highest_price=new_hp
+                                                highest_price=new_hp,
+                                                execution_mode=execution_mode,
                                             )
                             except Exception as e:
                                 logger.warning(f"Strategy {strategy_id} realtime indicator recompute failed: {str(e)}")
@@ -2222,6 +2631,7 @@ class TradingExecutor:
                         leverage=float(leverage),
                         trading_config=trading_config,
                         timeframe_seconds=int(timeframe_seconds or 60),
+                        execution_mode=execution_mode,
                     )
                     if risk_tp:
                         triggered_signals.append(risk_tp)
@@ -2251,18 +2661,17 @@ class TradingExecutor:
                                 if str(s.get('type') or '').strip().lower() != risk_close
                             ]
 
-                    # Grid / DCA bot risk exits — entry_price-based SL/TP would
-                    # be meaningless for them. Uses equity drawdown +
-                    # out-of-grid breakout protection and may close BOTH legs
-                    # within a single tick (hence the list).
-                    grid_exits = self._grid_bot_risk_exits(
-                        strategy_id=strategy_id,
-                        symbol=symbol,
-                        current_price=float(current_price),
-                        trading_config=trading_config,
-                        timeframe_seconds=int(timeframe_seconds or 60),
-                        initial_capital=float(initial_capital or 0),
-                    )
+                    # Grid / DCA bot risk exits — resting grid handles risk inside runner.tick.
+                    grid_exits = []
+                    if not use_grid_resting:
+                        grid_exits = self._grid_bot_risk_exits(
+                            strategy_id=strategy_id,
+                            symbol=symbol,
+                            current_price=float(current_price),
+                            trading_config=trading_config,
+                            timeframe_seconds=int(timeframe_seconds or 60),
+                            initial_capital=float(initial_capital or 0),
+                        )
                     if grid_exits:
                         triggered_signals.extend(grid_exits)
                         types_to_drop = {
@@ -2476,7 +2885,16 @@ class TradingExecutor:
                 _protect_open_positions_on_exit(exit_reason or "strategy thread exited")
             except Exception:
                 pass
+            try:
+                if grid_resting_runner is not None:
+                    grid_resting_runner.shutdown()
+            except Exception:
+                pass
             # 清理
+            try:
+                self._last_exit_reason[int(strategy_id)] = (exit_reason or "strategy thread exited").strip()
+            except Exception:
+                pass
             with self.lock:
                 if strategy_id in self.running_strategies:
                     del self.running_strategies[strategy_id]
@@ -2647,6 +3065,7 @@ class TradingExecutor:
         execution_mode: str,
         exchange_config: Optional[Dict[str, Any]],
         trading_config: Optional[Dict[str, Any]] = None,
+        user_id: int = 1,
     ) -> Tuple[Optional[str], Optional[str]]:
         """加密货币策略（signal/live）：有交易所则按绑定所拉 K 线；否则走 Settings 全局数据源。"""
         if (market_category or "").strip() != "Crypto":
@@ -2656,8 +3075,20 @@ class TradingExecutor:
             return None, None
         from app.data_sources.crypto import resolve_crypto_venue
 
+        cfg = exchange_config if isinstance(exchange_config, dict) else {}
+        cred_ref = cfg.get("credential_id") or cfg.get("credentials_id")
+        if cred_ref and not (
+            cfg.get("exchange_id") or cfg.get("exchangeId") or cfg.get("exchange")
+        ):
+            try:
+                from app.services.exchange_execution import resolve_exchange_config
+
+                cfg = resolve_exchange_config(cfg, user_id=int(user_id or 1))
+            except Exception:
+                pass
+
         ex, mt = resolve_crypto_venue(
-            exchange_config=exchange_config,
+            exchange_config=cfg,
             trading_config=trading_config,
             market_type=market_type,
         )
@@ -2827,52 +3258,45 @@ class TradingExecutor:
             if not current_positions:
                 return None
 
-            pos = current_positions[0]
-            side = pos.get('side')
-            if side not in ['long', 'short']:
-                return None
-
-            entry_price = float(pos.get('entry_price', 0) or 0)
-            if entry_price <= 0 or current_price <= 0:
-                return None
-
-            # Stop-loss: prefer @strategy ratios (same as backtest), else flat percent fields.
             sl = float(self._risk_params_from_trading_config(trading_config).get("stop_loss_ratio") or 0)
             if sl <= 0:
                 return None
 
-            # SL is the underlying's % price move; leverage only affects PnL
-            # magnitude / liquidation, NOT the trigger threshold.
-
-            # Use candle start timestamp to deduplicate exit attempts within a candle.
             now_ts = int(time.time())
             tf = int(timeframe_seconds or 60)
             candle_ts = int(now_ts // tf) * tf
 
-            # 多头：跌破止损线
-            if side == 'long':
-                stop_line = entry_price * (1 - sl)
-                if current_price <= stop_line:
-                    return {
-                        'type': 'close_long',
-                        'trigger_price': 0,  # 立即触发（由 exit_trigger_mode 控制）
-                        'position_size': 0,
-                        'timestamp': candle_ts,
-                        'reason': 'server_stop_loss',
-                        'stop_loss_price': stop_line,
-                    }
-            # 空头：突破止损线
-            elif side == 'short':
-                stop_line = entry_price * (1 + sl)
-                if current_price >= stop_line:
-                    return {
-                        'type': 'close_short',
-                        'trigger_price': 0,
-                        'position_size': 0,
-                        'timestamp': candle_ts,
-                        'reason': 'server_stop_loss',
-                        'stop_loss_price': stop_line,
-                    }
+            for pos in current_positions:
+                side = (pos.get('side') or '').strip().lower()
+                if side not in ('long', 'short'):
+                    continue
+
+                entry_price = float(pos.get('entry_price', 0) or 0)
+                if entry_price <= 0 or current_price <= 0:
+                    continue
+
+                if side == 'long':
+                    stop_line = entry_price * (1 - sl)
+                    if current_price <= stop_line:
+                        return {
+                            'type': 'close_long',
+                            'trigger_price': 0,
+                            'position_size': 0,
+                            'timestamp': candle_ts,
+                            'reason': 'server_stop_loss',
+                            'stop_loss_price': stop_line,
+                        }
+                else:
+                    stop_line = entry_price * (1 + sl)
+                    if current_price >= stop_line:
+                        return {
+                            'type': 'close_short',
+                            'trigger_price': 0,
+                            'position_size': 0,
+                            'timestamp': candle_ts,
+                            'reason': 'server_stop_loss',
+                            'stop_loss_price': stop_line,
+                        }
 
             return None
         except Exception as e:
@@ -2888,6 +3312,7 @@ class TradingExecutor:
         leverage: float,
         trading_config: Dict[str, Any],
         timeframe_seconds: int,
+        execution_mode: str = "signal",
     ) -> Optional[Dict[str, Any]]:
         """
         Server-side exits driven by trading_config / @strategy code annotations:
@@ -2915,15 +3340,6 @@ class TradingExecutor:
             if not current_positions:
                 return None
 
-            pos = current_positions[0]
-            side = (pos.get('side') or '').strip().lower()
-            if side not in ['long', 'short']:
-                return None
-
-            entry_price = float(pos.get('entry_price', 0) or 0)
-            if entry_price <= 0 or current_price <= 0:
-                return None
-
             # TP / trailing are the underlying's % price move; leverage does not
             # affect trigger thresholds (only PnL magnitude / liquidation).
             risk_params = self._risk_params_from_trading_config(trading_config)
@@ -2939,7 +3355,6 @@ class TradingExecutor:
             # Conflict rule: when trailing is enabled, fixed TP is disabled.
             if trailing_enabled and trailing_pct_eff > 0:
                 tp_eff = 0.0
-                # If activationPct is missing, reuse take_profit_pct as activation threshold.
                 if trailing_act_eff <= 0 and tp > 0:
                     trailing_act_eff = tp
 
@@ -2947,98 +3362,104 @@ class TradingExecutor:
             tf = int(timeframe_seconds or 60)
             candle_ts = int(now_ts // tf) * tf
 
-            # Highest/lowest tracking (persisted in DB so restart continues trailing correctly)
-            try:
-                hp = float(pos.get('highest_price') or 0.0)
-            except Exception:
-                hp = 0.0
-            try:
-                lp = float(pos.get('lowest_price') or 0.0)
-            except Exception:
-                lp = 0.0
+            for pos in current_positions:
+                side = (pos.get('side') or '').strip().lower()
+                if side not in ('long', 'short'):
+                    continue
 
-            if hp <= 0:
-                hp = entry_price
-            hp = max(hp, float(current_price))
+                entry_price = float(pos.get('entry_price', 0) or 0)
+                if entry_price <= 0 or current_price <= 0:
+                    continue
 
-            if lp <= 0:
-                lp = entry_price
-            lp = min(lp, float(current_price))
+                try:
+                    hp = float(pos.get('highest_price') or 0.0)
+                except Exception:
+                    hp = 0.0
+                try:
+                    lp = float(pos.get('lowest_price') or 0.0)
+                except Exception:
+                    lp = 0.0
 
-            # Persist best-effort
-            try:
-                self._update_position(
-                    strategy_id=strategy_id,
-                    symbol=pos.get('symbol') or symbol,
-                    side=side,
-                    size=float(pos.get('size') or 0.0),
-                    entry_price=entry_price,
-                    current_price=float(current_price),
-                    highest_price=hp,
-                    lowest_price=lp,
-                )
-            except Exception:
-                pass
+                if hp <= 0:
+                    hp = entry_price
+                hp = max(hp, float(current_price))
 
-            # 1) Trailing stop
-            if trailing_enabled and trailing_pct_eff > 0:
-                if side == 'long':
-                    active = True
-                    if trailing_act_eff > 0:
-                        active = hp >= entry_price * (1 + trailing_act_eff)
-                    if active:
-                        stop_line = hp * (1 - trailing_pct_eff)
-                        if current_price <= stop_line:
+                if lp <= 0:
+                    lp = entry_price
+                lp = min(lp, float(current_price))
+
+                try:
+                    self._update_position(
+                        strategy_id=strategy_id,
+                        symbol=pos.get('symbol') or symbol,
+                        side=side,
+                        size=float(pos.get('size') or 0.0),
+                        entry_price=entry_price,
+                        current_price=float(current_price),
+                        highest_price=hp,
+                        lowest_price=lp,
+                        execution_mode=execution_mode,
+                    )
+                except Exception:
+                    pass
+
+                if trailing_enabled and trailing_pct_eff > 0:
+                    if side == 'long':
+                        active = True
+                        if trailing_act_eff > 0:
+                            active = hp >= entry_price * (1 + trailing_act_eff)
+                        if active:
+                            stop_line = hp * (1 - trailing_pct_eff)
+                            if current_price <= stop_line:
+                                return {
+                                    'type': 'close_long',
+                                    'trigger_price': 0,
+                                    'position_size': 0,
+                                    'timestamp': candle_ts,
+                                    'reason': 'server_trailing_stop',
+                                    'trailing_stop_price': stop_line,
+                                    'highest_price': hp,
+                                }
+                    else:
+                        active = True
+                        if trailing_act_eff > 0:
+                            active = lp <= entry_price * (1 - trailing_act_eff)
+                        if active:
+                            stop_line = lp * (1 + trailing_pct_eff)
+                            if current_price >= stop_line:
+                                return {
+                                    'type': 'close_short',
+                                    'trigger_price': 0,
+                                    'position_size': 0,
+                                    'timestamp': candle_ts,
+                                    'reason': 'server_trailing_stop',
+                                    'trailing_stop_price': stop_line,
+                                    'lowest_price': lp,
+                                }
+
+                if tp_eff > 0:
+                    if side == 'long':
+                        tp_line = entry_price * (1 + tp_eff)
+                        if current_price >= tp_line:
                             return {
                                 'type': 'close_long',
                                 'trigger_price': 0,
                                 'position_size': 0,
                                 'timestamp': candle_ts,
-                                'reason': 'server_trailing_stop',
-                                'trailing_stop_price': stop_line,
-                                'highest_price': hp,
+                                'reason': 'server_take_profit',
+                                'take_profit_price': tp_line,
                             }
-                else:
-                    active = True
-                    if trailing_act_eff > 0:
-                        active = lp <= entry_price * (1 - trailing_act_eff)
-                    if active:
-                        stop_line = lp * (1 + trailing_pct_eff)
-                        if current_price >= stop_line:
+                    else:
+                        tp_line = entry_price * (1 - tp_eff)
+                        if current_price <= tp_line:
                             return {
                                 'type': 'close_short',
                                 'trigger_price': 0,
                                 'position_size': 0,
                                 'timestamp': candle_ts,
-                                'reason': 'server_trailing_stop',
-                                'trailing_stop_price': stop_line,
-                                'lowest_price': lp,
+                                'reason': 'server_take_profit',
+                                'take_profit_price': tp_line,
                             }
-
-            # 2) Fixed take-profit (only when trailing is disabled)
-            if tp_eff > 0:
-                if side == 'long':
-                    tp_line = entry_price * (1 + tp_eff)
-                    if current_price >= tp_line:
-                        return {
-                            'type': 'close_long',
-                            'trigger_price': 0,
-                            'position_size': 0,
-                            'timestamp': candle_ts,
-                            'reason': 'server_take_profit',
-                            'take_profit_price': tp_line,
-                        }
-                else:
-                    tp_line = entry_price * (1 - tp_eff)
-                    if current_price <= tp_line:
-                        return {
-                            'type': 'close_short',
-                            'trigger_price': 0,
-                            'position_size': 0,
-                            'timestamp': candle_ts,
-                            'reason': 'server_take_profit',
-                            'take_profit_price': tp_line,
-                        }
 
             return None
         except Exception:
@@ -4904,37 +5325,29 @@ class TradingExecutor:
         matched_entry_price: Optional[float] = None,
         grid_matched_profit: Optional[float] = None,
     ):
-        """记录交易到数据库"""
+        """记录交易到数据库（signal 模拟模式）"""
         try:
-            user_id = 1
-            with get_db_connection() as db:
-                cursor = db.cursor()
-                try:
-                    cursor.execute("SELECT user_id FROM qd_strategies_trading WHERE id = %s", (strategy_id,))
-                    row = cursor.fetchone()
-                    user_id = int((row or {}).get('user_id') or 1)
-                except Exception:
-                    pass
-                query = """
-                    INSERT INTO qd_strategy_trades (
-                        user_id, strategy_id, symbol, type, price, amount, value,
-                        commission, profit, close_reason,
-                        matched_entry_price, grid_matched_profit, created_at
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-                    )
-                """
-                cursor.execute(
-                    query,
-                    (
-                        user_id, strategy_id, symbol, type, price, amount, value,
-                        commission or 0, profit, str(close_reason or "").strip(),
-                        float(matched_entry_price) if matched_entry_price is not None else 0.0,
-                        float(grid_matched_profit) if grid_matched_profit is not None else 0.0,
-                    ),
-                )
-                db.commit()
-                cursor.close()
+            from app.services.live_trading.leg_context import resolve_leg_context
+            from app.services.live_trading.records import record_trade
+
+            leg = resolve_leg_context(
+                strategy_id=int(strategy_id),
+                symbol=str(symbol or ""),
+                fill_source="signal_sim",
+            )
+            record_trade(
+                strategy_id=int(strategy_id),
+                symbol=str(symbol or ""),
+                trade_type=str(type or ""),
+                price=float(price or 0.0),
+                amount=float(amount or 0.0),
+                commission=float(commission or 0.0),
+                profit=profit,
+                close_reason=str(close_reason or ""),
+                matched_entry_price=matched_entry_price,
+                grid_matched_profit=grid_matched_profit,
+                leg=leg,
+            )
         except Exception as e:
             logger.error(f"Failed to record trade: {e}")
 
@@ -4948,8 +5361,27 @@ class TradingExecutor:
         current_price: float,
         highest_price: float = 0.0,
         lowest_price: float = 0.0,
+        execution_mode: str = "signal",
     ):
         """更新持仓状态"""
+        mode = str(execution_mode or "signal").strip().lower()
+        if mode == "live":
+            # Live size/entry is owned by PendingOrderWorker + position sync.
+            # Only patch trailing markers on rows that still exist.
+            try:
+                from app.services.live_trading.records import patch_position_markers
+
+                patch_position_markers(
+                    strategy_id=int(strategy_id),
+                    symbol=str(symbol or ""),
+                    side=str(side or ""),
+                    current_price=float(current_price or 0.0),
+                    highest_price=float(highest_price or 0.0),
+                    lowest_price=float(lowest_price or 0.0),
+                )
+            except Exception as e:
+                logger.warning("patch_position_markers failed sid=%s: %s", strategy_id, e)
+            return
         try:
             # Get user_id from strategy
             user_id = 1
@@ -5331,6 +5763,7 @@ class TradingExecutor:
             execution_mode=execution_mode,
             exchange_config=exchange_config,
             trading_config=trading_config,
+            user_id=int(strategy.get('user_id') or 1),
         )
         self._log_crypto_kline_source(
             strategy_id, market_category, execution_mode, kline_exchange_id, kline_market_type

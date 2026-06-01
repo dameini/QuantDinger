@@ -46,10 +46,10 @@ The Agent Gateway is mounted at **`/api/agent/v1`** by `app/routes/agent_v1/`.
   desktop IDEs), `sse`, and `streamable-http` (cloud agents / remote IDEs;
   also bind `QUANTDINGER_MCP_HOST` / `QUANTDINGER_MCP_PORT`). Add new tools
   there only after exposing the underlying capability via REST.
-- Admin UI: the Vue project at `QuantDinger-Vue-src/` ships an admin-only
-  page at route `/agent-tokens` (`src/views/agent-tokens/index.vue`) for
-  issuing/revoking tokens and viewing the audit log. API client lives in
-  `src/api/agent.js`; route is gated by `permission: ['admin']`.
+- Admin UI: the Vue project at `QuantDinger-Vue-src/` ships **Profile → My Agent Token**
+  for every logged-in user (`src/views/profile/components/ProfileAgentTokens.vue`,
+  API `/api/agent/v1/me/tokens`). Admins retain `/agent-tokens` for audit.
+  API client lives in `src/api/agent.js`.
 
 Do not treat the marketing-heavy root `README.md` as the only onboarding doc; use it for user install paths and link out.
 
