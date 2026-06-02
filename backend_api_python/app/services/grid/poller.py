@@ -230,6 +230,13 @@ class GridFillPoller:
         """Poll every open order for one strategy immediately (UI refresh)."""
         sid = int(strategy_id)
         open_orders = self._repo.list_open(sid)
+        unprocessed = self._repo.list_unprocessed(sid)
+        merged: Dict[int, GridRestingOrder] = {}
+        for order in open_orders + unprocessed:
+            oid = int(order.id or 0)
+            if oid > 0:
+                merged[oid] = order
+        open_orders = list(merged.values())
         if not open_orders:
             return 0
         runner = get_runner(sid)

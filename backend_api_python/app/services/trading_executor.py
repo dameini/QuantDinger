@@ -298,6 +298,75 @@ class TradingExecutor:
         return "flat"
 
     @staticmethod
+    def _symbol_match_key(symbol: str) -> str:
+        return str(symbol or "").split(":")[0].strip()
+
+    def _inflight_open_side(self, strategy_id: int, symbol: str) -> Optional[str]:
+        """
+        Return 'long' or 'short' when an open_* order is pending/processing for
+        this strategy+symbol, else None.
+        """
+        sym_key = self._symbol_match_key(symbol)
+        if not sym_key:
+            return None
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT signal_type, symbol
+                    FROM pending_orders
+                    WHERE strategy_id = %s
+                      AND status IN ('pending', 'processing')
+                      AND signal_type IN ('open_long', 'open_short')
+                    ORDER BY id DESC
+                    LIMIT 20
+                    """,
+                    (int(strategy_id),),
+                )
+                rows = cur.fetchall() or []
+                cur.close()
+            for row in rows:
+                row_sym = self._symbol_match_key(str(row.get("symbol") or ""))
+                if row_sym != sym_key:
+                    continue
+                sig = str(row.get("signal_type") or "").strip().lower()
+                if sig == "open_long":
+                    return "long"
+                if sig == "open_short":
+                    return "short"
+        except Exception as e:
+            logger.debug("inflight open lookup failed sid=%s: %s", strategy_id, e)
+        return None
+
+    def _effective_position_state(
+        self,
+        strategy_id: int,
+        symbol: str,
+        positions: List[Dict[str, Any]],
+    ) -> str:
+        """Local DB state plus in-flight open orders (live dedup guard)."""
+        state = self._position_state(positions)
+        if state != "flat":
+            return state
+        inflight = self._inflight_open_side(strategy_id, symbol)
+        return inflight or "flat"
+
+    @staticmethod
+    def _is_live_script_hydrate_candidate(trading_config: Optional[Dict[str, Any]]) -> bool:
+        tc = trading_config if isinstance(trading_config, dict) else {}
+        if str(tc.get("execution_mode") or "live").strip().lower() != "live":
+            return False
+        bot_type = str(tc.get("bot_type") or "").strip().lower()
+        if bot_type == "grid":
+            return True
+        is_bot_script = bool(
+            bot_type in ("martingale", "dca")
+            or tc.get("strategy_mode") == "bot"
+        )
+        return not is_bot_script
+
+    @staticmethod
     def _is_indicator_both_mode(trading_config: Optional[Dict[str, Any]]) -> bool:
         """True only when buy/sell was normalized with backtest-style both-mode flip semantics."""
         tc = trading_config if isinstance(trading_config, dict) else {}
@@ -723,10 +792,9 @@ class TradingExecutor:
                     del self.running_strategies[strategy_id]
                     self._exchange_fee_cache.pop(strategy_id, None)
                     try:
-                        from app.services.grid.runner import get_runner
-                        gr = get_runner(strategy_id)
-                        if gr:
-                            gr.shutdown()
+                        from app.services.grid.runner import shutdown_grid_for_strategy
+
+                        shutdown_grid_for_strategy(strategy_id)
                     except Exception:
                         pass
                     logger.info(f"Strategy {strategy_id} stopped")
@@ -734,6 +802,12 @@ class TradingExecutor:
                     append_strategy_log(strategy_id, "info", "Strategy stop requested (run flag cleared)")
                 else:
                     logger.info(f"Strategy {strategy_id} marked stopped in DB (no active thread)")
+                    try:
+                        from app.services.grid.runner import shutdown_grid_for_strategy
+
+                        shutdown_grid_for_strategy(strategy_id)
+                    except Exception:
+                        pass
                 return True
                 
         except Exception as e:
@@ -783,11 +857,9 @@ class TradingExecutor:
                 elif side == 'short':
                     ctx.position.open_short(ep, size)
 
-        # Grid bots need accurate per-leg state. When DB is empty/stale (e.g.
-        # after restart + sync lag), fall back to the exchange book.
+        # Live script/grid: when DB is empty/stale, fall back to the exchange book.
         tc = trading_config if isinstance(trading_config, dict) else {}
-        bot_type = self._bot_type_key(tc)
-        if bot_type == "grid" and str(tc.get("execution_mode") or "live").strip().lower() == "live":
+        if self._is_live_script_hydrate_candidate(tc):
             self._hydrate_grid_ctx_from_exchange_best_effort(
                 ctx,
                 strategy_id=strategy_id,
@@ -797,6 +869,7 @@ class TradingExecutor:
                 db_had_long=ctx.position.has_long(),
                 db_had_short=ctx.position.has_short(),
             )
+            pl = self._get_current_positions(strategy_id, symbol)
         # 把 ctx.balance 刷新为最新权益(初始资金 + 已实现盈亏 + 未实现盈亏),
         # 这样趋势等使用 ctx.balance * POS_PCT 计算仓位的脚本能反映真实资金
         try:
@@ -880,7 +953,7 @@ class TradingExecutor:
                 except Exception:
                     pass
                 logger.info(
-                    "Grid hydrate from exchange: %s %s size=%s (db missing leg)",
+                    "Exchange hydrate from book: %s %s size=%s (db missing leg)",
                     symbol,
                     side,
                     sz,
@@ -1209,9 +1282,21 @@ class TradingExecutor:
                 return float(usdt_or_ratio) * lev / float(ref_price)
             return float(usdt_or_ratio)
 
+        def _script_qty_extra() -> Dict[str, Any]:
+            """Non-bot scripts pass base-asset qty via ctx.buy/sell; honor it live like backtest."""
+            if is_bot_script or raw_amt is None:
+                return {}
+            try:
+                if float(raw_amt) > 0 and local_qty > 0:
+                    return {'script_base_qty': float(local_qty)}
+            except Exception:
+                pass
+            return {}
+
         def _emit(sig: Dict[str, Any], reason_override: Optional[str]) -> None:
             if reason_override:
                 sig.setdefault('reason', reason_override)
+            sig.update(_script_qty_extra())
             out.append(sig)
 
         for order in list(ctx._orders or []):
@@ -2693,7 +2778,7 @@ class TradingExecutor:
                         logger.info(f"Strategy {strategy_id} triggered signals: {triggered_signals}")
 
                         current_positions = self._get_current_positions(strategy_id, symbol)
-                        state = self._position_state(current_positions)
+                        state = self._effective_position_state(strategy_id, symbol, current_positions)
 
                         # Strict state machine + priority:
                         # - Only allow signals matching current state (flat/long/short).
@@ -2757,7 +2842,7 @@ class TradingExecutor:
                             current_positions = self._get_current_positions(strategy_id, symbol)
 
                             if not self._is_signal_allowed(
-                                self._position_state(current_positions),
+                                self._effective_position_state(strategy_id, symbol, current_positions),
                                 signal_type,
                                 indicator_both_mode=indicator_both_mode,
                             ):
@@ -2787,6 +2872,7 @@ class TradingExecutor:
                                 take_profit_price=selected.get("take_profit_price"),
                                 signal_reason=selected.get("reason"),
                                 trailing_stop_price=selected.get("trailing_stop_price"),
+                                script_base_qty=selected.get("script_base_qty"),
                             )
                             if ok:
                                 logger.info(f"Strategy {strategy_id} signal executed: {signal_type} @ {execute_price}")
@@ -4098,13 +4184,15 @@ class TradingExecutor:
             
             executed_df = exec_env.get('df', df)
 
-            # Validation: if chart signals are provided, df['buy']/df['sell'] must exist for execution normalization.
+            # Validation: chart markers in output['signals'] require df execution columns.
             output_obj = exec_env.get('output')
             has_output_signals = isinstance(output_obj, dict) and isinstance(output_obj.get('signals'), list) and len(output_obj.get('signals')) > 0
-            if has_output_signals and not all(col in executed_df.columns for col in ['buy', 'sell']):
+            has_four_way = all(col in executed_df.columns for col in ['open_long', 'close_long', 'open_short', 'close_short'])
+            has_buy_sell = all(col in executed_df.columns for col in ['buy', 'sell'])
+            if has_output_signals and not has_four_way and not has_buy_sell:
                 raise ValueError(
-                    "Invalid indicator script: output['signals'] is provided, but df['buy'] and df['sell'] are missing. "
-                    "Please set df['buy'] and df['sell'] as boolean columns (len == len(df))."
+                    "Invalid indicator script: output['signals'] is provided, but df execution columns are missing. "
+                    "Set df['buy'] and df['sell'], or four-way df['open_long'/'close_long'/'open_short'/'close_short']."
                 )
             
             return executed_df, exec_env
@@ -4299,13 +4387,14 @@ class TradingExecutor:
         ai_model_config: Optional[Dict[str, Any]] = None,
         signal_ts: int = 0,
         price_exchange_id: Optional[str] = None,
+        script_base_qty: Optional[float] = None,
     ):
         """执行具体的交易信号"""
         try:
             indicator_both_mode = self._is_indicator_both_mode(trading_config)
 
             # Hard state-machine guard (double safety in addition to loop-level filtering).
-            state = self._position_state(current_positions)
+            state = self._effective_position_state(strategy_id, symbol, current_positions)
             if not self._is_signal_allowed(state, signal_type, indicator_both_mode=indicator_both_mode):
                 append_strategy_log(strategy_id, "info", f"Signal filtered by state machine: {signal_type} (state={state})")
                 return False
@@ -4337,7 +4426,7 @@ class TradingExecutor:
                     price_exchange_id=price_exchange_id,
                 )
                 current_positions = self._get_current_positions(strategy_id, symbol)
-                state = self._position_state(current_positions)
+                state = self._effective_position_state(strategy_id, symbol, current_positions)
                 if state == "short":
                     append_strategy_log(
                         strategy_id, "info",
@@ -4368,7 +4457,7 @@ class TradingExecutor:
                     price_exchange_id=price_exchange_id,
                 )
                 current_positions = self._get_current_positions(strategy_id, symbol)
-                state = self._position_state(current_positions)
+                state = self._effective_position_state(strategy_id, symbol, current_positions)
                 if state == "long":
                     append_strategy_log(
                         strategy_id, "info",
@@ -4460,15 +4549,27 @@ class TradingExecutor:
             bot_type = (trading_config or {}).get('bot_type', '')
             is_bot_script = bool(bot_type)
 
+            try:
+                explicit_script_qty = (
+                    float(script_base_qty)
+                    if script_base_qty is not None and float(script_base_qty) > 0
+                    else None
+                )
+            except Exception:
+                explicit_script_qty = None
+
             # Frontend position sizing alignment:
             # - non-bot open_* uses entry_pct from trading_config if provided
             # - bot scripts pass their own amount/ratio from ctx.buy()/ctx.sell()
+            # - script strategies with ctx.buy(price, qty) pass script_base_qty (base coins)
+            entry_ratio_override = None
             cs_mode = (
                 isinstance(trading_config, dict)
                 and str(trading_config.get("cs_strategy_type") or "").strip().lower() == "cross_sectional"
             )
             if (
-                (not is_bot_script)
+                explicit_script_qty is None
+                and (not is_bot_script)
                 and (not cs_mode)
                 and sig in ("open_long", "open_short")
                 and isinstance(trading_config, dict)
@@ -4476,13 +4577,16 @@ class TradingExecutor:
                 entry_ratio = self._risk_params_from_trading_config(trading_config).get("entry_ratio")
                 if entry_ratio is not None and float(entry_ratio) > 0:
                     position_size = float(entry_ratio)
+                    entry_ratio_override = float(entry_ratio)
 
             # Open / add sizing
             if ('open' in sig or 'add' in sig):
-                 if position_size is None or float(position_size) <= 0:
+                 if explicit_script_qty is not None and not is_bot_script:
+                     amount = explicit_script_qty
+                 elif position_size is None or float(position_size) <= 0:
                      position_size = 0.05
 
-                 if is_bot_script and float(position_size) > 1.0:
+                 if explicit_script_qty is None and is_bot_script and float(position_size) > 1.0:
                      # Bot scripts pass amount as absolute USDT notional, not ratio.
                      usdt_notional = float(position_size)
                      if market_type == 'spot':
@@ -4491,10 +4595,12 @@ class TradingExecutor:
                          amount = usdt_notional / current_price
                      else:
                          amount = (usdt_notional * leverage) / current_price
-                 else:
+                 elif explicit_script_qty is None:
                      use_code_ratios = bool(self._code_strategy_cfg(trading_config))
                      if use_code_ratios and sig in ("open_long", "open_short", "add_long", "add_short"):
                          position_ratio = float(position_size)
+                     elif entry_ratio_override is not None:
+                         position_ratio = float(entry_ratio_override)
                      else:
                          position_ratio = self._to_ratio(position_size, default=0.05)
                      if market_type == 'spot':
@@ -4553,6 +4659,11 @@ class TradingExecutor:
                         signal_type = sig
                     else:
                         amount = full_size
+                elif explicit_script_qty is not None:
+                    amount = min(float(explicit_script_qty), full_size)
+                    if amount < full_size * 0.999:
+                        sig = f"reduce_{pos_side}"
+                        signal_type = sig
                 else:
                     amount = full_size
 

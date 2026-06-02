@@ -21,10 +21,13 @@ from app.services.live_trading.factory import create_client
 from app.services.live_trading.records import (
     apply_fill_to_local_position,
     ensure_position_ledger_schema,
-    lookup_exchange_side_qty,
     normalize_strategy_symbol,
     record_trade,
     strategy_allowed_symbols,
+)
+from app.services.live_trading.strategy_position_sync import (
+    apply_exchange_snapshot_to_strategy_ledger,
+    strategy_uses_fill_ledger,
 )
 from app.services.live_trading.account_positions import (
     account_legs_from_exchange_maps,
@@ -141,6 +144,29 @@ def _set_position_sync_snapshot(
         )
 
 
+def invalidate_position_sync_snapshot(cache_key: str) -> None:
+    """Drop cached exchange position snapshot (e.g. after a fill)."""
+    with _position_sync_cache_lock:
+        _position_sync_snapshot_cache.pop(str(cache_key or ""), None)
+
+
+def invalidate_position_sync_snapshot_for_exchange(
+    *,
+    user_id: int,
+    exchange_id: str,
+    market_type: str,
+    exchange_config: Dict[str, Any],
+) -> None:
+    invalidate_position_sync_snapshot(
+        _position_sync_cache_key(
+            int(user_id or 1),
+            str(exchange_id or "").strip().lower(),
+            str(market_type or "swap").strip().lower(),
+            exchange_config if isinstance(exchange_config, dict) else {},
+        )
+    )
+
+
 def _persist_strategy_fill(
     *,
     strategy_id: int,
@@ -196,6 +222,17 @@ def _persist_strategy_fill(
         grid_matched_profit=grid_matched_profit if grid_matched_profit is not None else profit,
         leg=leg,
     )
+    try:
+        from app.services.live_trading.records import _get_user_id_from_strategy
+
+        invalidate_position_sync_snapshot_for_exchange(
+            user_id=_get_user_id_from_strategy(int(strategy_id)),
+            exchange_id=str(exchange_config.get("exchange_id") or "").strip().lower(),
+            market_type=str(market_type or "swap"),
+            exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+        )
+    except Exception:
+        pass
     return profit, matched_entry_price
 
 
@@ -402,6 +439,17 @@ class PendingOrderWorker:
             try:
                 sc = load_strategy_configs(int(sid))
                 exec_mode = (sc.get("execution_mode") or "").strip().lower()
+                bot_type = str(
+                    sc.get("bot_type")
+                    or (sc.get("trading_config") or {}).get("bot_type")
+                    or ""
+                ).strip().lower()
+                if strategy_uses_fill_ledger(sc):
+                    logger.debug(
+                        "[PositionSync] Strategy %s skipped: fill-ledger strategy (L3)",
+                        sid,
+                    )
+                    continue
                 # 修改：即使signal模式，如果指定了target_strategy_id（策略启动时调用），也要同步
                 # 这样可以清理用户在交易所手动平仓但数据库记录还在的"幽灵持仓"
                 if exec_mode != "live" and not target_strategy_id:
@@ -955,8 +1003,71 @@ class PendingOrderWorker:
                                     exch_entry_price.setdefault(sym, {"long": 0.0, "short": 0.0})[side_str] = avg
                         # Continue to reconciliation logic below
 
+                    elif str(market_type or "").strip().lower() == "spot":
+                        # Spot position sync (best-effort):
+                        # - Needed for UI reconciliation ("策略快照与交易所不一致") and for L3 self-heal
+                        #   to remove ghost local snapshot rows after a full sell/close.
+                        # - We only treat spot holdings as `long` base quantities; no shorts.
+                        try:
+                            spot_resp = None
+                            try:
+                                spot_resp = client.get_positions(symbol=sync_symbol) if sync_symbol else client.get_positions()
+                            except TypeError:
+                                spot_resp = client.get_positions()
+                        except Exception as e:
+                            logger.error(f"[PositionSync] Strategy {sid} spot get_positions failed: {e}", exc_info=True)
+                            continue
+
+                        data = spot_resp.get("data") if isinstance(spot_resp, dict) else spot_resp
+                        if isinstance(data, dict):
+                            data = data.get("data") or data.get("list") or data.get("positions") or []
+                        if not isinstance(data, list):
+                            data = []
+
+                        for p in data:
+                            if not isinstance(p, dict):
+                                continue
+                            sym = str(p.get("symbol") or p.get("instId") or "").strip()
+                            if not sym:
+                                continue
+                            hb_sym = normalize_strategy_symbol(sym) or sym
+                            raw_qty = 0.0
+                            for qty_key in (
+                                "bal",
+                                "available",
+                                "availBal",
+                                "free",
+                                "qty",
+                                "quantity",
+                                "position_qty",
+                                "positionQty",
+                                "amount",
+                                "position",
+                                "size",
+                                "total",
+                                "volume",
+                            ):
+                                try:
+                                    candidate = float(p.get(qty_key) or 0.0)
+                                except Exception:
+                                    candidate = 0.0
+                                if candidate > 0:
+                                    raw_qty = candidate
+                                    break
+                            if raw_qty <= 0:
+                                continue
+
+                            exch_size.setdefault(hb_sym, {"long": 0.0, "short": 0.0})["long"] = float(raw_qty)
+                            try:
+                                ep = float(p.get("avgCost") or p.get("avg_cost") or p.get("open_avg_price") or 0.0)
+                            except Exception:
+                                ep = 0.0
+                            if ep > 0:
+                                exch_entry_price.setdefault(hb_sym, {"long": 0.0, "short": 0.0})["long"] = ep
+                        # Continue to reconciliation logic below
+
                     else:
-                        # Spot reconciliation is optional; skip for now (keeps self-check low-risk).
+                        # Unsupported market/client for position sync.
                         logger.debug(f"position sync: skip unsupported market/client: sid={sid}, cfg={safe_cfg}, market_type={market_type}, client={type(client)}")
                         continue
 
@@ -992,45 +1103,32 @@ class PendingOrderWorker:
                 else:
                     logger.info(f"[PositionSync] Strategy {sid} ({safe_cfg.get('exchange_id', 'unknown')}) has NO positions on exchange.")
 
-                # 3) L3 self-heal: delete local rows when exchange leg is flat.
-                # Do NOT insert/update strategy rows from account totals (multi-strategy credential safe).
-                to_delete_ids: List[int] = []
-                eps = 1e-12
-
-                for r in plist:
-                    rid = int(r.get("id") or 0)
-                    sym = str(r.get("symbol") or "").strip()
-                    side = str(r.get("side") or "").strip().lower()
-                    if not rid or not sym or side not in ("long", "short"):
-                        continue
-                    try:
-                        local_size = float(r.get("size") or 0.0)
-                    except Exception:
-                        local_size = 0.0
-
-                    exch_qty = lookup_exchange_side_qty(exch_size, sym, side)
-                    logger.debug(
-                        f"[PositionSync] Check ID={rid} {sym} {side}: local_sz={local_size}, exch_sz={exch_qty}"
+                # 3) L3 reconcile: upsert allowed strategy symbols from exchange;
+                # delete legs that are flat. Scoped to strategy_allowed_symbols only.
+                try:
+                    written = apply_exchange_snapshot_to_strategy_ledger(
+                        strategy_id=int(sid),
+                        strategy_config={
+                            "symbol": sc.get("symbol"),
+                            "trading_config": sc.get("trading_config") or {},
+                        },
+                        exch_size=exch_size,
+                        exch_entry_price=exch_entry_price,
+                        exch_inst_id=exch_inst_id,
+                        market_type=str(market_type or "swap"),
+                        exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
                     )
-
-                    if exch_qty <= eps:
-                        to_delete_ids.append(rid)
-
-                if not to_delete_ids:
-                    continue
-
-                with get_db_connection() as db:
-                    cur = db.cursor()
-                    for rid in to_delete_ids:
-                        cur.execute("DELETE FROM qd_strategy_positions WHERE id = %s", (int(rid),))
-                    db.commit()
-                    cur.close()
-
-                if to_delete_ids:
-                    logger.debug(
-                        "position sync: removed %s ghost positions for strategy_id=%s",
-                        len(to_delete_ids),
+                    if written:
+                        logger.debug(
+                            "position sync: upserted %s L3 legs for strategy_id=%s",
+                            written,
+                            sid,
+                        )
+                except Exception as l3_err:
+                    logger.warning(
+                        "position sync: L3 ledger apply failed strategy_id=%s: %s",
                         sid,
+                        l3_err,
                     )
             except Exception as e:
                 msg = str(e)
@@ -1520,6 +1618,23 @@ class PendingOrderWorker:
 
         side, pos_side, reduce_only = _signal_to_side_pos_reduce(signal_type)
 
+        from app.services.live_trading.position_query import query_exchange_position_size
+
+        pre_position_qty = 0.0
+        try:
+            pre_position_qty = float(
+                query_exchange_position_size(
+                    client=client,
+                    symbol=str(symbol),
+                    pos_side=str(pos_side or ""),
+                    market_type=str(market_type or "swap"),
+                    exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+                )
+                or 0.0
+            )
+        except Exception as e:
+            logger.debug("pre_position_qty snapshot failed pending_id=%s: %s", order_id, e)
+
         # Leverage handling (best-effort):
         # - For OKX swap, leverage must be set via private endpoint; otherwise exchange defaults apply.
         # - For other exchanges, leverage setting is not implemented yet in this local client.
@@ -1542,7 +1657,7 @@ class PendingOrderWorker:
             logger.warning(f"Pre-execution sync failed: {e}")
 
         # Collect raw exchange interactions / intermediate states for debugging & persistence.
-        phases: Dict[str, Any] = {}
+        phases: Dict[str, Any] = {"pre_position_qty": pre_position_qty}
 
         # Close/reduce: cap to DB size; if DB empty, fall back to live exchange position.
         if reduce_only:
@@ -1725,6 +1840,7 @@ class PendingOrderWorker:
 
         # Phase 1: limit (hang order)
         limit_order_id = ""
+        limit_client_oid = ""
         if use_limit_first:
             try:
                 # price adjustment to reduce immediate taker fills (best-effort)
@@ -2392,6 +2508,41 @@ class PendingOrderWorker:
         # Build final result (best-effort) — live path never fabricates fill qty from request amount.
         filled_final = float(total_base or 0.0)
         avg_final = float(_current_avg() or 0.0)
+
+        ex_oid_for_recovery = str(market_order_id or limit_order_id or "")
+        coid_for_recovery = str(
+            market_client_oid if market_order_id else (limit_client_oid if limit_order_id else "")
+        )
+        if filled_final <= 0 and ex_oid_for_recovery:
+            from app.services.live_trading.fill_recovery import try_recover_zero_fill
+
+            rec_filled, rec_avg, rec_src = try_recover_zero_fill(
+                client,
+                symbol=str(symbol),
+                market_type=str(market_type or "swap"),
+                exchange_config=exchange_config if isinstance(exchange_config, dict) else {},
+                exchange_order_id=ex_oid_for_recovery,
+                client_order_id=coid_for_recovery,
+                requested_qty=float(amount or 0.0),
+                signal_type=str(signal_type or ""),
+                pos_side=str(pos_side or ""),
+                pre_position_qty=float(pre_position_qty or 0.0),
+                ref_price=float(ref_price or 0.0),
+            )
+            if rec_filled > 0:
+                filled_final = rec_filled
+                avg_final = rec_avg if rec_avg > 0 else float(ref_price or 0.0)
+                phases["fill_recovery"] = {
+                    "source": rec_src,
+                    "filled": rec_filled,
+                    "avg_price": avg_final,
+                    "exchange_order_id": ex_oid_for_recovery,
+                }
+                append_strategy_log(
+                    strategy_id,
+                    "info",
+                    f"Fill recovered ({rec_src}): {signal_type} {symbol} qty={rec_filled:.6f} @ ~{avg_final:.4f}",
+                )
 
         res = type("Tmp", (), {"exchange_id": str(exchange_config.get("exchange_id") or ""), "exchange_order_id": str(market_order_id or limit_order_id), "raw": phases, "filled": filled_final, "avg_price": avg_final})()
 

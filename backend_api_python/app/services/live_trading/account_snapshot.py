@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.services.exchange_execution import resolve_exchange_config
 from app.services.live_trading.factory import create_client
 from app.services.live_trading.records import normalize_strategy_symbol
+from app.services.live_trading.spot_wallet_snapshot import list_spot_wallet_positions
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -65,7 +66,15 @@ def _append_snapshot_error(errors: List[str], exc: Exception, *, context: str) -
     logger.warning("%s: %s", context, exc)
 
 
-def _parse_okx_positions(data: List[Dict[str, Any]], *, market_type: str) -> List[Dict[str, Any]]:
+def _parse_okx_positions(
+    data: List[Dict[str, Any]],
+    *,
+    market_type: str,
+    client: Any = None,
+) -> List[Dict[str, Any]]:
+    from app.services.grid.fill_units import okx_swap_position_base_size
+
+    okx_client = client if client is not None and hasattr(client, "get_instrument") else None
     out: List[Dict[str, Any]] = []
     for p in data or []:
         if not isinstance(p, dict):
@@ -91,17 +100,230 @@ def _parse_okx_positions(data: List[Dict[str, Any]], *, market_type: str) -> Lis
             entry = float(p.get("avgPx") or 0.0)
         except Exception:
             entry = 0.0
+        if str(market_type or "").strip().lower() == "swap" and okx_client is not None:
+            qty_base = okx_swap_position_base_size(p, client=okx_client)
+        else:
+            qty_base = abs(float(pos))
+        if qty_base <= 0:
+            continue
         out.append(
             {
                 "symbol": normalize_strategy_symbol(hb_sym) or hb_sym,
                 "side": side,
-                "size": abs(float(pos)),
+                "size": qty_base,
                 "entry_price": entry,
                 "market_type": market_type,
                 "inst_id": inst_id,
             }
         )
     return out
+
+
+def _parse_okx_spot_balances(balance_resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Backward-compatible wrapper; prefer ``list_spot_wallet_positions(OkxClient)``."""
+    from app.services.live_trading.spot_wallet_snapshot import _from_okx_balance
+
+    return _from_okx_balance(balance_resp)
+
+
+def _symbol_from_position_item(item: Dict[str, Any]) -> str:
+    sym_raw = str(
+        item.get("instId")
+        or item.get("symbol")
+        or item.get("contract")
+        or item.get("contract_code")
+        or ""
+    ).strip()
+    if not sym_raw:
+        return ""
+    hb = sym_raw.replace("-SWAP", "").replace("_", "/").replace("-", "/")
+    if hb.endswith("USDT") and "/" not in hb and len(hb) > 4:
+        hb = f"{hb[:-4]}/USDT"
+    return normalize_strategy_symbol(hb) or hb
+
+
+def _parse_swap_position_items(items: List[Dict[str, Any]], *, market_type: str = "swap") -> List[Dict[str, Any]]:
+    from app.services.live_trading.position_row_parse import (
+        extract_signed_position_qty,
+        infer_position_side_from_row,
+    )
+
+    out: List[Dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        side = infer_position_side_from_row(item)
+        qty = abs(extract_signed_position_qty(item))
+        if qty <= 1e-10:
+            continue
+        sym = _symbol_from_position_item(item)
+        if not sym:
+            continue
+        try:
+            entry = float(
+                item.get("avgPx")
+                or item.get("entryPrice")
+                or item.get("openPriceAvg")
+                or item.get("avgEntryPrice")
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            entry = 0.0
+        inst_id = str(item.get("instId") or item.get("symbol") or item.get("contract") or sym)
+        out.append(
+            {
+                "symbol": sym,
+                "side": side,
+                "size": qty,
+                "entry_price": entry,
+                "market_type": market_type,
+                "inst_id": inst_id,
+            }
+        )
+    return out
+
+
+def _fetch_spot_wallet(client: Any, errors: List[str], *, label: str) -> List[Dict[str, Any]]:
+    if client is None:
+        return []
+    try:
+        return list_spot_wallet_positions(client)
+    except Exception as e:
+        _append_snapshot_error(errors, e, context=label)
+        return []
+
+
+def _fetch_swap_positions_snapshot(client: Any, exchange_id: str, errors: List[str]) -> List[Dict[str, Any]]:
+    if client is None:
+        return []
+    ex = str(exchange_id or "").strip().lower()
+    label = f"{ex.upper() or 'EXCHANGE'} 合约持仓"
+    try:
+        from app.services.live_trading.binance import BinanceFuturesClient
+        from app.services.live_trading.bitget import BitgetMixClient
+        from app.services.live_trading.bybit import BybitClient
+        from app.services.live_trading.deepcoin import DeepcoinClient
+        from app.services.live_trading.gate import GateUsdtFuturesClient
+        from app.services.live_trading.htx import HtxClient
+        from app.services.live_trading.kucoin import KucoinFuturesClient
+        from app.services.live_trading.okx import OkxClient
+
+        if isinstance(client, OkxClient):
+            resp = client.get_positions(inst_type="SWAP") or {}
+            data = (resp.get("data") or []) if isinstance(resp, dict) else []
+            return _parse_okx_positions(data, market_type="swap", client=client)
+        if isinstance(client, BinanceFuturesClient):
+            rows = client.get_positions() or []
+            if isinstance(rows, dict) and "raw" in rows:
+                rows = rows["raw"]
+            return _parse_binance_futures_positions(rows if isinstance(rows, list) else [])
+        if isinstance(client, BybitClient):
+            resp = client.get_positions() or {}
+            items = ((resp.get("result") or {}).get("list") or []) if isinstance(resp, dict) else []
+            return _parse_swap_position_items(items if isinstance(items, list) else [], market_type="swap")
+        if isinstance(client, BitgetMixClient):
+            resp = client.get_positions(product_type="USDT-FUTURES") or {}
+            items = (resp.get("data") or []) if isinstance(resp, dict) else []
+            return _parse_swap_position_items(items if isinstance(items, list) else [], market_type="swap")
+        if isinstance(client, GateUsdtFuturesClient):
+            resp = client.get_positions()
+            items = resp if isinstance(resp, list) else []
+            parsed: List[Dict[str, Any]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                contract = str(item.get("contract") or "").strip()
+                try:
+                    sz_ct = float(item.get("size") or 0.0)
+                except (TypeError, ValueError):
+                    sz_ct = 0.0
+                if abs(sz_ct) <= 0:
+                    continue
+                row = dict(item)
+                row["size"] = sz_ct
+                row["symbol"] = contract
+                qm = 1.0
+                try:
+                    meta = client.get_contract(contract=contract) or {}
+                    qm = float(meta.get("quanto_multiplier") or meta.get("contract_size") or 0.0) or 1.0
+                except Exception:
+                    qm = 1.0
+                for leg in _parse_swap_position_items([row], market_type="swap"):
+                    leg["size"] = float(leg.get("size") or 0) * qm
+                    parsed.append(leg)
+            return parsed
+        if isinstance(client, KucoinFuturesClient):
+            resp = client.get_positions() or {}
+            data = resp.get("data") if isinstance(resp, dict) else resp
+            items = data if isinstance(data, list) else []
+            parsed = []
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                p_sym = str(item.get("symbol") or "").strip()
+                mult = 1.0
+                try:
+                    meta = client.get_contract(symbol=p_sym) or {}
+                    mult = float(meta.get("multiplier") or meta.get("lotSize") or 0.0) or 1.0
+                except Exception:
+                    mult = 1.0
+                row = dict(item)
+                row["currentQty"] = item.get("currentQty") or item.get("quantity")
+                for leg in _parse_swap_position_items([row], market_type="swap"):
+                    leg["size"] = float(leg.get("size") or 0) * mult
+                    parsed.append(leg)
+            return parsed
+        if isinstance(client, DeepcoinClient):
+            resp = client.get_positions() or {}
+            data = resp.get("data") if isinstance(resp, dict) else resp
+            if isinstance(data, dict):
+                data = data.get("list") or [data]
+            return _parse_swap_position_items(data if isinstance(data, list) else [], market_type="swap")
+        if isinstance(client, HtxClient):
+            resp = client.get_positions() or {}
+            data = (resp.get("data") or []) if isinstance(resp, dict) else []
+            return _parse_swap_position_items(data if isinstance(data, list) else [], market_type="swap")
+        if hasattr(client, "get_positions"):
+            resp = client.get_positions() or {}
+            if isinstance(resp, list):
+                return _parse_swap_position_items(resp, market_type="swap")
+            data = resp.get("data") if isinstance(resp, dict) else resp
+            if isinstance(data, dict):
+                data = data.get("list") or [data]
+            if isinstance(data, list):
+                return _parse_swap_position_items(data, market_type="swap")
+    except Exception as e:
+        _append_snapshot_error(errors, e, context=label)
+    return []
+
+
+def _fetch_multi_crypto_snapshot(
+    exchange_config: Dict[str, Any],
+    exchange_id: str,
+    errors: List[str],
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    ex = str(exchange_id or "").strip().lower()
+    swap_pos: List[Dict[str, Any]] = []
+    spot_pos: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
+
+    swap_client = None
+    try:
+        swap_client = create_client(exchange_config, market_type="swap")
+        swap_pos = _fetch_swap_positions_snapshot(swap_client, ex, errors)
+    except Exception as e:
+        _append_snapshot_error(errors, e, context=f"{ex.upper()} 合约连接")
+
+    spot_client = None
+    try:
+        spot_client = create_client(exchange_config, market_type="spot")
+    except Exception:
+        spot_client = swap_client
+    spot_pos = _fetch_spot_wallet(spot_client, errors, label=f"{ex.upper()} 现货持仓")
+    if not spot_pos and swap_client is not None and spot_client is not swap_client:
+        spot_pos = _fetch_spot_wallet(swap_client, errors, label=f"{ex.upper()} 现货持仓")
+
+    return swap_pos, spot_pos, orders
 
 
 def _parse_binance_futures_positions(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -217,15 +439,13 @@ def _fetch_okx_snapshot(
     try:
         resp = client.get_positions(inst_type="SWAP")
         data = (resp.get("data") or []) if isinstance(resp, dict) else []
-        swap_pos = _parse_okx_positions(data, market_type="swap")
+        swap_pos = _parse_okx_positions(data, market_type="swap", client=client)
     except Exception as e:
         _append_snapshot_error(errors, e, context="OKX 合约持仓")
     try:
-        resp = client.get_positions(inst_type="SPOT")
-        data = (resp.get("data") or []) if isinstance(resp, dict) else []
-        spot_pos = _parse_okx_positions(data, market_type="spot")
+        spot_pos = _fetch_spot_wallet(client, errors, label="OKX 现货持仓")
     except Exception as e:
-        logger.debug("OKX spot positions snapshot skipped: %s", e)
+        _append_snapshot_error(errors, e, context="OKX 现货持仓")
     for inst_type, mt, label in (
         ("SWAP", "swap", "OKX 合约挂单"),
         ("SPOT", "spot", "OKX 现货挂单"),
@@ -277,6 +497,10 @@ def _fetch_binance_snapshot(
         except Exception as e:
             _append_snapshot_error(errors, e, context="Binance 合约挂单")
     elif isinstance(client, BinanceSpotClient):
+        try:
+            spot_pos = _fetch_spot_wallet(client, errors, label="Binance 现货持仓")
+        except Exception as e:
+            _append_snapshot_error(errors, e, context="Binance 现货持仓")
         try:
             rows = client._signed_request("GET", "/api/v3/openOrders", params={})
             orders = _parse_binance_orders(_as_list_payload(rows), market_type="spot")
@@ -334,22 +558,38 @@ def fetch_account_snapshot(*, user_id: int, credential_id: int) -> Dict[str, Any
             swap_all.extend(sp)
             spot_all.extend(st)
             orders_all.extend(od)
+    elif exchange_id in (
+        "bitget",
+        "bybit",
+        "gate",
+        "gateio",
+        "kucoin",
+        "htx",
+        "huobi",
+        "deepcoin",
+        "kraken",
+        "coinbase",
+        "coinbaseexchange",
+    ):
+        sp, st, od = _fetch_multi_crypto_snapshot(exchange_config, exchange_id, errors)
+        swap_all.extend(sp)
+        spot_all.extend(st)
+        orders_all.extend(od)
     else:
         try:
             client = create_client(exchange_config, market_type="swap")
             from app.services.live_trading.binance import BinanceFuturesClient
 
             if isinstance(client, BinanceFuturesClient):
-                sp, _, od = _fetch_binance_snapshot(client, "swap", errors)
+                sp, st, od = _fetch_binance_snapshot(client, "swap", errors)
                 swap_all.extend(sp)
+                spot_all.extend(st)
                 orders_all.extend(od)
-            elif hasattr(client, "get_positions"):
-                resp = client.get_positions() or {}
-                data = resp.get("data") if isinstance(resp, dict) else resp
-                if isinstance(data, list):
-                    swap_all.extend(_parse_okx_positions(data, market_type="swap"))
             else:
-                errors.append(f"{exchange_id}：暂不支持账户快照，请使用 OKX / Binance")
+                sp, st, od = _fetch_multi_crypto_snapshot(exchange_config, exchange_id, errors)
+                swap_all.extend(sp)
+                spot_all.extend(st)
+                orders_all.extend(od)
         except Exception as e:
             _append_snapshot_error(errors, e, context=f"{exchange_id} 账户连接")
 
