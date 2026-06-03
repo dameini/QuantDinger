@@ -940,25 +940,42 @@ class HtxClient(BaseRestClient):
             )
         )
 
-        side_raw = str(self._first_value(row, "type", "direction", "side", "order_type", "orderType") or "").lower()
+        pending_signal_type = str(row.get("_pending_signal_type") or "").strip().lower()
+        side_raw = str(self._first_value(row, "side", "direction", "order_side", "orderSide", "type", "order_type", "orderType") or "").lower()
         offset_raw = str(self._first_value(row, "offset", "trade_type", "tradeType", "reduce_only") or "").lower()
+        position_side = str(self._first_value(row, "position_side", "positionSide", "pos_side", "posSide") or "").lower()
+        reduce_only = offset_raw in ("close", "reduce", "1", "true")
         if "buy" in side_raw:
             side = "buy"
         elif "sell" in side_raw:
             side = "sell"
+        elif pending_signal_type in ("open_long", "add_long", "close_short", "reduce_short"):
+            side = "buy"
+        elif pending_signal_type in ("open_short", "add_short", "close_long", "reduce_long"):
+            side = "sell"
         else:
             side = side_raw
-        is_close = offset_raw in ("close", "reduce", "1", "true") or "close" in side_raw
-        if market_type == "spot":
-            trade_type = "buy" if side == "buy" else "sell"
-        elif side == "buy" and is_close:
-            trade_type = "close_short"
-        elif side == "sell" and is_close:
-            trade_type = "close_long"
-        elif side == "sell":
-            trade_type = "open_short"
+
+        if pending_signal_type:
+            trade_type = pending_signal_type
         else:
-            trade_type = "open_long"
+            is_close = reduce_only or "close" in side_raw
+            if market_type == "swap" and not is_close and position_side in ("long", "short"):
+                if position_side == "long" and side == "sell":
+                    is_close = True
+                elif position_side == "short" and side == "buy":
+                    is_close = True
+
+            if market_type == "spot":
+                trade_type = "buy" if side == "buy" else "sell"
+            elif side == "buy" and is_close:
+                trade_type = "close_short"
+            elif side == "sell" and is_close:
+                trade_type = "close_long"
+            elif side == "sell":
+                trade_type = "open_short"
+            else:
+                trade_type = "open_long"
 
         price = self._to_float(self._first_value(row, "price", "trade_price", "tradePrice", "match_price", "matchPrice"))
         qty = self._to_float(
