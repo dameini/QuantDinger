@@ -53,6 +53,8 @@ class HtxClient(BaseRestClient):
         self._spot_account_id: Optional[str] = None
         self._contract_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._contract_cache_ttl_sec = 300.0
+        self._spot_symbol_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._spot_symbol_cache_ttl_sec = 300.0
         self._lever_cache: Dict[str, int] = {}
         self._v5_asset_mode: Optional[int] = None
         self._v5_asset_mode_ts: float = 0.0
@@ -108,6 +110,31 @@ class HtxClient(BaseRestClient):
         except Exception:
             return 0
 
+    @staticmethod
+    def _floor_to_precision(value: Decimal, precision: Optional[int]) -> Decimal:
+        try:
+            if precision is None:
+                return value
+            p = int(precision)
+            if p < 0:
+                return value
+            q = Decimal("1").scaleb(-p)
+            return value.quantize(q, rounding=ROUND_DOWN)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _dec_str(d: Decimal, max_decimals: int = 18, strict_precision: Optional[int] = None) -> str:
+        try:
+            if strict_precision is not None:
+                d = HtxClient._floor_to_precision(d, strict_precision)
+                prec = max(0, int(strict_precision))
+                return f"{d:.{prec}f}".rstrip("0").rstrip(".")
+        except Exception:
+            pass
+        s = f"{d:.{max_decimals}f}"
+        return s.rstrip("0").rstrip(".")
+
     def _sign_params(self, *, method: str, base_url: str, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
         signed = dict(params or {})
         signed["AccessKeyId"] = self.api_key
@@ -133,6 +160,59 @@ class HtxClient(BaseRestClient):
         if isinstance(data, dict) and str(data.get("status") or "").lower() == "error":
             raise LiveTradingError(f"HTX spot error: {data}")
         return data if isinstance(data, dict) else {"raw": data}
+
+    def _get_spot_symbol_info(self, *, symbol: str) -> Dict[str, Any]:
+        sym = to_htx_spot_symbol(symbol)
+        if not sym:
+            return {}
+        now = time.time()
+        cached = self._spot_symbol_cache.get(sym)
+        if cached:
+            ts, data = cached
+            if (now - float(ts or 0.0)) <= float(self._spot_symbol_cache_ttl_sec or 300.0):
+                return dict(data or {})
+        try:
+            raw = self._spot_public_request("GET", "/v1/settings/common/market-symbols")
+            rows = raw.get("data") if isinstance(raw, dict) else None
+            if not isinstance(rows, list):
+                rows = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row_sym = str(row.get("symbol") or row.get("sc") or "").strip().lower()
+                if row_sym == sym.lower():
+                    self._spot_symbol_cache[sym] = (now, dict(row))
+                    return dict(row)
+        except Exception as e:
+            logger.debug("HTX spot symbol metadata fetch failed for %s: %s", sym, e)
+        return {}
+
+    @staticmethod
+    def _extract_spot_amount_precision(info: Dict[str, Any]) -> Optional[int]:
+        if not isinstance(info, dict):
+            return None
+        for key in ("amount-precision", "amount_precision", "ap", "quantityPrecision", "qtyPrecision"):
+            if info.get(key) is not None:
+                try:
+                    prec = int(info.get(key))
+                    return prec if prec >= 0 else None
+                except Exception:
+                    continue
+        return None
+
+    def _normalize_quantity(self, *, symbol: str, quantity: float, for_market: bool = True) -> Tuple[Decimal, Optional[int]]:
+        req = self._to_dec(quantity)
+        if req <= 0:
+            return Decimal("0"), None
+        if self.market_type != "spot":
+            return req, None
+        info = self._get_spot_symbol_info(symbol=symbol)
+        qty_precision = self._extract_spot_amount_precision(info)
+        if qty_precision is not None:
+            req = self._floor_to_precision(req, qty_precision)
+        if req <= 0:
+            return Decimal("0"), qty_precision
+        return req, qty_precision
 
     def _spot_private_request(
         self,
@@ -711,11 +791,17 @@ class HtxClient(BaseRestClient):
                 if last <= 0:
                     raise LiveTradingError("HTX spot market buy requires latest price for qty->value conversion")
                 amount = amount * last
+                amount_str = f"{amount:.12f}".rstrip("0").rstrip(".")
+            else:
+                amt_dec, amt_precision = self._normalize_quantity(symbol=symbol, quantity=amount, for_market=True)
+                if amt_dec <= 0:
+                    raise LiveTradingError("Invalid HTX spot quantity after precision normalize")
+                amount_str = self._dec_str(amt_dec, strict_precision=amt_precision)
             body = {
                 "account-id": account_id,
                 "symbol": to_htx_spot_symbol(symbol),
                 "type": order_type,
-                "amount": f"{amount:.12f}".rstrip("0").rstrip("."),
+                "amount": amount_str,
                 "source": "spot-api",
             }
             formatted_client_order_id = self._format_spot_client_order_id(client_order_id)

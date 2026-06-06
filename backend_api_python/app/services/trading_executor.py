@@ -473,6 +473,41 @@ class TradingExecutor:
             return 3
         return 99
 
+    @staticmethod
+    def _normalize_signal_for_state(
+        signal_info: Optional[Dict[str, Any]],
+        state: str,
+        *,
+        indicator_both_mode: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Align indicator live signals with the executor state machine.
+
+        Some indicator strategies model scale-ins by emitting ``open_long`` /
+        ``open_short`` again while already holding that direction. In live mode
+        the executor only accepts ``add_long`` / ``add_short`` once a position
+        exists, so rewrite those signals before filtering/execution.
+
+        Keep both-mode flip semantics intact: in both-mode an ``open_long`` from
+        ``short`` or ``flat`` is intentional and must not be rewritten.
+        """
+        if not isinstance(signal_info, dict):
+            return signal_info
+        st = (state or "flat").strip().lower()
+        sig = str(signal_info.get("type") or "").strip().lower()
+        if indicator_both_mode:
+            return signal_info
+        mapped = None
+        if st == "long" and sig == "open_long":
+            mapped = "add_long"
+        elif st == "short" and sig == "open_short":
+            mapped = "add_short"
+        if not mapped:
+            return signal_info
+        normalized = dict(signal_info)
+        normalized["type"] = mapped
+        return normalized
+
     def _dedup_key(self, strategy_id: int, symbol: str, signal_type: str, signal_ts: int) -> str:
         sym = (symbol or "").strip().upper()
         if ":" in sym:
@@ -2853,11 +2888,19 @@ class TradingExecutor:
                         # - Bot-mode may need multiple state transitions in one tick
                         #   (e.g. grid partial take-profit / reverse across levels),
                         #   while indicator mode still executes at most one signal.
+                        normalized_triggered_signals = [
+                            self._normalize_signal_for_state(
+                                s,
+                                state,
+                                indicator_both_mode=indicator_both_mode,
+                            )
+                            for s in triggered_signals
+                        ]
                         if is_bot_mode:
-                            candidates = list(triggered_signals)
+                            candidates = list(normalized_triggered_signals)
                         else:
                             candidates = [
-                                s for s in triggered_signals
+                                s for s in normalized_triggered_signals
                                 if self._is_signal_allowed(
                                     state,
                                     s.get('type'),
