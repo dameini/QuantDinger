@@ -18,6 +18,7 @@ import numpy as np
 from app.data_sources import DataSourceFactory
 from app.utils.logger import get_logger
 from app.utils.db import get_db_connection
+from app.utils.risk_guard import trailing_exit_locks_net_profit
 from app.services.indicator_params import IndicatorParamsParser, IndicatorCaller
 
 logger = get_logger(__name__)
@@ -892,6 +893,13 @@ class BacktestService:
         trailing_enabled = bool(trailing_cfg.get('enabled'))
         trailing_pct = float(trailing_cfg.get('pct') or 0.0)
         trailing_activation_pct = float(trailing_cfg.get('activationPct') or 0.0)
+        exit_owner = str(cfg.get('exitOwner') or cfg.get('exit_owner') or '').strip().lower()
+        if exit_owner == 'indicator':
+            stop_loss_pct = 0.0
+            take_profit_pct = 0.0
+            trailing_enabled = False
+            trailing_pct = 0.0
+            trailing_activation_pct = 0.0
 
         # Signal-timing mode (next_bar_open / same_bar_close / ...). Mirrors the
         # parsing done in `run_multi_timeframe`/`run`/`run_strategy_script`. It's
@@ -1371,8 +1379,13 @@ class BacktestService:
                                 trail_active = highest_since_entry >= entry_price * (1 + trailing_activation_pct_eff)
                             if trail_active:
                                 tr_price = highest_since_entry * (1 - trailing_pct_eff)
-                                if path_price <= tr_price:
-                                    exec_price = tr_price * (1 - slippage)
+                                exec_price = tr_price * (1 - slippage)
+                                if path_price <= tr_price and trailing_exit_locks_net_profit(
+                                    "long",
+                                    entry_price=entry_price,
+                                    exit_price=exec_price,
+                                    fee_rate=commission,
+                                ):
                                     commission_fee = position * exec_price * commission
                                     profit = (exec_price - entry_price) * position - commission_fee
                                     capital += profit
@@ -1467,8 +1480,13 @@ class BacktestService:
                                 trail_active = lowest_since_entry <= entry_price * (1 - trailing_activation_pct_eff)
                             if trail_active:
                                 tr_price = lowest_since_entry * (1 + trailing_pct_eff)
-                                if path_price >= tr_price:
-                                    exec_price = tr_price * (1 + slippage)
+                                exec_price = tr_price * (1 + slippage)
+                                if path_price >= tr_price and trailing_exit_locks_net_profit(
+                                    "short",
+                                    entry_price=entry_price,
+                                    exit_price=exec_price,
+                                    fee_rate=commission,
+                                ):
                                     commission_fee = shares * exec_price * commission
                                     profit = (entry_price - exec_price) * shares - commission_fee
                                     if capital + profit <= 0:
@@ -2451,7 +2469,8 @@ class BacktestService:
             if has_output_signals and not has_four_way and not has_buy_sell:
                 raise ValueError(
                     "Invalid indicator script: output['signals'] is provided, but df execution columns are missing. "
-                    "Set df['buy'] and df['sell'], or four-way df['open_long'/'close_long'/'open_short'/'close_short']."
+                    "Set four-way df['open_long'], df['close_long'], df['open_short'], and df['close_short']. "
+                    "output['signals'] is chart-only and cannot place orders."
                 )
             
             # Extract signals from executed df
@@ -2493,7 +2512,7 @@ class BacktestService:
                 raise ValueError(
                     "Indicator must define either 4-way columns "
                     "(df['open_long'], df['close_long'], df['open_short'], df['close_short']) "
-                    "or simple columns (df['buy'], df['sell'])."
+                    "for new scripts. Legacy df['buy']/df['sell'] is still executable only for existing saved code."
                 )
             
         except Exception as e:
@@ -2840,6 +2859,13 @@ class BacktestService:
         trailing_enabled = bool(trailing_cfg.get('enabled'))
         trailing_pct = float(trailing_cfg.get('pct') or 0.0)
         trailing_activation_pct = float(trailing_cfg.get('activationPct') or 0.0)
+        exit_owner = str(cfg.get('exitOwner') or cfg.get('exit_owner') or '').strip().lower()
+        if exit_owner == 'indicator':
+            stop_loss_pct = 0.0
+            take_profit_pct = 0.0
+            trailing_enabled = False
+            trailing_pct = 0.0
+            trailing_activation_pct = 0.0
 
         # Risk percentages are the underlying's % price move directly.
         # Leverage only affects PnL magnitude / liquidation, NOT trigger thresholds.
@@ -3032,7 +3058,13 @@ class BacktestService:
                             trail_active = highest_since_entry >= entry_price * (1 + trailing_activation_pct_eff)
                         if trail_active:
                             tr_price = highest_since_entry * (1 - trailing_pct_eff)
-                            if low <= tr_price:
+                            tr_exec_price = tr_price * (1 - slippage)
+                            if low <= tr_price and trailing_exit_locks_net_profit(
+                                "long",
+                                entry_price=entry_price,
+                                exit_price=tr_exec_price,
+                                fee_rate=commission,
+                            ):
                                 candidates.append(('close_long_trailing', tr_price))
 
                     if candidates:
@@ -3083,7 +3115,13 @@ class BacktestService:
                             trail_active = lowest_since_entry <= entry_price * (1 - trailing_activation_pct_eff)
                         if trail_active:
                             tr_price = lowest_since_entry * (1 + trailing_pct_eff)
-                            if high >= tr_price:
+                            tr_exec_price = tr_price * (1 + slippage)
+                            if high >= tr_price and trailing_exit_locks_net_profit(
+                                "short",
+                                entry_price=entry_price,
+                                exit_price=tr_exec_price,
+                                fee_rate=commission,
+                            ):
                                 candidates.append(('close_short_trailing', tr_price))
 
                     if candidates:

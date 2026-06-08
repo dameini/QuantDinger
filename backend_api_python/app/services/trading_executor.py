@@ -24,6 +24,7 @@ import numpy as np
 from app.utils.logger import get_logger
 from app.utils.db import get_db_connection
 from app.utils.strategy_runtime_logs import append_strategy_log
+from app.utils.risk_guard import DEFAULT_TAKER_FEE_RATE, trailing_exit_locks_net_profit
 from app.data_sources import DataSourceFactory, UnsupportedMarketError
 from app.services.kline import KlineService
 from app.services.indicator_params import IndicatorParamsParser, IndicatorCaller, StrategyConfigParser
@@ -595,6 +596,21 @@ class TradingExecutor:
         code_cfg = tc.get("_strategy_cfg_from_code")
         return code_cfg if isinstance(code_cfg, dict) else {}
 
+    def _exit_owner_from_trading_config(self, trading_config: Optional[Dict[str, Any]]) -> str:
+        tc = trading_config if isinstance(trading_config, dict) else {}
+        code_cfg = self._code_strategy_cfg(tc)
+        owner = (
+            code_cfg.get("exitOwner")
+            or code_cfg.get("exit_owner")
+            or tc.get("exit_owner")
+            or tc.get("exitOwner")
+            or ""
+        )
+        return str(owner or "").strip().lower()
+
+    def _indicator_owns_exits(self, trading_config: Optional[Dict[str, Any]]) -> bool:
+        return self._exit_owner_from_trading_config(trading_config) == "indicator"
+
     def _risk_params_from_trading_config(self, trading_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Resolve risk/position ratios for live execution.
@@ -604,7 +620,7 @@ class TradingExecutor:
         trading_config *_pct fields (stored as percent numbers).
         """
         code_cfg = self._code_strategy_cfg(trading_config)
-        if code_cfg:
+        if code_cfg and ("risk" in code_cfg or "position" in code_cfg):
             risk = code_cfg.get("risk") or {}
             trailing = risk.get("trailing") or {}
             pos = code_cfg.get("position") or {}
@@ -645,7 +661,7 @@ class TradingExecutor:
         """
         tc = trading_config or {}
         code_cfg = self._code_strategy_cfg(tc)
-        if code_cfg:
+        if code_cfg and ("risk" in code_cfg or "position" in code_cfg):
             risk = code_cfg.get("risk") or {}
             trailing = risk.get("trailing") or {}
             pos = code_cfg.get("position") or {}
@@ -689,7 +705,7 @@ class TradingExecutor:
         adverse_reduce_size_pct = self._to_ratio(tc.get("adverse_reduce_size_pct"))
         adverse_reduce_max_times = int(tc.get("adverse_reduce_max_times") or 0)
 
-        return {
+        out = {
             "risk": {
                 "stopLossPct": stop_loss_pct,
                 "takeProfitPct": take_profit_pct,
@@ -729,6 +745,10 @@ class TradingExecutor:
                 },
             },
         }
+        exit_owner = self._exit_owner_from_trading_config(tc)
+        if exit_owner:
+            out["exitOwner"] = exit_owner
+        return out
     
     def start_strategy(self, strategy_id: int) -> bool:
         """
@@ -2107,6 +2127,9 @@ class TradingExecutor:
                     td = code_cfg.get("tradeDirection")
                     if td and not trading_config.get("trade_direction"):
                         trading_config["trade_direction"] = td
+                    exit_owner = code_cfg.get("exitOwner")
+                    if exit_owner and not trading_config.get("exit_owner"):
+                        trading_config["exit_owner"] = exit_owner
                     strategy["trading_config"] = trading_config
 
             # Resolve credential references before any strategy branch (grid / bots / cross-sectional).
@@ -2981,6 +3004,7 @@ class TradingExecutor:
                                 stop_loss_price=selected.get("stop_loss_price"),
                                 take_profit_price=selected.get("take_profit_price"),
                                 signal_reason=selected.get("reason"),
+                                matched_entry_price=selected.get("matched_entry_price"),
                                 trailing_stop_price=selected.get("trailing_stop_price"),
                                 script_base_qty=selected.get("script_base_qty"),
                                 script_quote_amount=selected.get("script_quote_amount"),
@@ -3254,6 +3278,29 @@ class TradingExecutor:
                 self._exchange_fee_cache[strategy_id] = None
             return None
 
+    def _effective_taker_fee_rate(
+        self,
+        strategy_id: int,
+        trading_config: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        """Fee rate used by runtime risk guards and local signal-mode fills."""
+        try:
+            cached = getattr(self, "_exchange_fee_cache", {}) or {}
+            exchange_fee = cached.get(strategy_id)
+            if exchange_fee and float(exchange_fee.get("taker") or 0.0) > 0:
+                return float(exchange_fee["taker"])
+        except Exception:
+            pass
+
+        try:
+            configured_pct = float((trading_config or {}).get("commission", 0) or 0)
+            if configured_pct > 0:
+                return max(0.0, min(configured_pct / 100.0, 0.05))
+        except Exception:
+            pass
+
+        return DEFAULT_TAKER_FEE_RATE
+
     @staticmethod
     def _live_crypto_kline_params(
         *,
@@ -3447,6 +3494,9 @@ class TradingExecutor:
             if bot_type in ('grid', 'dca'):
                 return None
 
+            if self._indicator_owns_exits(trading_config):
+                return None
+
             if not self._is_server_side_exit_enabled(trading_config, 'enable_server_side_stop_loss'):
                 return None
 
@@ -3477,10 +3527,11 @@ class TradingExecutor:
                     if current_price <= stop_line:
                         return {
                             'type': 'close_long',
-                            'trigger_price': 0,
-                            'position_size': 0,
+                            'trigger_price': float(current_price),
+                            'position_size': float(pos.get('size') or 0.0),
                             'timestamp': candle_ts,
                             'reason': 'server_stop_loss',
+                            'matched_entry_price': entry_price,
                             'stop_loss_price': stop_line,
                         }
                 else:
@@ -3488,10 +3539,11 @@ class TradingExecutor:
                     if current_price >= stop_line:
                         return {
                             'type': 'close_short',
-                            'trigger_price': 0,
-                            'position_size': 0,
+                            'trigger_price': float(current_price),
+                            'position_size': float(pos.get('size') or 0.0),
                             'timestamp': candle_ts,
                             'reason': 'server_stop_loss',
+                            'matched_entry_price': entry_price,
                             'stop_loss_price': stop_line,
                         }
 
@@ -3530,6 +3582,9 @@ class TradingExecutor:
                 # Grid / DCA bots: see ``_grid_bot_risk_exits``.
                 return None
 
+            if self._indicator_owns_exits(trading_config):
+                return None
+
             if not self._is_server_side_exit_enabled(trading_config, 'enable_server_side_take_profit'):
                 return None
 
@@ -3548,6 +3603,7 @@ class TradingExecutor:
             tp_eff = tp if tp > 0 else 0.0
             trailing_pct_eff = trailing_pct if trailing_pct > 0 else 0.0
             trailing_act_eff = trailing_act if trailing_act > 0 else 0.0
+            trailing_fee_rate = self._effective_taker_fee_rate(strategy_id, trading_config)
 
             # Conflict rule: when trailing is enabled, fixed TP is disabled.
             if trailing_enabled and trailing_pct_eff > 0:
@@ -3607,13 +3663,19 @@ class TradingExecutor:
                             active = hp >= entry_price * (1 + trailing_act_eff)
                         if active:
                             stop_line = hp * (1 - trailing_pct_eff)
-                            if current_price <= stop_line:
+                            if current_price <= stop_line and trailing_exit_locks_net_profit(
+                                "long",
+                                entry_price=entry_price,
+                                exit_price=float(current_price),
+                                fee_rate=trailing_fee_rate,
+                            ):
                                 return {
                                     'type': 'close_long',
-                                    'trigger_price': 0,
-                                    'position_size': 0,
+                                    'trigger_price': float(current_price),
+                                    'position_size': float(pos.get('size') or 0.0),
                                     'timestamp': candle_ts,
                                     'reason': 'server_trailing_stop',
+                                    'matched_entry_price': entry_price,
                                     'trailing_stop_price': stop_line,
                                     'highest_price': hp,
                                 }
@@ -3623,13 +3685,19 @@ class TradingExecutor:
                             active = lp <= entry_price * (1 - trailing_act_eff)
                         if active:
                             stop_line = lp * (1 + trailing_pct_eff)
-                            if current_price >= stop_line:
+                            if current_price >= stop_line and trailing_exit_locks_net_profit(
+                                "short",
+                                entry_price=entry_price,
+                                exit_price=float(current_price),
+                                fee_rate=trailing_fee_rate,
+                            ):
                                 return {
                                     'type': 'close_short',
-                                    'trigger_price': 0,
-                                    'position_size': 0,
+                                    'trigger_price': float(current_price),
+                                    'position_size': float(pos.get('size') or 0.0),
                                     'timestamp': candle_ts,
                                     'reason': 'server_trailing_stop',
+                                    'matched_entry_price': entry_price,
                                     'trailing_stop_price': stop_line,
                                     'lowest_price': lp,
                                 }
@@ -3640,10 +3708,11 @@ class TradingExecutor:
                         if current_price >= tp_line:
                             return {
                                 'type': 'close_long',
-                                'trigger_price': 0,
-                                'position_size': 0,
+                                'trigger_price': float(current_price),
+                                'position_size': float(pos.get('size') or 0.0),
                                 'timestamp': candle_ts,
                                 'reason': 'server_take_profit',
+                                'matched_entry_price': entry_price,
                                 'take_profit_price': tp_line,
                             }
                     else:
@@ -3651,10 +3720,11 @@ class TradingExecutor:
                         if current_price <= tp_line:
                             return {
                                 'type': 'close_short',
-                                'trigger_price': 0,
-                                'position_size': 0,
+                                'trigger_price': float(current_price),
+                                'position_size': float(pos.get('size') or 0.0),
                                 'timestamp': candle_ts,
                                 'reason': 'server_take_profit',
+                                'matched_entry_price': entry_price,
                                 'take_profit_price': tp_line,
                             }
 
@@ -4303,7 +4373,8 @@ class TradingExecutor:
             if has_output_signals and not has_four_way and not has_buy_sell:
                 raise ValueError(
                     "Invalid indicator script: output['signals'] is provided, but df execution columns are missing. "
-                    "Set df['buy'] and df['sell'], or four-way df['open_long'/'close_long'/'open_short'/'close_short']."
+                    "Set four-way df['open_long'], df['close_long'], df['open_short'], and df['close_short']. "
+                    "output['signals'] is chart-only and cannot place orders."
                 )
             
             return executed_df, exec_env
@@ -4360,6 +4431,57 @@ class TradingExecutor:
         if raw in ("close", "flatten", "liquidate", "market_close"):
             return "close"
         return "notify"
+
+    def _simulated_open_qty_from_trade_rows(self, strategy_id: int, symbol: str, side: str) -> float:
+        """Best-effort net open quantity from signal/paper trade rows.
+
+        ``qd_strategy_positions`` can become stale after manual DB edits or older
+        paper-trading bugs. Before recording a simulated close, require a
+        corresponding unclosed trade leg so stale position rows cannot create
+        ghost close profit.
+        """
+        side_norm = (side or "").strip().lower()
+        if side_norm not in ("long", "short"):
+            return 0.0
+        sym_key = str(symbol or "").split(":")[0].strip()
+        try:
+            with get_db_connection() as db:
+                cursor = db.cursor()
+                cursor.execute(
+                    """
+                    SELECT symbol, type, amount
+                    FROM qd_strategy_trades
+                    WHERE strategy_id = %s
+                    ORDER BY id ASC
+                    """,
+                    (int(strategy_id),),
+                )
+                rows = cursor.fetchall() or []
+                cursor.close()
+        except Exception as e:
+            logger.warning(f"Failed to calculate simulated open qty: strategy={strategy_id}, err={e}")
+            return 0.0
+
+        qty = 0.0
+        for row in rows:
+            row_symbol = str((row or {}).get("symbol") or "").split(":")[0].strip()
+            if row_symbol != sym_key:
+                continue
+            typ = str((row or {}).get("type") or "").strip().lower()
+            amount = float((row or {}).get("amount") or 0.0)
+            if amount <= 0:
+                continue
+            if side_norm == "long":
+                if typ in ("open_long", "add_long"):
+                    qty += amount
+                elif typ in ("close_long", "reduce_long"):
+                    qty -= amount
+            else:
+                if typ in ("open_short", "add_short"):
+                    qty += amount
+                elif typ in ("close_short", "reduce_short"):
+                    qty -= amount
+        return max(0.0, qty)
 
     def _get_open_positions_for_strategy(self, strategy_id: int) -> List[Dict[str, Any]]:
         """Return non-zero local positions for a strategy."""
@@ -4491,6 +4613,7 @@ class TradingExecutor:
         stop_loss_price: float = None,
         take_profit_price: float = None,
         signal_reason: str = "",
+        matched_entry_price: Optional[float] = None,
         trailing_stop_price: float = None,
         execution_mode: str = 'signal',
         notification_config: Optional[Dict[str, Any]] = None,
@@ -4816,6 +4939,40 @@ class TradingExecutor:
                 else:
                     amount = full_size
 
+            if str(execution_mode or "").strip().lower() == "signal" and (
+                sig.startswith("close_") or sig.startswith("reduce_")
+            ):
+                pos_side = "long" if "long" in sig else "short"
+                pos = next((p for p in current_positions if (p.get('side') or '').strip().lower() == pos_side), None)
+                local_size = float((pos or {}).get("size") or 0.0)
+                open_qty = self._simulated_open_qty_from_trade_rows(strategy_id, symbol, pos_side)
+                eps = max(1e-12, local_size * 1e-9)
+                if open_qty <= eps:
+                    append_strategy_log(
+                        strategy_id,
+                        "warning",
+                        (
+                            f"Skip {sig}: no unmatched {pos_side} entry trade for {symbol}; "
+                            "purging stale simulated position to prevent ghost close PnL"
+                        ),
+                    )
+                    if local_size > 0:
+                        self._close_position(strategy_id, symbol, pos_side)
+                    return False
+                if amount > open_qty:
+                    append_strategy_log(
+                        strategy_id,
+                        "warning",
+                        (
+                            f"Clamp {sig}: local_size={local_size:.12f}, "
+                            f"trade_open_qty={open_qty:.12f}, requested={amount:.12f}"
+                        ),
+                    )
+                    amount = open_qty
+                    if sig.startswith("reduce_"):
+                        sig = "close_long" if pos_side == "long" else "close_short"
+                        signal_type = sig
+
             if amount <= 0 and ('open' in signal_type or 'add' in signal_type):
                 return False
 
@@ -4884,14 +5041,8 @@ class TradingExecutor:
                     return True
 
                 # 更新数据库状态 (signal mode / local simulation)
-                # Prefer real exchange fee-rate; fall back to user-configured rate
-                _exchange_fee = self._exchange_fee_cache.get(strategy_id)
-                if _exchange_fee and _exchange_fee.get('taker', 0) > 0:
-                    _comm_rate = _exchange_fee['taker']
-                else:
-                    _comm_rate = float((trading_config or {}).get('commission', 0) or 0) / 100.0
-                    if _comm_rate <= 0:
-                        _comm_rate = 0.001
+                # Prefer real exchange fee-rate; fall back to user-configured rate.
+                _comm_rate = self._effective_taker_fee_rate(strategy_id, trading_config)
                 _est_commission = round(float(current_price or 0) * float(amount or 0) * _comm_rate, 8)
                 from app.utils.trade_close_reason import resolve_close_reason_for_record
                 _exit_reason = resolve_close_reason_for_record(
@@ -4904,7 +5055,8 @@ class TradingExecutor:
                     self._record_trade(
                         strategy_id=strategy_id, symbol=symbol, type=signal_type,
                         price=current_price, amount=amount, value=amount*current_price,
-                        commission=_est_commission
+                        commission=_est_commission,
+                        matched_entry_price=current_price,
                     )
                     side = 'short' if 'short' in signal_type else 'long'
                     
@@ -4948,6 +5100,7 @@ class TradingExecutor:
                         price=current_price, amount=amount, value=amount*current_price,
                         profit=reduce_profit, commission=_est_commission,
                         close_reason=_exit_reason,
+                        matched_entry_price=old_entry if old_entry > 0 else matched_entry_price,
                     )
                     
                     new_size = max(0.0, old_size - float(amount or 0.0))
@@ -4983,6 +5136,7 @@ class TradingExecutor:
                         price=current_price, amount=amount, value=amount*current_price,
                         profit=close_profit, commission=_est_commission,
                         close_reason=_exit_reason,
+                        matched_entry_price=entry_price if old_pos and entry_price > 0 else matched_entry_price,
                     )
                     self._close_position(strategy_id, symbol, side)
                     _pstr = f", profit={close_profit:.4f}" if close_profit is not None else ""

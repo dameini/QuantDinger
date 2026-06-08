@@ -13,6 +13,7 @@ import time
 from app.services.strategy import StrategyService
 from app.services.strategy_compiler import StrategyCompiler
 from app.services.backtest import BacktestService
+from app.services.backtest_limits import validate_backtest_range
 from app.services.strategy_snapshot import StrategySnapshotResolver
 from app import get_trading_executor
 from app.utils.logger import get_logger
@@ -466,28 +467,29 @@ def run_strategy_backtest():
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
 
-        days_diff = (end_date - start_date).days
         timeframe = snapshot.get('timeframe') or '1D'
-        if timeframe == '1m':
-            max_days = 30
-            max_range_text = '1 month'
-        elif timeframe == '5m':
-            max_days = 180
-            max_range_text = '6 months'
-        elif timeframe in ['15m', '30m']:
-            max_days = 365
-            max_range_text = '1 year'
-        else:
-            max_days = 1095
-            max_range_text = '3 years'
-        if days_diff > max_days:
+        svc = get_backtest_service()
+        warmup_bars = svc._estimate_warmup_bars(
+            snapshot.get('code') or '',
+            (snapshot.get('strategy_config') or {}).get('indicator_params')
+            if isinstance(snapshot.get('strategy_config'), dict)
+            else None,
+        )
+        range_error = validate_backtest_range(
+            market=snapshot.get('market') or '',
+            symbol=snapshot.get('symbol') or '',
+            timeframe=timeframe,
+            start_date=start_date,
+            end_date=end_date,
+            warmup_bars=warmup_bars,
+        )
+        if range_error:
             return jsonify({
                 'code': 0,
-                'msg': f'Backtest range exceeds limit: timeframe {timeframe} supports up to {max_range_text} ({max_days} days), but you selected {days_diff} days',
-                'data': None
+                'msg': range_error['msg'],
+                'data': range_error
             }), 400
 
-        svc = get_backtest_service()
         result = svc.run_strategy_snapshot(snapshot, start_date=start_date, end_date=end_date)
         ea = dict(result.get('executionAssumptions') or {})
         ea['commission'] = round(float(snapshot.get('commission') or 0), 6)
@@ -1906,15 +1908,6 @@ def stop_strategy():
         if not st:
             return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
 
-        conflict = _find_live_strategy_conflict(st, user_id)
-        if conflict:
-            msg = _live_conflict_message(conflict)
-            return jsonify({
-                'code': 0,
-                'msg': msg,
-                'data': {'conflict': conflict},
-            }), 409
-        
         # Get strategy type
         strategy_type = get_strategy_service().get_strategy_type(strategy_id)
         
@@ -1979,6 +1972,16 @@ def start_strategy():
                 'msg': 'AI strategy has been removed; local edition does not support starting AI strategies',
                 'data': None
             }), 400
+
+        conflict = _find_live_strategy_conflict(st, user_id)
+        if conflict:
+            msg = _live_conflict_message(conflict)
+            return jsonify({
+                'code': 0,
+                'msg': msg,
+                'data': {'conflict': conflict},
+            }), 409
+
         get_strategy_service().update_strategy_status(strategy_id, 'running', user_id=user_id)
 
         executor = get_trading_executor()
@@ -3029,6 +3032,97 @@ def get_strategy_performance():
     except Exception as e:
         logger.error(f"get_strategy_performance failed: {str(e)}")
         return jsonify({'code': 0, 'msg': str(e)}), 500
+
+
+@strategy_blp.route('/strategies/review-report', methods=['POST'])
+@login_required
+def get_strategy_review_report():
+    """Build an AI-assisted strategy review report from factual trade records."""
+    try:
+        user_id = int(g.user_id)
+        data = request.get_json(silent=True) or {}
+
+        try:
+            strategy_id = int(request.args.get('id') or data.get('id') or data.get('strategy_id') or 0)
+        except Exception:
+            strategy_id = 0
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
+
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        try:
+            lookback_days = int(data.get('lookback_days') or request.args.get('lookback_days') or 30)
+        except Exception:
+            lookback_days = 30
+
+        include_ai_raw = data.get('include_ai')
+        if include_ai_raw is None:
+            include_ai_raw = request.args.get('include_ai', '1')
+        include_ai = str(include_ai_raw).strip().lower() not in ('0', 'false', 'no', 'off')
+        language = str(data.get('language') or request.args.get('lang') or request.headers.get('Accept-Language') or 'zh-CN')
+
+        from app.services.strategy_review import StrategyReviewService
+        report = StrategyReviewService().build_report(
+            strategy_id=int(strategy_id),
+            user_id=user_id,
+            lookback_days=lookback_days,
+            include_ai=include_ai,
+            language=language,
+        )
+        return jsonify({'code': 1, 'msg': 'success', 'data': report})
+    except Exception as e:
+        logger.error(f"get_strategy_review_report failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@strategy_blp.route('/strategies/review-report/history', methods=['GET'])
+@login_required
+def get_strategy_review_report_history():
+    """List or load saved AI strategy review reports."""
+    try:
+        user_id = int(g.user_id)
+        try:
+            strategy_id = int(request.args.get('id') or request.args.get('strategy_id') or 0)
+        except Exception:
+            strategy_id = 0
+        if not strategy_id:
+            return jsonify({'code': 0, 'msg': 'Missing strategy id parameter', 'data': None}), 400
+
+        st = get_strategy_service().get_strategy(strategy_id, user_id=user_id)
+        if not st:
+            return jsonify({'code': 0, 'msg': 'Strategy not found', 'data': None}), 404
+
+        from app.services.strategy_review import StrategyReviewService
+        service = StrategyReviewService()
+        try:
+            report_id = int(request.args.get('report_id') or 0)
+        except Exception:
+            report_id = 0
+
+        if report_id:
+            report = service.get_history_report(
+                report_id=report_id,
+                strategy_id=strategy_id,
+                user_id=user_id,
+            )
+            if not report:
+                return jsonify({'code': 0, 'msg': 'Review report not found', 'data': None}), 404
+            return jsonify({'code': 1, 'msg': 'success', 'data': report})
+
+        try:
+            limit = int(request.args.get('limit') or 20)
+        except Exception:
+            limit = 20
+        history = service.list_history(strategy_id=strategy_id, user_id=user_id, limit=limit)
+        return jsonify({'code': 1, 'msg': 'success', 'data': history})
+    except Exception as e:
+        logger.error(f"get_strategy_review_report_history failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
 @strategy_blp.route('/strategies/logs', methods=['GET'])

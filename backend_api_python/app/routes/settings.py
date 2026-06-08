@@ -89,7 +89,7 @@ ADVANCED_KEYS = {
     'OPENROUTER_TEMPERATURE',
     'AI_ANALYSIS_CONSENSUS_TIMEFRAMES',
     'AI_CODE_GEN_MODEL',
-    'OPENAI_BASE_URL', 'DEEPSEEK_BASE_URL', 'GROK_BASE_URL', 'MINIMAX_BASE_URL',
+    'OPENAI_BASE_URL', 'DEEPSEEK_BASE_URL', 'GROK_BASE_URL', 'ATLASCLOUD_BASE_URL', 'MINIMAX_BASE_URL',
     # Trading internals
     'MAKER_WAIT_SEC',
     # Agent gateway (operator-level)
@@ -363,6 +363,7 @@ CONFIG_SCHEMA = {
                     {'value': 'google', 'label': 'Google Gemini'},
                     {'value': 'deepseek', 'label': 'DeepSeek'},
                     {'value': 'grok', 'label': 'xAI Grok'},
+                    {'value': 'atlascloud', 'label': 'AtlasCloud'},
                     {'value': 'custom', 'label': 'Custom API (OpenAI-compatible)'},
                     {'value': 'minimax', 'label': 'MiniMax'},
                     {'value': 'litellm', 'label': 'LiteLLM (100+ providers)'},
@@ -497,6 +498,33 @@ CONFIG_SCHEMA = {
                 'default': 'https://api.x.ai/v1',
                 'description': 'xAI Grok API endpoint',
                 'group': 'grok'
+            },
+            # AtlasCloud
+            {
+                'key': 'ATLASCLOUD_API_KEY',
+                'label': 'AtlasCloud API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://www.atlascloud.ai/docs/models/llm',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'AtlasCloud API key. Uses the official OpenAI-compatible LLM endpoint.',
+                'group': 'atlascloud'
+            },
+            {
+                'key': 'ATLASCLOUD_MODEL',
+                'label': 'AtlasCloud Model',
+                'type': 'text',
+                'default': 'deepseek-v3',
+                'description': 'Model: deepseek-v3',
+                'group': 'atlascloud'
+            },
+            {
+                'key': 'ATLASCLOUD_BASE_URL',
+                'label': 'AtlasCloud Base URL',
+                'type': 'text',
+                'default': 'https://api.atlascloud.ai/v1',
+                'description': 'AtlasCloud OpenAI-compatible API endpoint. Must include /v1.',
+                'group': 'atlascloud'
             },
             # Custom API (OpenAI-compatible)
             {
