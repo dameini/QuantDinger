@@ -4259,6 +4259,58 @@ class TradingExecutor:
             logger.error(f"Failed to execute indicator and extract prices: {str(e)}")
             logger.error(traceback.format_exc())
             return None
+
+    @staticmethod
+    def _apply_legacy_indicator_state_hydration_compat(indicator_code: str) -> str:
+        """
+        Backward-compatibility shim for legacy state-machine indicators.
+
+        Older four-way indicators often reinitialize internal state with:
+        ``position_qty = 0``, ``avg_price = 0.0``, ``last_buy_price = 0.0``.
+        In live mode the executor already knows the real position snapshot and
+        exposes ``initial_*`` globals, but those old indicators never read
+        them, so their replay state can drift from the actual exchange / DB
+        position.  When that happens a generic ``close_long`` generated from the
+        replay window can flatten a real position whose basis is completely
+        different.
+
+        To preserve existing user indicators without forcing manual rewrites, we
+        rewrite only these canonical zero-initializers into expressions seeded
+        from the live snapshot.  The patch is intentionally narrow:
+        - only exact top-level-style assignments are touched
+        - only the legacy long-state variable names are rewritten
+        - user code that already manages ``initial_*`` explicitly is unaffected
+        """
+        if not indicator_code:
+            return indicator_code or ""
+
+        compatibility_code = indicator_code
+
+        if re.search(r'^\s*position_qty\s*=\s*0\s*$', compatibility_code, re.MULTILINE):
+            compatibility_code = re.sub(
+                r'^\s*position_qty\s*=\s*0\s*$',
+                'position_qty = max(0, int(initial_position_count or (1 if int(initial_position or 0) > 0 else 0)))',
+                compatibility_code,
+                count=1,
+                flags=re.MULTILINE,
+            )
+        if re.search(r'^\s*avg_price\s*=\s*0(?:\.0+)?\s*$', compatibility_code, re.MULTILINE):
+            compatibility_code = re.sub(
+                r'^\s*avg_price\s*=\s*0(?:\.0+)?\s*$',
+                'avg_price = float(initial_avg_entry_price or 0.0) if int(initial_position or 0) > 0 else 0.0',
+                compatibility_code,
+                count=1,
+                flags=re.MULTILINE,
+            )
+        if re.search(r'^\s*last_buy_price\s*=\s*0(?:\.0+)?\s*$', compatibility_code, re.MULTILINE):
+            compatibility_code = re.sub(
+                r'^\s*last_buy_price\s*=\s*0(?:\.0+)?\s*$',
+                'last_buy_price = float(initial_last_add_price or initial_avg_entry_price or 0.0) if int(initial_position or 0) > 0 else 0.0',
+                compatibility_code,
+                count=1,
+                flags=re.MULTILINE,
+            )
+        return compatibility_code
     
     def _execute_indicator_df(
         self, indicator_code: str, df: pd.DataFrame, trading_config: Dict[str, Any], 
@@ -4341,9 +4393,11 @@ class TradingExecutor:
             exec_env = local_vars.copy()
             exec_env['__builtins__'] = build_safe_builtins()
 
-            # 兼容性修复：pandas 2.0+ 移除了 fillna(method=...) 参数
-            import re
-            compatibility_fixed_code = indicator_code
+            # 兼容性修复：pandas 2.0+ 移除了 fillna(method=...) 参数；
+            # 以及旧版状态机指标未读取 initial_* 持仓快照时的实盘状态漂移。
+            compatibility_fixed_code = self._apply_legacy_indicator_state_hydration_compat(
+                indicator_code
+            )
             compatibility_fixed_code = re.sub(
                 r'\.fillna\(\s*method\s*=\s*["\']ffill["\']\s*\)',
                 '.ffill()',

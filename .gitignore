@@ -87,3 +87,12 @@ QuantDinger-Vue-src/src/locales/lang/*.bak
 # Docker
 # ========================
 docker-compose.override.yml
+
+# ========================
+# Local Codex workflow files
+# ========================
+AGENTS.md
+CODEX_WORKFLOW.md
+SESSION.md
+TODO.md
+scripts/codex-session.sh
