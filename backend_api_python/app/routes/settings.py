@@ -415,6 +415,8 @@ CONFIG_SCHEMA = {
                 'label': 'OpenAI Model',
                 'type': 'text',
                 'default': 'gpt-4o',
+                'link': 'https://platform.openai.com/docs/models',
+                'link_text': 'settings.link.viewModels',
                 'description': 'Model name: gpt-4o, gpt-4o-mini, gpt-4-turbo, etc.',
                 'group': 'openai'
             },
@@ -442,6 +444,8 @@ CONFIG_SCHEMA = {
                 'label': 'Gemini Model',
                 'type': 'text',
                 'default': 'gemini-1.5-flash',
+                'link': 'https://ai.google.dev/gemini-api/docs/models',
+                'link_text': 'settings.link.viewModels',
                 'description': 'Model: gemini-1.5-flash, gemini-1.5-pro, gemini-2.0-flash-exp',
                 'group': 'google'
             },
@@ -461,6 +465,8 @@ CONFIG_SCHEMA = {
                 'label': 'DeepSeek Model',
                 'type': 'text',
                 'default': 'deepseek-chat',
+                'link': 'https://api-docs.deepseek.com/quick_start/pricing',
+                'link_text': 'settings.link.viewModels',
                 'description': 'Model: deepseek-chat, deepseek-coder',
                 'group': 'deepseek'
             },
@@ -488,6 +494,8 @@ CONFIG_SCHEMA = {
                 'label': 'Grok Model',
                 'type': 'text',
                 'default': 'grok-beta',
+                'link': 'https://docs.x.ai/docs/models',
+                'link_text': 'settings.link.viewModels',
                 'description': 'Model: grok-beta, grok-2',
                 'group': 'grok'
             },
@@ -505,7 +513,7 @@ CONFIG_SCHEMA = {
                 'label': 'AtlasCloud API Key',
                 'type': 'password',
                 'required': False,
-                'link': 'https://www.atlascloud.ai/docs/models/llm',
+                'link': 'https://www.atlascloud.ai/docs/api-keys',
                 'link_text': 'settings.link.getApiKey',
                 'description': 'AtlasCloud API key. Uses the official OpenAI-compatible LLM endpoint.',
                 'group': 'atlascloud'
@@ -515,7 +523,9 @@ CONFIG_SCHEMA = {
                 'label': 'AtlasCloud Model',
                 'type': 'text',
                 'default': 'deepseek-v3',
-                'description': 'Model: deepseek-v3',
+                'link': 'https://www.atlascloud.ai/docs/models/llm',
+                'link_text': 'settings.link.viewModels',
+                'description': 'AtlasCloud model id, e.g. deepseek-v3. Do not enter other-provider or OpenRouter-prefixed ids unless AtlasCloud lists them.',
                 'group': 'atlascloud'
             },
             {
@@ -567,6 +577,8 @@ CONFIG_SCHEMA = {
                 'label': 'MiniMax Model',
                 'type': 'text',
                 'default': 'MiniMax-M2.7',
+                'link': 'https://platform.minimax.io/docs',
+                'link_text': 'settings.link.viewModels',
                 'description': 'Model: MiniMax-M2.7, MiniMax-M2.7-highspeed',
                 'group': 'minimax'
             },
@@ -594,6 +606,8 @@ CONFIG_SCHEMA = {
                 'label': 'LiteLLM Model',
                 'type': 'text',
                 'default': 'gpt-4o-mini',
+                'link': 'https://docs.litellm.ai/docs/providers',
+                'link_text': 'settings.link.viewProviders',
                 'description': 'Model ID in provider/model format, e.g. anthropic/claude-sonnet-4-20250514, gemini/gemini-2.5-flash, azure/gpt-4o',
                 'group': 'litellm'
             },
