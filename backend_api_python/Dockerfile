@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # QuantDinger Backend API Dockerfile
 # BASE_IMAGE can be overridden from docker-compose (e.g. IMAGE_PREFIX for mirror pulls).
 ARG BASE_IMAGE=python:3.12-slim-bookworm
@@ -15,7 +16,9 @@ WORKDIR /app
 # Apt: when BUILD_REGION=cn, try Aliyun Debian mirror first (typical win in mainland) and
 # restore official on failure. Otherwise go straight to official sources so overseas
 # builders (e.g. GitHub-hosted runners) don't waste time hitting cn mirrors.
-RUN set -eux; \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    set -eux; \
     APT_TIMEOUT='Acquire::http::Timeout=35'; \
     if [ "$BUILD_REGION" = "cn" ]; then \
       if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
@@ -48,14 +51,15 @@ COPY requirements.txt .
 
 # Pip: when BUILD_REGION=cn, try Aliyun PyPI first; on any failure retry default index.
 # Otherwise install from PyPI official directly.
-RUN set -eux; \
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    set -eux; \
     if [ "$BUILD_REGION" = "cn" ]; then \
-      pip install --no-cache-dir --prefer-binary --timeout 180 \
+      pip install --prefer-binary --timeout 180 \
           -i https://mirrors.aliyun.com/pypi/simple/ \
           -r requirements.txt \
-        || pip install --no-cache-dir --prefer-binary --timeout 180 -r requirements.txt; \
+        || pip install --prefer-binary --timeout 180 -r requirements.txt; \
     else \
-      pip install --no-cache-dir --prefer-binary --timeout 180 -r requirements.txt; \
+      pip install --prefer-binary --timeout 180 -r requirements.txt; \
     fi; \
     apt-get purge -y --auto-remove build-essential python3-dev libffi-dev libssl-dev; \
     rm -rf /var/lib/apt/lists/*

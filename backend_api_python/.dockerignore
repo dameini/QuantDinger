@@ -35,10 +35,11 @@ data/memory/*.db
 
 # Tests
 tests/
+.pytest_cache/
 pytest_cache/
 .coverage
+htmlcov/
 
 # Documentation
 *.md
 !README.md
-

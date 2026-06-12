@@ -2230,21 +2230,13 @@ class TradingExecutor:
                 logger.warning(f"策略 {strategy_id} 启动时持仓同步失败（不影响启动）: {e}")
 
             # 获取当前持仓最高价（从本地数据库读取）
-            current_pos_list = self._get_current_positions(strategy_id, symbol)
-            initial_highest = 0.0
-            initial_position = 0  # 0=无持仓, 1=多头, -1=空头
-            initial_avg_entry_price = 0.0
-            initial_position_count = 0
-            initial_last_add_price = 0.0
-            
-            if current_pos_list:
-                pos = current_pos_list[0]  # 取第一个持仓（单向持仓模式）
-                initial_highest = float(pos.get('highest_price', 0) or 0)
-                pos_side = pos.get('side', 'long')
-                initial_position = 1 if pos_side == 'long' else -1
-                initial_avg_entry_price = float(pos.get('entry_price', 0) or 0)
-                initial_position_count = 1  # 简化处理，假设是单笔持仓
-                initial_last_add_price = initial_avg_entry_price
+            pos_snapshot = self._get_live_indicator_position_snapshot(strategy_id, symbol)
+            current_pos_list = pos_snapshot['current_pos_list']
+            initial_highest = pos_snapshot['initial_highest']
+            initial_position = pos_snapshot['initial_position']  # 0=无持仓, 1=多头, -1=空头
+            initial_avg_entry_price = pos_snapshot['initial_avg_entry_price']
+            initial_position_count = pos_snapshot['initial_position_count']
+            initial_last_add_price = pos_snapshot['initial_last_add_price']
 
             logger.info(
                 f"策略 {strategy_id} 持仓快照: count={len(current_pos_list)}, "
@@ -2530,21 +2522,13 @@ class TradingExecutor:
                                             except Exception:
                                                 last_kline_time = int(time.time())
                                     else:
-                                        current_pos_list = self._get_current_positions(strategy_id, symbol)
-                                        initial_highest = 0.0
-                                        initial_position = 0
-                                        initial_avg_entry_price = 0.0
-                                        initial_position_count = 0
-                                        initial_last_add_price = 0.0
-
-                                        if current_pos_list:
-                                            pos = current_pos_list[0]
-                                            initial_highest = float(pos.get('highest_price', 0) or 0)
-                                            pos_side = pos.get('side', 'long')
-                                            initial_position = 1 if pos_side == 'long' else -1
-                                            initial_avg_entry_price = float(pos.get('entry_price', 0) or 0)
-                                            initial_position_count = 1
-                                            initial_last_add_price = initial_avg_entry_price
+                                        pos_snapshot = self._get_live_indicator_position_snapshot(strategy_id, symbol)
+                                        current_pos_list = pos_snapshot['current_pos_list']
+                                        initial_highest = pos_snapshot['initial_highest']
+                                        initial_position = pos_snapshot['initial_position']
+                                        initial_avg_entry_price = pos_snapshot['initial_avg_entry_price']
+                                        initial_position_count = pos_snapshot['initial_position_count']
+                                        initial_last_add_price = pos_snapshot['initial_last_add_price']
 
                                         indicator_result = self._execute_indicator_with_prices(
                                             indicator_code, df, trading_config,
@@ -2726,21 +2710,13 @@ class TradingExecutor:
                                 else:
                                     realtime_df = self._update_dataframe_with_current_price(realtime_df, current_price, timeframe)
 
-                                current_pos_list = self._get_current_positions(strategy_id, symbol)
-                                initial_highest = 0.0
-                                initial_position = 0
-                                initial_avg_entry_price = 0.0
-                                initial_position_count = 0
-                                initial_last_add_price = 0.0
-
-                                if current_pos_list:
-                                    pos = current_pos_list[0]
-                                    initial_highest = float(pos.get('highest_price', 0) or 0)
-                                    pos_side = pos.get('side', 'long')
-                                    initial_position = 1 if pos_side == 'long' else -1
-                                    initial_avg_entry_price = float(pos.get('entry_price', 0) or 0)
-                                    initial_position_count = 1
-                                    initial_last_add_price = initial_avg_entry_price
+                                pos_snapshot = self._get_live_indicator_position_snapshot(strategy_id, symbol)
+                                current_pos_list = pos_snapshot['current_pos_list']
+                                initial_highest = pos_snapshot['initial_highest']
+                                initial_position = pos_snapshot['initial_position']
+                                initial_avg_entry_price = pos_snapshot['initial_avg_entry_price']
+                                initial_position_count = pos_snapshot['initial_position_count']
+                                initial_last_add_price = pos_snapshot['initial_last_add_price']
 
                                 indicator_result = self._execute_indicator_with_prices(
                                     indicator_code, realtime_df, trading_config,
@@ -4310,6 +4286,21 @@ class TradingExecutor:
                 count=1,
                 flags=re.MULTILINE,
             )
+        if re.search(r'^\s*for\s+i\s+in\s+range\(len\(df\)\):\s*$', compatibility_code, re.MULTILINE):
+            compatibility_code = re.sub(
+                r'^\s*for\s+i\s+in\s+range\(len\(df\)\):\s*$',
+                (
+                    '_live_state_reseed_idx = max(0, len(df) - 2)\n'
+                    'for i in range(len(df)):\n'
+                    '    if i == _live_state_reseed_idx:\n'
+                    '        position_qty = max(0, int(initial_position_count or (1 if int(initial_position or 0) > 0 else 0)))\n'
+                    '        avg_price = float(initial_avg_entry_price or 0.0) if int(initial_position or 0) > 0 else 0.0\n'
+                    '        last_buy_price = float(initial_last_add_price or initial_avg_entry_price or 0.0) if int(initial_position or 0) > 0 else 0.0'
+                ),
+                compatibility_code,
+                count=1,
+                flags=re.MULTILINE,
+            )
         return compatibility_code
     
     def _execute_indicator_df(
@@ -4469,6 +4460,123 @@ class TradingExecutor:
         except Exception as e:
             logger.error(f"Failed to fetch positions: {str(e)}")
             return []
+
+    def _get_live_indicator_position_snapshot(self, strategy_id: int, symbol: str) -> Dict[str, float]:
+        """
+        Build the live-position snapshot passed into legacy state-machine indicators.
+
+        Older indicators only understand a tiny mutable state:
+        ``position_qty`` / ``avg_price`` / ``last_buy_price``.
+        When a live position exists, we seed those values from the real ledger
+        instead of using simplistic placeholders.
+        """
+        current_pos_list = self._get_current_positions(strategy_id, symbol)
+        snapshot = {
+            'current_pos_list': current_pos_list,
+            'initial_highest': 0.0,
+            'initial_position': 0,
+            'initial_avg_entry_price': 0.0,
+            'initial_position_count': 0,
+            'initial_last_add_price': 0.0,
+        }
+        if not current_pos_list:
+            return snapshot
+
+        pos = current_pos_list[0]
+        snapshot['initial_highest'] = float(pos.get('highest_price', 0) or 0)
+        pos_side = str(pos.get('side') or 'long').strip().lower()
+        snapshot['initial_position'] = 1 if pos_side == 'long' else -1
+        snapshot['initial_avg_entry_price'] = float(pos.get('entry_price', 0) or 0)
+        snapshot['initial_position_count'] = 1 if float(pos.get('size', 0) or 0) > 0 else 0
+        snapshot['initial_last_add_price'] = snapshot['initial_avg_entry_price']
+
+        side_key = 'long' if snapshot['initial_position'] > 0 else 'short'
+        leg_entries = self._get_open_leg_entry_trades(
+            strategy_id=strategy_id,
+            symbol=symbol,
+            side=side_key,
+            current_size=float(pos.get('size', 0) or 0),
+        )
+        if leg_entries:
+            snapshot['initial_position_count'] = max(1, len(leg_entries))
+            latest_entry_price = float(leg_entries[-1].get('price', 0) or 0)
+            if latest_entry_price > 0:
+                snapshot['initial_last_add_price'] = latest_entry_price
+        return snapshot
+
+    def _get_open_leg_entry_trades(
+        self,
+        *,
+        strategy_id: int,
+        symbol: str,
+        side: str,
+        current_size: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Best-effort reconstruction of the currently open entry leg from local trades.
+
+        We walk local fills backwards from the newest trade until we have covered
+        the currently open size. This gives legacy indicators a more realistic
+        layer count and last add price than the old fixed ``1`` / ``avg_price``.
+        """
+        side_norm = str(side or '').strip().lower()
+        if side_norm not in ('long', 'short'):
+            return []
+        size_left = max(0.0, float(current_size or 0.0))
+        if size_left <= 0:
+            return []
+
+        sym_key = str(symbol or '').split(':')[0].strip()
+        if side_norm == 'long':
+            entry_types = {'open_long', 'add_long'}
+            exit_types = {'close_long', 'reduce_long'}
+        else:
+            entry_types = {'open_short', 'add_short'}
+            exit_types = {'close_short', 'reduce_short'}
+
+        try:
+            with get_db_connection() as db:
+                cursor = db.cursor()
+                cursor.execute(
+                    """
+                    SELECT created_at, symbol, type, amount, price, source
+                    FROM qd_strategy_trades
+                    WHERE strategy_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (int(strategy_id),),
+                )
+                rows = cursor.fetchall() or []
+                cursor.close()
+        except Exception as e:
+            logger.warning(
+                "Failed to reconstruct open-leg entries: strategy=%s symbol=%s err=%s",
+                strategy_id, symbol, e,
+            )
+            return []
+
+        collected: List[Dict[str, Any]] = []
+        for row in rows:
+            row_symbol = str((row or {}).get('symbol') or '').split(':')[0].strip()
+            if row_symbol != sym_key:
+                continue
+            if str((row or {}).get('source') or '').strip().lower() != 'local':
+                continue
+            typ = str((row or {}).get('type') or '').strip().lower()
+            amount = float((row or {}).get('amount') or 0.0)
+            if amount <= 0:
+                continue
+            if typ in exit_types:
+                size_left += amount
+                continue
+            if typ in entry_types:
+                collected.append(row)
+                size_left -= amount
+                if size_left <= 1e-9:
+                    break
+
+        collected.reverse()
+        return collected
 
     def _exit_position_protection_action(self) -> str:
         """
