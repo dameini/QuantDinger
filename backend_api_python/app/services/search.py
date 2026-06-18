@@ -1,4 +1,4 @@
-"""
+﻿"""
 Search service v2.0 - 增强版搜索服务
 整合多个搜索引擎，支持 API Key 轮换和故障转移
 
@@ -11,6 +11,7 @@ Search service v2.0 - 增强版搜索服务
 
 参考：daily_stock_analysis-main/src/search_service.py
 """
+import os
 import requests
 import json
 import time
@@ -24,6 +25,7 @@ from urllib.parse import urlparse
 
 from app.utils.logger import get_logger
 from app.utils.config_loader import load_addon_config
+from app.config.data_sources import AlphaVantageConfig, GDELTConfig
 
 logger = get_logger(__name__)
 
@@ -591,6 +593,104 @@ class BingSearchProvider(BaseSearchProvider):
             )
 
 
+class GDELTSearchProvider(BaseSearchProvider):
+    """Free global news fallback backed by the GDELT DOC 2.0 API."""
+
+    def __init__(self):
+        super().__init__(['free'], "GDELT")
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        try:
+            params = {
+                "query": query,
+                "mode": "artlist",
+                "format": "json",
+                "sort": "datedesc",
+                "maxrecords": min(max(max_results, 1), 50),
+                "timespan": f"{max(1, min(int(days or 7), 90))}d",
+            }
+            response = requests.get(GDELTConfig.BASE_URL, params=params, timeout=GDELTConfig.TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            articles = data.get("articles") if isinstance(data, dict) else []
+            results: List[SearchResult] = []
+            for item in articles[:max_results]:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url") or ""
+                results.append(SearchResult(
+                    title=item.get("title") or url or query,
+                    snippet=item.get("seendate") or "",
+                    url=url,
+                    source=item.get("domain") or self._extract_domain(url) or "GDELT",
+                    published_date=item.get("seendate") or "",
+                ))
+            return SearchResponse(query=query, results=results, provider=self.name, success=bool(results))
+        except Exception as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=str(e))
+
+
+class AlphaVantageNewsProvider(BaseSearchProvider):
+    """Company news and sentiment supplement backed by Alpha Vantage NEWS_SENTIMENT."""
+
+    def __init__(self, api_key: str):
+        super().__init__([api_key] if api_key else [], "AlphaVantage")
+
+    def _extract_tickers(self, query: str) -> List[str]:
+        blocked = {"AI", "API", "CPI", "GDP", "ETF", "USD", "HK", "US", "CN"}
+        tokens = re.findall(r"\b[A-Z]{1,6}(?:/[A-Z]{2,6})?\b", query or "")
+        tickers: List[str] = []
+        for token in tokens:
+            symbol = token.replace("/", "")
+            if symbol in blocked:
+                continue
+            if symbol not in tickers:
+                tickers.append(symbol)
+        return tickers[:5]
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        tickers = self._extract_tickers(query)
+        if not tickers:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message="No ticker-like symbol found for Alpha Vantage NEWS_SENTIMENT",
+            )
+
+        try:
+            params = {
+                "function": "NEWS_SENTIMENT",
+                "tickers": ",".join(tickers),
+                "sort": "LATEST",
+                "limit": min(max(max_results, 1), AlphaVantageConfig.NEWS_LIMIT),
+                "apikey": api_key,
+            }
+            response = requests.get(AlphaVantageConfig.BASE_URL, params=params, timeout=AlphaVantageConfig.TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            feed = data.get("feed") if isinstance(data, dict) else []
+            results: List[SearchResult] = []
+            for item in feed[:max_results]:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url") or ""
+                sentiment = str(item.get("overall_sentiment_label") or "neutral").lower()
+                summary = item.get("summary") or ""
+                results.append(SearchResult(
+                    title=item.get("title") or query,
+                    snippet=summary[:500],
+                    url=url,
+                    source=item.get("source") or self._extract_domain(url) or "Alpha Vantage",
+                    published_date=item.get("time_published") or "",
+                    sentiment=sentiment,
+                ))
+            return SearchResponse(query=query, results=results, provider=self.name, success=bool(results))
+        except Exception as e:
+            return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=str(e))
+
+
 class DuckDuckGoSearchProvider(BaseSearchProvider):
     """DuckDuckGo 搜索引擎（免费，无需 API Key）"""
     
@@ -721,43 +821,66 @@ class SearchService:
         """加载配置"""
         config = load_addon_config()
         self._config = config.get('search', {})
-        self.provider = self._config.get('provider', 'google')
+        self.provider = str(self._config.get('provider') or os.getenv('SEARCH_PROVIDER') or 'tavily').strip().lower()
         self.max_results = int(self._config.get('max_results', 10))
+
+    def _search_config_value(self, section: str, key: str, env_name: str = '') -> str:
+        section_cfg = self._config.get(section, {}) if isinstance(self._config, dict) else {}
+        value = section_cfg.get(key) if isinstance(section_cfg, dict) else None
+        if not value and env_name:
+            value = os.getenv(env_name)
+        return str(value or '').strip()
     
     def _init_providers(self):
-        """初始化搜索引擎（按优先级排序）"""
+        """Initialize search providers in the configured research fallback order."""
         from app.config import APIKeys
-        
+        if self.provider in {"none", "off", "disabled"}:
+            logger.info("Search is disabled by SEARCH_PROVIDER=none")
+            return
+
+        provider_map: Dict[str, BaseSearchProvider] = {}
+
         tavily_keys = APIKeys.TAVILY_API_KEYS
         if tavily_keys:
-            self._providers.append(TavilySearchProvider(tavily_keys))
-            logger.info(f"已配置 Tavily 搜索，共 {len(tavily_keys)} 个 API Key")
-        
-        # 2. SerpAPI
+            provider_map["tavily"] = TavilySearchProvider(tavily_keys)
+            logger.info(f"Tavily search is configured with {len(tavily_keys)} API key(s)")
+
+        provider_map["gdelt"] = GDELTSearchProvider()
+
         serpapi_keys = APIKeys.SERPAPI_KEYS
         if serpapi_keys:
-            self._providers.append(SerpAPISearchProvider(serpapi_keys))
-            logger.info(f"已配置 SerpAPI 搜索，共 {len(serpapi_keys)} 个 API Key")
-        
-        # 3. Google CSE
-        google_api_key = self._config.get('google', {}).get('api_key')
-        google_cx = self._config.get('google', {}).get('cx')
+            provider_map["serpapi"] = SerpAPISearchProvider(serpapi_keys)
+            logger.info(f"SerpAPI search is configured with {len(serpapi_keys)} API key(s)")
+
+        alpha_key = APIKeys.ALPHA_VANTAGE_API_KEY
+        if alpha_key:
+            provider_map["alpha_vantage"] = AlphaVantageNewsProvider(alpha_key)
+            logger.info("Alpha Vantage NEWS_SENTIMENT is configured")
+
+        google_api_key = self._search_config_value('google', 'api_key', 'SEARCH_GOOGLE_API_KEY')
+        google_cx = self._search_config_value('google', 'cx', 'SEARCH_GOOGLE_CX')
         if google_api_key and google_cx:
-            self._providers.append(GoogleSearchProvider(google_api_key, google_cx))
-            logger.info("已配置 Google CSE 搜索")
-        
-        # 4. Bing
-        bing_api_key = self._config.get('bing', {}).get('api_key')
+            provider_map["google"] = GoogleSearchProvider(google_api_key, google_cx)
+            logger.info("Google CSE search is configured")
+
+        bing_api_key = self._search_config_value('bing', 'api_key', 'SEARCH_BING_API_KEY')
         if bing_api_key:
-            self._providers.append(BingSearchProvider(bing_api_key))
-            logger.info("已配置 Bing 搜索")
-        
-        self._providers.append(DuckDuckGoSearchProvider())
-        logger.info("已配置 DuckDuckGo 搜索（免费兜底）")
-        
-        if len(self._providers) == 1:
-            logger.warning("仅有 DuckDuckGo 可用，建议配置更多搜索引擎 API Key")
-    
+            provider_map["bing"] = BingSearchProvider(bing_api_key)
+            logger.info("Bing search is configured")
+
+        provider_map["duckduckgo"] = DuckDuckGoSearchProvider()
+
+        preferred = self.provider if self.provider in provider_map else ""
+        if preferred:
+            self._providers.append(provider_map.pop(preferred))
+
+        for key in ("tavily", "gdelt", "serpapi", "alpha_vantage", "google", "bing", "duckduckgo"):
+            provider = provider_map.pop(key, None)
+            if provider:
+                self._providers.append(provider)
+
+        logger.info("Search provider order: %s", " -> ".join(p.name for p in self._providers))
+
     @property
     def is_available(self) -> bool:
         """检查是否有可用的搜索引擎"""
@@ -767,14 +890,17 @@ class SearchService:
         """Return configured search provider diagnostics for agent context."""
         from app.config import APIKeys
 
-        google_cfg = self._config.get('google', {}) if isinstance(self._config, dict) else {}
-        bing_cfg = self._config.get('bing', {}) if isinstance(self._config, dict) else {}
+        google_api_key = self._search_config_value('google', 'api_key', 'SEARCH_GOOGLE_API_KEY')
+        google_cx = self._search_config_value('google', 'cx', 'SEARCH_GOOGLE_CX')
+        bing_api_key = self._search_config_value('bing', 'api_key', 'SEARCH_BING_API_KEY')
         configured = {
-            "Google": bool(google_cfg.get('api_key') and google_cfg.get('cx')),
-            "Bing": bool(bing_cfg.get('api_key')),
+            "Google": bool(google_api_key and google_cx),
+            "Bing": bool(bing_api_key),
             "Tavily": bool(APIKeys.TAVILY_API_KEYS),
             "SerpAPI": bool(APIKeys.SERPAPI_KEYS),
-            "DuckDuckGo": True,
+            "AlphaVantage": bool(APIKeys.ALPHA_VANTAGE_API_KEY),
+            "GDELT": self.provider not in {"none", "off", "disabled"},
+            "DuckDuckGo": self.provider not in {"none", "off", "disabled"},
         }
         active_names = {provider.name for provider in self._providers}
         active_available = {provider.name: provider.is_available for provider in self._providers}
@@ -786,7 +912,7 @@ class SearchService:
                 "available": bool(active_available.get(name)),
                 "note": _search_provider_note(name, bool(configured.get(name)), name in active_names),
             }
-            for name in ("Google", "Bing", "Tavily", "SerpAPI", "DuckDuckGo")
+            for name in ("Tavily", "GDELT", "SerpAPI", "AlphaVantage", "Google", "Bing", "DuckDuckGo")
         ]
     
     def search(self, query: str, num_results: int = None, date_restrict: str = None, days: int = 7) -> List[Dict[str, Any]]:
@@ -925,12 +1051,17 @@ def _search_provider_note(name: str, configured: bool, registered: bool) -> str:
         return "Set TAVILY_API_KEYS to enable Tavily AI search."
     if name == "SerpAPI" and not configured:
         return "Set SERPAPI_KEYS to enable SerpAPI Google/Bing search."
+    if name == "AlphaVantage" and not configured:
+        return "Set ALPHA_VANTAGE_API_KEY to enable company news and sentiment."
+    if name == "GDELT" and configured:
+        return "Free global news fallback, no API key required."
     if configured and not registered:
         return "Configured but not registered by the current search service instance; restart backend."
-    return "ready" if configured or name == "DuckDuckGo" else "not configured"
+    return "ready" if configured or name in {"GDELT", "DuckDuckGo"} else "not configured"
 
 
 def reset_search_service() -> None:
     """重置搜索服务（用于测试或配置更新后）"""
     global _search_service
     _search_service = None
+

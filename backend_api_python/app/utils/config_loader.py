@@ -156,6 +156,17 @@ def load_addon_config() -> Dict[str, Any]:
         ('TRADING_ECONOMICS_BASE_URL', 'tradingeconomics.base_url', 'string'),
         ('TRADING_ECONOMICS_TIMEOUT', 'tradingeconomics.timeout', 'int'),
 
+        # Macro research sources
+        ('FRED_API_KEY', 'fred.api_key', 'string'),
+        ('FRED_BASE_URL', 'fred.base_url', 'string'),
+        ('FRED_TIMEOUT', 'fred.timeout', 'int'),
+        ('BLS_API_KEY', 'bls.api_key', 'string'),
+        ('BLS_BASE_URL', 'bls.base_url', 'string'),
+        ('BLS_TIMEOUT', 'bls.timeout', 'int'),
+        ('BEA_API_KEY', 'bea.api_key', 'string'),
+        ('BEA_BASE_URL', 'bea.base_url', 'string'),
+        ('BEA_TIMEOUT', 'bea.timeout', 'int'),
+
         # Crypto analytics
         ('COINGLASS_API_KEY', 'coinglass.api_key', 'string'),
         ('CRYPTOQUANT_API_KEY', 'cryptoquant.api_key', 'string'),
@@ -183,6 +194,15 @@ def load_addon_config() -> Dict[str, Any]:
         
         # SerpAPI (Google/Bing scraper)
         ('SERPAPI_KEYS', 'serpapi.api_keys', 'string'),
+
+        # Free/global news and company news/sentiment
+        ('GDELT_BASE_URL', 'gdelt.base_url', 'string'),
+        ('GDELT_TIMEOUT', 'gdelt.timeout', 'int'),
+        ('GDELT_MAX_RESULTS', 'gdelt.max_results', 'int'),
+        ('ALPHA_VANTAGE_API_KEY', 'alpha_vantage.api_key', 'string'),
+        ('ALPHA_VANTAGE_BASE_URL', 'alpha_vantage.base_url', 'string'),
+        ('ALPHA_VANTAGE_TIMEOUT', 'alpha_vantage.timeout', 'int'),
+        ('ALPHA_VANTAGE_NEWS_LIMIT', 'alpha_vantage.news_limit', 'int'),
     ]
 
     for env_name, dotted_key, value_type in mappings:

@@ -27,6 +27,8 @@ gunicorn>=22.0.0
 flask-smorest>=0.44.0,<0.48
 marshmallow>=3.24.1,<5
 PyYAML>=6.0
+# Server-side PDF export for AI analysis reports
+reportlab>=4.2.0
 # Password hashing
 bcrypt>=4.1.0
 # Interactive Brokers trading (optional, for US stock trading via TWS/IB Gateway)

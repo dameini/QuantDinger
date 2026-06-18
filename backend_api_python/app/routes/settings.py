@@ -82,6 +82,8 @@ ADVANCED_KEYS = {
     'OPENROUTER_TEMPERATURE',
     'AI_ANALYSIS_CONSENSUS_TIMEFRAMES', 'SEARCH_MAX_RESULTS',
     'SEARCH_GOOGLE_API_KEY', 'SEARCH_GOOGLE_CX', 'SEARCH_BING_API_KEY', 'SERPAPI_KEYS',
+    'GDELT_BASE_URL', 'GDELT_TIMEOUT', 'GDELT_MAX_RESULTS',
+    'ALPHA_VANTAGE_API_KEY', 'ALPHA_VANTAGE_BASE_URL', 'ALPHA_VANTAGE_TIMEOUT', 'ALPHA_VANTAGE_NEWS_LIMIT',
     'AI_CODE_GEN_MODEL',
     'OPENAI_BASE_URL', 'DEEPSEEK_BASE_URL', 'GROK_BASE_URL', 'ATLASCLOUD_BASE_URL', 'MINIMAX_BASE_URL',
     # Trading internals
@@ -116,6 +118,7 @@ ADVANCED_KEYS = {
     'ADANOS_SENTIMENT_SOURCE', 'ADANOS_API_BASE_URL',
     # Provider internals / rarely changed endpoints
     'TRADING_ECONOMICS_BASE_URL', 'TRADING_ECONOMICS_TIMEOUT',
+    'FRED_BASE_URL', 'FRED_TIMEOUT', 'BLS_BASE_URL', 'BLS_TIMEOUT', 'BEA_BASE_URL', 'BEA_TIMEOUT',
     # Brand internals
     'BRAND_FAVICON_URL',
     'BRAND_LEGAL_USER_AGREEMENT_TEXT', 'BRAND_LEGAL_PRIVACY_POLICY_TEXT',
@@ -633,9 +636,9 @@ CONFIG_SCHEMA = {
                 'key': 'SEARCH_PROVIDER',
                 'label': 'Search Provider',
                 'type': 'select',
-                'options': ['tavily', 'google', 'bing', 'none'],
+                'options': ['tavily', 'gdelt', 'serpapi', 'google', 'bing', 'duckduckgo', 'none'],
                 'default': 'tavily',
-                'description': 'News / web search provider used by AI analysis. Configure both LLM and search to get full AI analysis results'
+                'description': 'Primary news/web search provider used by AI analysis. QuantDinger falls back to configured providers, then GDELT and DuckDuckGo when available'
             },
             {
                 'key': 'SEARCH_MAX_RESULTS',
@@ -688,6 +691,61 @@ CONFIG_SCHEMA = {
                 'link': 'https://serpapi.com/',
                 'link_text': 'settings.link.getApiKey',
                 'description': 'SerpAPI keys (comma-separated)'
+            },
+            {
+                'key': 'GDELT_BASE_URL',
+                'label': 'GDELT DOC Base URL',
+                'type': 'text',
+                'default': 'https://api.gdeltproject.org/api/v2/doc/doc',
+                'link': 'https://api.gdeltproject.org/api/v2/doc/doc',
+                'link_text': 'settings.link.viewDocs',
+                'description': 'Free global news fallback endpoint. GDELT requires no API key and is used when paid search sources are unavailable.'
+            },
+            {
+                'key': 'GDELT_TIMEOUT',
+                'label': 'GDELT Timeout (sec)',
+                'type': 'number',
+                'default': '12',
+                'description': 'Timeout for GDELT DOC 2.0 global news queries.'
+            },
+            {
+                'key': 'GDELT_MAX_RESULTS',
+                'label': 'GDELT Max Results',
+                'type': 'number',
+                'default': '10',
+                'description': 'Default maximum GDELT article count used by fallback news/event search.'
+            },
+            {
+                'key': 'ALPHA_VANTAGE_API_KEY',
+                'label': 'Alpha Vantage API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://www.alphavantage.co/support/#api-key',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Optional low-cost company news and sentiment source using Alpha Vantage NEWS_SENTIMENT.'
+            },
+            {
+                'key': 'ALPHA_VANTAGE_BASE_URL',
+                'label': 'Alpha Vantage Base URL',
+                'type': 'text',
+                'default': 'https://www.alphavantage.co/query',
+                'link': 'https://www.alphavantage.co/documentation/',
+                'link_text': 'settings.link.viewDocs',
+                'description': 'Alpha Vantage API endpoint for NEWS_SENTIMENT and related market-data functions.'
+            },
+            {
+                'key': 'ALPHA_VANTAGE_TIMEOUT',
+                'label': 'Alpha Vantage Timeout (sec)',
+                'type': 'number',
+                'default': '12',
+                'description': 'Timeout for Alpha Vantage company news and sentiment requests.'
+            },
+            {
+                'key': 'ALPHA_VANTAGE_NEWS_LIMIT',
+                'label': 'Alpha Vantage News Limit',
+                'type': 'number',
+                'default': '20',
+                'description': 'Maximum NEWS_SENTIMENT feed items requested per company-news lookup.'
             },
         ]
     },
@@ -821,6 +879,84 @@ CONFIG_SCHEMA = {
                 'type': 'number',
                 'default': '10',
                 'description': 'Timeout for economic calendar requests.'
+            },
+            {
+                'key': 'FRED_API_KEY',
+                'label': 'FRED API Key',
+                'type': 'password',
+                'default': '',
+                'required': False,
+                'link': 'https://fred.stlouisfed.org/docs/api/api_key.html',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'FRED key for stable US macro time series such as rates, CPI, unemployment, payrolls and financial conditions.'
+            },
+            {
+                'key': 'FRED_BASE_URL',
+                'label': 'FRED Base URL',
+                'type': 'text',
+                'default': 'https://api.stlouisfed.org/fred',
+                'link': 'https://fred.stlouisfed.org/docs/api/fred/',
+                'link_text': 'settings.link.viewDocs',
+                'description': 'FRED API endpoint. Change only when using a proxy.'
+            },
+            {
+                'key': 'FRED_TIMEOUT',
+                'label': 'FRED Timeout (sec)',
+                'type': 'number',
+                'default': '10',
+                'description': 'Timeout for FRED macro time-series requests.'
+            },
+            {
+                'key': 'BLS_API_KEY',
+                'label': 'BLS API Key',
+                'type': 'password',
+                'default': '',
+                'required': False,
+                'link': 'https://www.bls.gov/developers/',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Optional BLS registration key for higher official CPI, jobs, wages and labor data limits.'
+            },
+            {
+                'key': 'BLS_BASE_URL',
+                'label': 'BLS Base URL',
+                'type': 'text',
+                'default': 'https://api.bls.gov/publicAPI/v2',
+                'link': 'https://www.bls.gov/developers/',
+                'link_text': 'settings.link.viewDocs',
+                'description': 'BLS public API endpoint. A key is optional but recommended.'
+            },
+            {
+                'key': 'BLS_TIMEOUT',
+                'label': 'BLS Timeout (sec)',
+                'type': 'number',
+                'default': '10',
+                'description': 'Timeout for BLS official macro series requests.'
+            },
+            {
+                'key': 'BEA_API_KEY',
+                'label': 'BEA API Key',
+                'type': 'password',
+                'default': '',
+                'required': False,
+                'link': 'https://apps.bea.gov/API/signup/',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'BEA key for official GDP, income, consumption and national accounts data.'
+            },
+            {
+                'key': 'BEA_BASE_URL',
+                'label': 'BEA Base URL',
+                'type': 'text',
+                'default': 'https://apps.bea.gov/api/data',
+                'link': 'https://apps.bea.gov/api/_pdf/bea_web_service_api_user_guide.pdf',
+                'link_text': 'settings.link.viewDocs',
+                'description': 'BEA API endpoint. Change only when using a proxy.'
+            },
+            {
+                'key': 'BEA_TIMEOUT',
+                'label': 'BEA Timeout (sec)',
+                'type': 'number',
+                'default': '10',
+                'description': 'Timeout for BEA official macro data requests.'
             },
             {
                 'key': 'COINGLASS_API_KEY',
