@@ -118,6 +118,13 @@ services:
       - GUNICORN_WORKERS=${GUNICORN_WORKERS:-1}
       - GUNICORN_THREADS=${GUNICORN_THREADS:-8}
       - ALLOW_LOCAL_DESKTOP_BROKERS=${ALLOW_LOCAL_DESKTOP_BROKERS:-true}
+      # Container egress does not automatically inherit the host shell proxy.
+      # Set these in the project-root `.env` when exchanges are reachable only
+      # through a proxy / soft-router path.
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - ALL_PROXY=${ALL_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis}
     networks:
       - quantdinger-network
     healthcheck:

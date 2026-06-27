@@ -33,20 +33,14 @@ if [ -z "$CURRENT_SECRET" ]; then
     CURRENT_SECRET="$NEW_SECRET"
 fi
 
-# Auto-generate SECRET_KEY if using default (zero-config experience)
+# Keep an explicit default SECRET_KEY stable. Existing deployments may have
+# already encrypted exchange credentials with this exact value; silently
+# rotating it at container boot breaks live credential decryption and can
+# auto-stop running strategies. Only generate a key when SECRET_KEY is missing.
 if [ "$CURRENT_SECRET" = "$DEFAULT_SECRET" ]; then
-    NEW_SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))")
-    # Use a temp file + write-back instead of `sed -i`. When /app/.env is a
-    # Docker bind-mount from the host (zero-repo GHCR deploy), `sed -i` fails
-    # with "Device or resource busy" because it tries to rename(2) the inode
-    # over a mount target. Truncate+write through the mount works fine and
-    # propagates the new key back to the host file.
-    TMP=$(mktemp)
-    sed "s|SECRET_KEY=.*|SECRET_KEY=${NEW_SECRET}|" /app/.env > "$TMP"
-    cat "$TMP" > /app/.env
-    rm -f "$TMP"
-    echo "[AUTO] Generated random SECRET_KEY (was default)."
-    echo "[TIP]  For production, set a persistent SECRET_KEY in backend_api_python/.env"
+    echo "[WARNING] SECRET_KEY is still using the default value."
+    echo "[TIP]  Keep it unchanged if you already encrypted live credentials with it."
+    echo "[TIP]  If you want to rotate it, re-encrypt credentials first, then restart."
 fi
 
 echo "[OK] SECRET_KEY is configured"

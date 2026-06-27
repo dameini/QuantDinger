@@ -135,6 +135,13 @@ services:
       # Spot full close / open fee buffer (Admin → Settings → Live Trading, or backend_api_python/.env)
       - SPOT_CLOSE_SAFETY_RATIO=${SPOT_CLOSE_SAFETY_RATIO:-0.998}
       - SPOT_OPEN_QUOTE_BUFFER=${SPOT_OPEN_QUOTE_BUFFER:-0.995}
+      # Container egress does not automatically inherit the host shell proxy.
+      # Set these in the project-root `.env` when exchanges are reachable only
+      # through a proxy / soft-router path.
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - ALL_PROXY=${ALL_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis}
       # Takes precedence over mounted .env (run.py load_dotenv override=False).
       # Include :8000 when using Vite dev server alongside this stack.
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:8888,http://localhost:8000}

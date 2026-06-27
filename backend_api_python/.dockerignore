@@ -19,14 +19,14 @@ ENV/
 logs/
 *.log
 
-# Database (在 docker-compose 中挂载)
+# Database (mounted by docker-compose)
 *.db
 
 # Environment
 .env
 .env.local
 
-# Data (在 docker-compose 中挂载)
+# Data (mounted by docker-compose)
 data/memory/*.db
 
 # Git
