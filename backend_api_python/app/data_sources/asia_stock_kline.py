@@ -16,9 +16,10 @@ Twelve Data (https://twelvedata.com) supports XSHG/XSHE/XHKG at all intervals.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
@@ -148,6 +149,41 @@ _TD_INTERVAL_MAP = {
     "1W": "1week",
 }
 
+_TD_DAILY_LIMIT_LOCK = threading.Lock()
+_TD_DAILY_LIMIT_UNTIL = 0.0
+
+
+def _twelvedata_daily_limit_active() -> bool:
+    with _TD_DAILY_LIMIT_LOCK:
+        return time.time() < _TD_DAILY_LIMIT_UNTIL
+
+
+def _mark_twelvedata_daily_limited(symbol: str, exchange: str, message: str) -> None:
+    global _TD_DAILY_LIMIT_UNTIL
+    now = datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).date()
+    until = datetime(
+        tomorrow.year,
+        tomorrow.month,
+        tomorrow.day,
+        0,
+        5,
+        tzinfo=timezone.utc,
+    ).timestamp()
+    first = False
+    with _TD_DAILY_LIMIT_LOCK:
+        if time.time() >= _TD_DAILY_LIMIT_UNTIL:
+            first = True
+        _TD_DAILY_LIMIT_UNTIL = max(_TD_DAILY_LIMIT_UNTIL, until)
+    if first:
+        logger.warning(
+            "TwelveData daily API credits exhausted for %s/%s; "
+            "skipping TwelveData requests until next UTC day. Last message: %s",
+            symbol,
+            exchange,
+            message,
+        )
+
 
 def _td_symbol_and_exchange(tencent_code: str, is_hk: bool) -> tuple[str, str]:
     """Convert Tencent code to Twelve Data (symbol, exchange).
@@ -182,6 +218,8 @@ def fetch_twelvedata_klines(
 
     interval = _TD_INTERVAL_MAP.get(timeframe)
     if not interval:
+        return []
+    if _twelvedata_daily_limit_active():
         return []
 
     symbol, exchange = _td_symbol_and_exchange(tencent_code, is_hk)
@@ -223,7 +261,10 @@ def fetch_twelvedata_klines(
     if data.get("status") != "ok" or "values" not in data:
         code = data.get("code", "")
         msg = data.get("message", str(data))
-        if code == 429 or "API credits" in msg or "minute limit" in msg:
+        msg_l = str(msg).lower()
+        if "api credits" in msg_l or "for the day" in msg_l:
+            _mark_twelvedata_daily_limited(symbol, exchange, msg)
+        elif code == 429 or "minute limit" in msg_l:
             logger.warning("TwelveData rate limit for %s/%s: %s", symbol, exchange, msg)
         elif "Pro" in msg or "Venture" in msg or "upgrading" in msg:
             logger.debug("TwelveData plan limit %s/%s tf=%s: %s", symbol, exchange, timeframe, msg)

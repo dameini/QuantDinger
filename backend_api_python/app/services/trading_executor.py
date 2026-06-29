@@ -77,6 +77,12 @@ class TradingExecutor:
         self.kline_service = KlineService()
         # Throttle writes to qd_strategy_logs (heartbeat), per strategy_id -> monotonic time
         self._strategy_ui_log_last_tick_ts = {}  # type: Dict[int, float]
+        self._console_tick_last_ts: Dict[int, float] = {}
+        self._console_tick_lock = threading.Lock()
+        try:
+            self._console_tick_interval_sec = max(1, int(os.getenv("STRATEGY_TICK_LOG_INTERVAL_SEC", "60")))
+        except Exception:
+            self._console_tick_interval_sec = 60
         
         self.max_threads = int(os.getenv('STRATEGY_MAX_THREADS', '64'))
         self._last_start_failure: str = ""
@@ -268,7 +274,18 @@ class TradingExecutor:
         Local-only observability: print to stdout so user can see strategy status in console.
         """
         try:
-            print(str(msg or ""), flush=True)
+            text = str(msg or "")
+            if "] tick price=" in text:
+                m = re.match(r"\[strategy:(\d+)\]\s+tick\b", text)
+                if m:
+                    sid = int(m.group(1))
+                    now = time.monotonic()
+                    with self._console_tick_lock:
+                        last = self._console_tick_last_ts.get(sid, 0.0)
+                        if last > 0 and now - last < self._console_tick_interval_sec:
+                            return
+                        self._console_tick_last_ts[sid] = now
+            print(text, flush=True)
         except Exception:
             pass
 
@@ -2527,7 +2544,7 @@ class TradingExecutor:
                             if signal_time == 0 or (current_ts - signal_time) < expiration_threshold:
                                 valid_signals.append(s)
                             else:
-                                logger.warning(f"Signal expired and removed: {s}")
+                                logger.debug(f"Signal expired and removed: {s}")
                         if len(valid_signals) != len(pending_signals):
                             pending_signals = valid_signals
 

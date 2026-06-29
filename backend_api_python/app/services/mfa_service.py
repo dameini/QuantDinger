@@ -148,6 +148,7 @@ class MfaService:
                     last_used_counter = 0,
                     confirmed_at = NULL,
                     updated_at = NOW()
+                RETURNING user_id
                 """,
                 (user_id, encrypted),
             )

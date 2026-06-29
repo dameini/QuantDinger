@@ -24,9 +24,12 @@ def append_strategy_log(strategy_id: int, level: str, message: str) -> None:
             cur.execute(
                 """
                 INSERT INTO qd_strategy_logs (strategy_id, level, message, timestamp)
-                VALUES (?, ?, ?, ?)
+                SELECT ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1 FROM qd_strategies_trading WHERE id = ?
+                )
                 """,
-                (sid, lv, msg, datetime.now(timezone.utc)),
+                (sid, lv, msg, datetime.now(timezone.utc), sid),
             )
             db.commit()
             cur.close()
