@@ -2593,7 +2593,7 @@ class BacktestService:
         # Supported indicator signal formats:
         # - Preferred (simple): df['buy'], df['sell'] as boolean
         # - Backtest/internal (4-way): df['open_long'], df['close_long'], df['open_short'], df['close_short'] as boolean
-        signals = pd.Series(0, index=df.index)
+        signals = {}
         
         try:
             # Reset DatetimeIndex to integer so user code can use df.at[0, ...] or df.iloc[0, ...]
@@ -2717,6 +2717,7 @@ class BacktestService:
         except Exception as e:
             logger.error(f"Indicator code execution error: {e}")
             logger.error(traceback.format_exc())
+            raise
         
         return signals
 

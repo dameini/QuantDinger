@@ -1957,7 +1957,7 @@ class TradingExecutor:
             self._log_crypto_kline_source(
                 strategy_id, market_category, execution_mode, kline_exchange_id, kline_market_type
             )
-            if exchange_config and exchange_config.get('api_key') or exchange_config.get('apiKey'):
+            if exchange_config and (exchange_config.get('api_key') or exchange_config.get('apiKey')):
                 try:
                     self._query_exchange_fee_rate(strategy_id, exchange_config, symbol, market_type)
                 except Exception as e:

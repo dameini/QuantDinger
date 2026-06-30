@@ -649,10 +649,13 @@ class BitgetMixClient(BaseRestClient):
         return out
 
     def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
-        sym = to_bitget_um_symbol(symbol) if market_type != "spot" else symbol.upper().replace("/", "")
-        product_type = "USDT-FUTURES" if market_type != "spot" else "SPOT"
+        mt = str(market_type or "swap").strip().lower()
+        if mt in ("futures", "future", "perp", "perpetual"):
+            mt = "swap"
+        sym = to_bitget_um_symbol(symbol)
+        business_type = "spot" if mt == "spot" else "mix"
         try:
-            raw = self._signed_request("GET", "/api/v2/common/trade-rate", params={"symbol": sym, "businessType": product_type})
+            raw = self._signed_request("GET", "/api/v2/common/trade-rate", params={"symbol": sym, "businessType": business_type})
             data = raw.get("data") if isinstance(raw, dict) else None
             if isinstance(data, dict):
                 maker = abs(float(data.get("makerFeeRate") or 0))
@@ -660,7 +663,7 @@ class BitgetMixClient(BaseRestClient):
                 if maker > 0 or taker > 0:
                     return {"maker": maker, "taker": taker}
         except Exception as e:
-            logger.warning(f"Bitget get_fee_rate({symbol}) failed: {e}")
+            logger.warning(f"Bitget get_fee_rate({symbol}, businessType={business_type}, symbol_param={sym}) failed: {e}")
         return None
 
     def set_leverage(
