@@ -346,6 +346,27 @@ CREATE TABLE IF NOT EXISTS qd_script_sources (
 CREATE INDEX IF NOT EXISTS idx_script_sources_user_id ON qd_script_sources(user_id);
 CREATE INDEX IF NOT EXISTS idx_script_sources_marketplace ON qd_script_sources(source_marketplace_indicator_id);
 
+CREATE TABLE IF NOT EXISTS qd_script_source_versions (
+    id SERIAL PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES qd_script_sources(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL,
+    name VARCHAR(255) NOT NULL DEFAULT '',
+    description TEXT DEFAULT '',
+    code TEXT NOT NULL DEFAULT '',
+    template_key VARCHAR(80) DEFAULT '',
+    param_schema JSONB DEFAULT '{}'::jsonb,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_script_source_versions_source
+ON qd_script_source_versions (source_id, version_no DESC);
+CREATE INDEX IF NOT EXISTS idx_script_source_versions_user
+ON qd_script_source_versions (user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_script_source_versions_no
+ON qd_script_source_versions (source_id, version_no);
+
 -- Add strategy_mode and strategy_code columns (script strategy support)
 DO $$
 BEGIN
@@ -659,6 +680,21 @@ CREATE TABLE IF NOT EXISTS qd_indicator_codes (
    CONSTRAINT qd_indicator_codes_user_id_fkey FOREIGN KEY (user_id) REFERENCES qd_users(id) ON DELETE CASCADE
 
 );
+
+-- Old databases may already have qd_indicator_codes without the newer
+-- community/script-marketplace compatibility columns. CREATE TABLE IF NOT
+-- EXISTS does not alter existing tables, so we must backfill here.
+DO $$
+BEGIN
+    ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS vip_free BOOLEAN DEFAULT FALSE;
+    ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_indicator_id INTEGER;
+    ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_script_source_id INTEGER;
+    ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_strategy_id INTEGER;
+    ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_language VARCHAR(16) DEFAULT NULL;
+    ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS name_i18n JSONB DEFAULT NULL;
+    ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS description_i18n JSONB DEFAULT NULL;
+    ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS asset_type VARCHAR(32) DEFAULT 'indicator';
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_indicator_codes_user_id ON qd_indicator_codes USING btree (user_id);
 CREATE INDEX IF NOT EXISTS idx_indicator_review_status ON qd_indicator_codes USING btree (review_status);

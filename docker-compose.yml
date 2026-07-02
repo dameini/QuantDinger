@@ -48,7 +48,7 @@ services:
       - "-c"
       - "shared_buffers=${PG_SHARED_BUFFERS:-256MB}"
     volumes:
-      - ${POSTGRES_DATA_SOURCE:-postgres_data}:${POSTGRES_PGDATA:-/var/lib/postgresql/18/docker}
+      - postgres_data:${POSTGRES_PGDATA:-/var/lib/postgresql/18/docker}
       - ./backend_api_python/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql
     ports:
       - "${DB_PORT:-127.0.0.1:5432}:5432"
@@ -223,6 +223,7 @@ services:
 
 volumes:
   postgres_data:
+    name: ${POSTGRES_DATA_SOURCE:-quantdinger_postgres_data}
     driver: local
   backend_logs:
     driver: local
@@ -232,4 +233,3 @@ volumes:
 networks:
   quantdinger-network:
     driver: bridge
-
