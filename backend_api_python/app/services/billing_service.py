@@ -5,7 +5,6 @@ settings. A cost of 0 makes the feature free; disabling billing bypasses all
 credit deductions. Marketplace VIP/free pricing is handled in community purchase
 flows, not in this global usage-metering layer.
 """
-import os
 import time
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
@@ -13,87 +12,49 @@ from typing import Dict, Any, Optional, Tuple
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.services.billing_config import FEATURE_NAMES, load_billing_config, load_membership_plans
 
 logger = get_logger(__name__)
 
 
-BILLING_CONFIG_PREFIX = 'BILLING_'
-
-DEFAULT_BILLING_CONFIG = {
-    'enabled': False,  # 是否启用计费
-
-    'cost_ai_analysis': 10,
-    'cost_ai_code_gen': 30,
-    'cost_ai_tuning': 50,
-    'cost_ai_copilot_chat': 5,
-    'cost_ai_copilot_image': 15,
-    'cost_ai_copilot_radar': 20,
-}
-
-# Feature name mapping (for log recording)
-FEATURE_NAMES = {
-    'ai_analysis': 'AI Analysis',
-    'ai_code_gen': 'AI Code Generation',
-    'ai_tuning': 'AI Parameter Tuning',
-    'ai_copilot_chat': 'AI Copilot Chat',
-    'ai_copilot_image': 'AI Copilot Image Analysis',
-    'ai_copilot_radar': 'AI Copilot Opportunity Radar',
-}
-
-
 class BillingService:
-    """计费服务类"""
+    """Billing and credit accounting service."""
     
     def __init__(self):
         self._config_cache = None
         self._config_cache_time = 0
-        self._cache_ttl = 60  # 配置缓存60秒
+        self._cache_ttl = 60  # Config cache TTL in seconds
     
     def get_billing_config(self) -> Dict[str, Any]:
-        """获取计费配置"""
+        """Return billing configuration from environment-backed settings."""
         now = time.time()
         if self._config_cache and (now - self._config_cache_time) < self._cache_ttl:
             return self._config_cache
         
-        config = {}
-        for key, default_value in DEFAULT_BILLING_CONFIG.items():
-            env_key = f'{BILLING_CONFIG_PREFIX}{key.upper()}'
-            value = os.getenv(env_key)
-            
-            if value is None or value == '':
-                config[key] = default_value
-            elif isinstance(default_value, bool):
-                config[key] = str(value).lower() in ('true', '1', 'yes')
-            elif isinstance(default_value, int):
-                try:
-                    config[key] = int(value)
-                except (ValueError, TypeError):
-                    config[key] = default_value
-            else:
-                config[key] = value
+        config = load_billing_config()
         
         self._config_cache = config
         self._config_cache_time = now
         return config
     
     def clear_config_cache(self):
-        """清除配置缓存"""
+        """Clear billing config cache."""
         self._config_cache = None
         self._config_cache_time = 0
     
     def is_billing_enabled(self) -> bool:
-        """检查是否启用计费"""
+        """Return whether billing is enabled."""
         config = self.get_billing_config()
         return config.get('enabled', False)
     
     def get_feature_cost(self, feature: str) -> int:
-        """获取指定功能的积分消耗，0 表示免费"""
+        """Return feature credit cost; 0 means free."""
         config = self.get_billing_config()
         cost_key = f'cost_{feature}'
         return config.get(cost_key, 0)
     
     def get_user_credits(self, user_id: int) -> Decimal:
-        """获取用户积分余额"""
+        """Return user credit balance."""
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
@@ -112,12 +73,7 @@ class BillingService:
             return Decimal('0')
     
     def get_user_vip_status(self, user_id: int) -> Tuple[bool, Optional[datetime]]:
-        """
-        获取用户VIP状态
-        
-        Returns:
-            (is_vip, expires_at): VIP是否有效, VIP过期时间
-        """
+        """Return VIP status and expiration time for a user."""
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
@@ -161,38 +117,7 @@ class BillingService:
           - yearly: price_usd, credits_once, duration_days
           - lifetime: price_usd, credits_monthly (granted every 30 days)
         """
-        def _f(key: str, default: float) -> float:
-            try:
-                return float(os.getenv(key, str(default)).strip())
-            except Exception:
-                return float(default)
-
-        def _i(key: str, default: int) -> int:
-            try:
-                return int(float(os.getenv(key, str(default)).strip()))
-            except Exception:
-                return int(default)
-
-        return {
-            "monthly": {
-                "plan": "monthly",
-                "price_usd": _f("MEMBERSHIP_MONTHLY_PRICE_USD", 19.9),
-                "credits_once": _i("MEMBERSHIP_MONTHLY_CREDITS", 500),
-                "duration_days": 30,
-            },
-            "yearly": {
-                "plan": "yearly",
-                "price_usd": _f("MEMBERSHIP_YEARLY_PRICE_USD", 199.0),
-                "credits_once": _i("MEMBERSHIP_YEARLY_CREDITS", 8000),
-                "duration_days": 365,
-            },
-            "lifetime": {
-                "plan": "lifetime",
-                "price_usd": _f("MEMBERSHIP_LIFETIME_PRICE_USD", 499.0),
-                # Lifetime: monthly credits granted periodically
-                "credits_monthly": _i("MEMBERSHIP_LIFETIME_MONTHLY_CREDITS", 800),
-            },
-        }
+        return load_membership_plans()
 
     def purchase_membership(
         self,
@@ -299,7 +224,7 @@ class BillingService:
                     ref = (fulfillment_ref or "").strip()
                     order_ref = ref if ref else f"usdt:{user_id}:{int(now.timestamp())}"
 
-                # Update user VIP fields — but only when something actually
+                # Update user VIP fields, but only when something actually
                 # changes. Lifetime members topping up via monthly/yearly
                 # keep all three VIP columns intact so we don't accidentally
                 # roll back a long expiry or flip the lifetime flag off.
@@ -347,7 +272,7 @@ class BillingService:
                 # NOTE: we used to also write a zero-amount `membership_purchase`
                 # audit row here so the credits-log tab showed two rows per
                 # purchase (one "you bought X" + one "you got N credits"). That
-                # was redundant — the actual credit grant above already records
+                # was redundant. The actual credit grant above already records
                 # the action with a non-zero amount, and the membership
                 # purchase itself is preserved in qd_membership_orders /
                 # qd_usdt_orders. Dropping the duplicate keeps the user-facing
@@ -481,15 +406,15 @@ class BillingService:
     
     def check_and_consume(self, user_id: int, feature: str, reference_id: str = '') -> Tuple[bool, str]:
         """
-        检查并消耗积分
+        Check and consume credits for a feature.
         
         Args:
-            user_id: 用户ID
+            user_id: User id.
             feature: Billing feature key, for example ai_analysis, ai_code_gen, or ai_tuning.
-            reference_id: 关联ID（可选）
+            reference_id: Optional related entity id.
         
         Returns:
-            (success, message): 是否成功, 提示消息
+            (success, message): Whether the charge succeeded and the status message.
         """
         if not self.is_billing_enabled():
             return True, 'billing_disabled'
@@ -540,15 +465,15 @@ class BillingService:
     def add_credits(self, user_id: int, amount: int, action: str = 'recharge', 
                     remark: str = '', operator_id: int = None, reference_id: str = '') -> Tuple[bool, str]:
         """
-        增加用户积分
+        Add credits to a user account.
         
         Args:
-            user_id: 用户ID
-            amount: 增加金额（正数）
-            action: 操作类型（recharge/admin_adjust/refund/referral_bonus/register_bonus）
-            remark: 备注
-            operator_id: 操作人ID（管理员操作时）
-            reference_id: 关联ID（如被邀请用户ID、订单号等）
+            user_id: User id.
+            amount: Positive credit amount.
+            action: Action type such as recharge, admin_adjust, refund, referral_bonus, or register_bonus.
+            remark: Optional remark.
+            operator_id: Operator user id for admin actions.
+            reference_id: Related entity id such as invited user id or order number.
         
         Returns:
             (success, message)
@@ -590,13 +515,13 @@ class BillingService:
     def set_credits(self, user_id: int, amount: int, remark: str = '', 
                     operator_id: int = None) -> Tuple[bool, str]:
         """
-        设置用户积分（管理员直接设置）
+        Set user credits directly for admin adjustments.
         
         Args:
-            user_id: 用户ID
-            amount: 设置的金额
-            remark: 备注
-            operator_id: 操作人ID
+            user_id: User id.
+            amount: New credit amount.
+            remark: Optional remark.
+            operator_id: Operator user id.
         
         Returns:
             (success, message)
@@ -638,13 +563,13 @@ class BillingService:
     def set_vip(self, user_id: int, expires_at: Optional[datetime], 
                 remark: str = '', operator_id: int = None) -> Tuple[bool, str]:
         """
-        设置用户VIP状态
+        Set user VIP status.
         
         Args:
-            user_id: 用户ID
-            expires_at: VIP过期时间（None表示取消VIP）
-            remark: 备注
-            operator_id: 操作人ID
+            user_id: User id.
+            expires_at: VIP expiration time; None cancels VIP.
+            remark: Optional remark.
+            operator_id: Operator user id.
         
         Returns:
             (success, message)
@@ -680,7 +605,7 @@ class BillingService:
             return False, str(e)
     
     def get_credits_log(self, user_id: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """获取用户积分变动日志"""
+        """Return user credit change logs."""
         offset = (page - 1) * page_size
         
         try:
@@ -731,7 +656,7 @@ class BillingService:
             return {'items': [], 'total': 0, 'page': 1, 'page_size': page_size, 'total_pages': 0}
     
     def get_user_billing_info(self, user_id: int) -> Dict[str, Any]:
-        """获取用户计费与会员信息快照（供前端显示）。
+        """Return billing and membership snapshot for frontend display.
 
         ``is_lifetime`` is exposed so the billing page can render the VIP
         snapshot as "Lifetime member" (instead of an awkward 100-year
@@ -778,7 +703,7 @@ _billing_service = None
 
 
 def get_billing_service() -> BillingService:
-    """获取计费服务单例"""
+    """Return the singleton billing service."""
     global _billing_service
     if _billing_service is None:
         _billing_service = BillingService()

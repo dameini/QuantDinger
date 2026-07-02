@@ -4,6 +4,7 @@
 """
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, timedelta, timezone
+import time
 import ccxt
 
 from app.data_sources.base import BaseDataSource, TIMEFRAME_SECONDS
@@ -14,6 +15,25 @@ logger = get_logger(__name__)
 
 # Live-trading scoped instances: one CCXT client per (exchange, spot|swap).
 _SCOPED_INSTANCES: Dict[str, "CryptoDataSource"] = {}
+_INVALID_SYMBOL_UNTIL: Dict[str, float] = {}
+
+
+def _invalid_symbol_ttl_sec() -> float:
+    return 300.0
+
+
+def _is_symbol_not_found_error(exc: Any) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        token in text
+        for token in (
+            "does not have market symbol",
+            "symbol not found",
+            "invalid symbol",
+            "market does not exist",
+            "trading pair not found",
+        )
+    )
 
 
 def resolve_ccxt_for_live_trading(exchange_id: str, market_type: str) -> Tuple[str, Dict[str, Any]]:
@@ -168,6 +188,31 @@ class CryptoDataSource(BaseDataSource):
             if quote:
                 return f"{normalized}:{quote}"
         return normalized
+
+    def _invalid_symbol_key(self, symbol_pair: str) -> str:
+        exchange_id = getattr(self.exchange, 'id', '').lower()
+        mt = getattr(self, "_scoped_market_type", "") or "spot"
+        return f"{exchange_id}:{mt}:{str(symbol_pair or '').upper()}"
+
+    def _is_invalid_symbol_cached(self, symbol_pair: str) -> bool:
+        key = self._invalid_symbol_key(symbol_pair)
+        until = float(_INVALID_SYMBOL_UNTIL.get(key) or 0.0)
+        if time.time() < until:
+            return True
+        _INVALID_SYMBOL_UNTIL.pop(key, None)
+        return False
+
+    def _mark_invalid_symbol(self, symbol_pair: str, error: Any) -> None:
+        key = self._invalid_symbol_key(symbol_pair)
+        if not self._is_invalid_symbol_cached(symbol_pair):
+            logger.warning(
+                "Symbol '%s' not found on %s; suppressing repeat requests for %.0fs. Error: %s",
+                symbol_pair,
+                getattr(self.exchange, 'id', ''),
+                _invalid_symbol_ttl_sec(),
+                str(error)[:160],
+            )
+        _INVALID_SYMBOL_UNTIL[key] = time.time() + _invalid_symbol_ttl_sec()
     
     def _ensure_markets_loaded(self) -> bool:
         """确保 markets 已加载（用于符号验证）"""
@@ -298,6 +343,9 @@ class CryptoDataSource(BaseDataSource):
         if not normalized:
             logger.warning(f"Failed to normalize symbol: {symbol}")
             return {'last': 0, 'symbol': symbol}
+
+        if self._is_invalid_symbol_cached(normalized):
+            return {'last': 0, 'symbol': symbol}
         
         try:
             ticker = self.exchange.fetch_ticker(normalized)
@@ -305,13 +353,7 @@ class CryptoDataSource(BaseDataSource):
                 return ticker
         except Exception as e:
             error_msg = str(e).lower()
-            is_symbol_error = any(keyword in error_msg for keyword in [
-                'does not have market symbol',
-                'symbol not found',
-                'invalid symbol',
-                'market does not exist',
-                'trading pair not found'
-            ])
+            is_symbol_error = _is_symbol_not_found_error(e)
             
             if is_symbol_error:
                 base = normalized.split('/')[0] if '/' in normalized else normalized
@@ -326,10 +368,13 @@ class CryptoDataSource(BaseDataSource):
                         except Exception as e2:
                             logger.debug(f"Alternative symbol {valid_symbol} also failed: {e2}")
             
-            logger.warning(
-                f"Symbol '{symbol}' (normalized: {normalized}) not found on {self.exchange.id}. "
-                f"Error: {str(e)[:100]}"
-            )
+            if is_symbol_error:
+                self._mark_invalid_symbol(normalized, e)
+            else:
+                logger.warning(
+                    f"Symbol '{symbol}' (normalized: {normalized}) not found on {self.exchange.id}. "
+                    f"Error: {str(e)[:100]}"
+                )
         
         return {'last': 0, 'symbol': symbol}
     
@@ -343,6 +388,7 @@ class CryptoDataSource(BaseDataSource):
     ) -> List[Dict[str, Any]]:
         """获取加密货币K线数据"""
         klines = []
+        symbol_pair = ""
         
         try:
             ccxt_timeframe = self.TIMEFRAME_MAP.get(timeframe, '1d')
@@ -379,6 +425,8 @@ class CryptoDataSource(BaseDataSource):
                 logger.warning(f"Failed to normalize symbol for K-line: {symbol}")
                 return []
 
+            if self._is_invalid_symbol_cached(symbol_pair):
+                return []
 
             ohlcv = self._fetch_ohlcv(
                 symbol_pair, fetch_ccxt_timeframe, fetch_limit,
@@ -615,6 +663,9 @@ class CryptoDataSource(BaseDataSource):
             return ohlcv
 
         except Exception as e:
+            if _is_symbol_not_found_error(e):
+                self._mark_invalid_symbol(symbol_pair, e)
+                return []
             logger.warning(f"CCXT fetch_ohlcv failed: {str(e)}; trying fallback")
             return self._fetch_ohlcv_fallback(
                 symbol_pair, ccxt_timeframe, limit, before_time, timeframe, after_time
@@ -659,6 +710,9 @@ class CryptoDataSource(BaseDataSource):
             ohlcv = self.exchange.fetch_ohlcv(symbol_pair, ccxt_timeframe, since=since, limit=safe_limit)
             return ohlcv
         except Exception as e:
-            logger.error(f"CCXT fallback method also failed: {str(e)}")
+            if _is_symbol_not_found_error(e):
+                self._mark_invalid_symbol(symbol_pair, e)
+            else:
+                logger.error(f"CCXT fallback method also failed: {str(e)}")
             return []
 

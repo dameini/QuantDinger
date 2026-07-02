@@ -6,7 +6,7 @@
 |------|---------|-------|
 | Docker & Docker Compose | 20+ | required for the default setup |
 | Python | 3.10+ | only if running backend outside Docker |
-| Node.js | 18+ | only if you maintain the private QuantDinger-Vue repo |
+| Node.js | 22 LTS | only if you maintain the private QuantDinger-Vue or mobile source repos |
 
 ## Quick Start (Docker)
 
@@ -33,7 +33,7 @@ The stack includes:
 |---------|------|-------------|
 | `frontend` | 8888 | Nginx serving Vue SPA |
 | `backend` | 5000 | Flask API (gunicorn) |
-| `postgres` | 5432 | PostgreSQL 16 |
+| `postgres` | 5432 | PostgreSQL 18 |
 | `redis` | 6379 | Cache layer (LRU, 128 MB) |
 
 ## Project Structure
@@ -55,7 +55,7 @@ quantdinger/
 │   └── requirements.txt
 ├── docs/                        # Changelog, architecture notes
 ├── docker-compose.yml           # frontend service pulls ghcr.io/.../quantdinger-frontend
-├── docker-compose.ghcr.yml      # both services pulled from GHCR (zero-clone deploy)
+├── docker-compose.ghcr.yml      # backend, frontend, and mobile pulled from GHCR (zero-clone deploy)
 └── README.md
 ```
 
@@ -178,6 +178,8 @@ pytest tests/ -v
 ```
 
 ## Troubleshooting
+
+- **First-time Docker install or pull failures** - see the bilingual [Installation Troubleshooting](docs/INSTALL_TROUBLESHOOTING.md) guide for Docker Desktop proxy setup, Docker Hub pull errors, and Postgres data-version issues.
 
 - **"apikey parameter is incorrect"** from Twelve Data — verify `TWELVE_DATA_API_KEY` in `.env`; Chinese stock data requires a paid plan.
 - **Heatmap "暂无数据"** — usually caused by NaN in yfinance data; the global JSON encoder now sanitises all NaN/Inf to `null`.

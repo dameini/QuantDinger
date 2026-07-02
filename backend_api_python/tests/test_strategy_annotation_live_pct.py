@@ -1,6 +1,7 @@
 """Tests for @strategy annotation -> backtest-compatible nested cfg."""
 
 from app.services.indicator_params import StrategyConfigParser
+from app.services.strategy import _apply_risk_flat_from_indicator_code
 
 
 USER_SAMPLE_CODE = """
@@ -38,6 +39,21 @@ def test_to_trading_config_risk_flat_user_sample():
     assert flat["trailing_activation_pct"] == 0.37
     assert flat["trailing_enabled"] is True
     assert flat["trade_direction"] == "both"
+
+
+def test_indicator_annotation_does_not_override_explicit_trade_direction():
+    trading_config = {
+        "trade_direction": "short",
+        "stop_loss_pct": 1.0,
+    }
+    indicator_config = {
+        "indicator_code": USER_SAMPLE_CODE,
+    }
+
+    merged = _apply_risk_flat_from_indicator_code(trading_config, indicator_config)
+
+    assert merged["trade_direction"] == "short"
+    assert merged["take_profit_pct"] == 25.0
 
 
 def test_to_trading_config_risk_flat_sub_one_percent():

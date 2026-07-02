@@ -1,4 +1,4 @@
-﻿"""
+"""
 Grid fill quantity normalization: convert exchange order fields to base-asset qty.
 
 Sources (official API docs):

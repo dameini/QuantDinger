@@ -81,6 +81,20 @@ class USStockDataSource(BaseDataSource):
     def _normalize_timeframe(self, timeframe: str) -> str:
         raw = str(timeframe or "1D").strip()
         return self.TIMEFRAME_ALIASES.get(raw.lower(), raw)
+
+    @staticmethod
+    def _yahoo_symbol(symbol: str) -> str:
+        sym = (symbol or "").strip().upper()
+        if "$" in sym:
+            base, series = sym.split("$", 1)
+            return f"{base}-P{series}" if base and series else sym
+        if "." in sym:
+            return sym.replace(".", "-")
+        return sym
+
+    @staticmethod
+    def _nasdaq_symbol(symbol: str) -> str:
+        return (symbol or "").strip().upper().replace("$", "^")
     
     def get_ticker(self, symbol: str) -> Dict[str, Any]:
         """
@@ -130,7 +144,7 @@ class USStockDataSource(BaseDataSource):
             return yahoo_quote
         
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(self._yahoo_symbol(symbol))
             
             try:
                 fast_info = ticker.fast_info
@@ -287,8 +301,9 @@ class USStockDataSource(BaseDataSource):
 
     def _fetch_nasdaq_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         try:
+            nasdaq_symbol = self._nasdaq_symbol(symbol)
             resp = requests.get(
-                f"https://api.nasdaq.com/api/quote/{symbol}/info",
+                f"https://api.nasdaq.com/api/quote/{nasdaq_symbol}/info",
                 params={"assetclass": "stocks"},
                 timeout=10,
                 headers=self.NASDAQ_HEADERS,
@@ -325,7 +340,7 @@ class USStockDataSource(BaseDataSource):
     ) -> List[Dict[str, Any]]:
         try:
             resp = requests.get(
-                f"https://api.nasdaq.com/api/quote/{symbol}/chart",
+                f"https://api.nasdaq.com/api/quote/{self._nasdaq_symbol(symbol)}/chart",
                 params={"assetclass": "stocks"},
                 timeout=10,
                 headers=self.NASDAQ_HEADERS,
@@ -378,7 +393,7 @@ class USStockDataSource(BaseDataSource):
     ) -> List[Dict[str, Any]]:
         try:
             resp = requests.get(
-                f"https://api.nasdaq.com/api/quote/{symbol}/historical",
+                f"https://api.nasdaq.com/api/quote/{self._nasdaq_symbol(symbol)}/historical",
                 params={
                     "assetclass": "stocks",
                     "fromdate": start_date.strftime("%Y-%m-%d"),
@@ -421,7 +436,7 @@ class USStockDataSource(BaseDataSource):
     def _fetch_yahoo_chart_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
         try:
             resp = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{self._yahoo_symbol(symbol)}",
                 params={"range": "1d", "interval": "1m", "includePrePost": "false"},
                 timeout=8,
                 headers={"User-Agent": "Mozilla/5.0"},
@@ -471,7 +486,7 @@ class USStockDataSource(BaseDataSource):
     ) -> List[Dict[str, Any]]:
         try:
             resp = requests.get(
-                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{self._yahoo_symbol(symbol)}",
                 params={
                     "period1": int(start_date.timestamp()),
                     "period2": int((end_date + timedelta(days=1)).timestamp()),
@@ -523,7 +538,7 @@ class USStockDataSource(BaseDataSource):
     def _fetch_yfinance(self, symbol: str, interval: str, start_date: datetime, end_date: datetime):
         """使用 yfinance 获取数据"""
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(self._yahoo_symbol(symbol))
             
             end_date_inclusive = end_date + timedelta(days=1)
             

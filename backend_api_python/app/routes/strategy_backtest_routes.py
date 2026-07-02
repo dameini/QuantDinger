@@ -16,6 +16,18 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _should_persist_backtest(payload: dict) -> bool:
+    purpose = str((payload or {}).get('runPurpose') or (payload or {}).get('run_purpose') or '').strip().lower()
+    if purpose in {'script_param_tuning', 'param_tuning', 'tuning'}:
+        return False
+    raw = (payload or {}).get('persist', True)
+    if raw is False or raw == 0:
+        return False
+    if isinstance(raw, str) and raw.strip().lower() in {'false', '0', 'no', 'off'}:
+        return False
+    return True
+
+
 def _build_script_source_strategy(source: dict, script_source_id: int, override_config: dict) -> dict:
     override = override_config if isinstance(override_config, dict) else {}
     metadata = source.get('metadata') or {}
@@ -107,29 +119,31 @@ def run_strategy_backtest():
         ea['slippage'] = round(float(snapshot.get('slippage') or 0), 6)
         ea['strictMode'] = bool(snapshot.get('strict_mode', True))
         result['executionAssumptions'] = ea
-        run_id = svc.persist_run(
-            user_id=user_id,
-            indicator_id=snapshot.get('indicator_id'),
-            strategy_id=snapshot.get('strategy_id'),
-            strategy_name=snapshot.get('strategy_name') or '',
-            run_type=snapshot.get('run_type') or 'strategy_indicator',
-            market=snapshot.get('market') or '',
-            symbol=snapshot.get('symbol') or '',
-            timeframe=snapshot.get('timeframe') or '',
-            start_date_str=start_date_str,
-            end_date_str=end_date_str,
-            initial_capital=float(snapshot.get('initial_capital') or 0),
-            commission=float(snapshot.get('commission') or 0),
-            slippage=float(snapshot.get('slippage') or 0),
-            leverage=int(snapshot.get('leverage') or 1),
-            trade_direction=str(snapshot.get('trade_direction') or 'long'),
-            strategy_config=snapshot.get('strategy_config') or {},
-            config_snapshot=snapshot.get('config_snapshot') or {},
-            status='success',
-            error_message='',
-            result=result,
-            code=snapshot.get('code') or '',
-        )
+        run_id = None
+        if _should_persist_backtest(payload):
+            run_id = svc.persist_run(
+                user_id=user_id,
+                indicator_id=snapshot.get('indicator_id'),
+                strategy_id=snapshot.get('strategy_id'),
+                strategy_name=snapshot.get('strategy_name') or '',
+                run_type=snapshot.get('run_type') or 'strategy_indicator',
+                market=snapshot.get('market') or '',
+                symbol=snapshot.get('symbol') or '',
+                timeframe=snapshot.get('timeframe') or '',
+                start_date_str=start_date_str,
+                end_date_str=end_date_str,
+                initial_capital=float(snapshot.get('initial_capital') or 0),
+                commission=float(snapshot.get('commission') or 0),
+                slippage=float(snapshot.get('slippage') or 0),
+                leverage=int(snapshot.get('leverage') or 1),
+                trade_direction=str(snapshot.get('trade_direction') or 'long'),
+                strategy_config=snapshot.get('strategy_config') or {},
+                config_snapshot=snapshot.get('config_snapshot') or {},
+                status='success',
+                error_message='',
+                result=result,
+                code=snapshot.get('code') or '',
+            )
         if strategy_id:
             try:
                 get_strategy_service().patch_trading_config(
@@ -159,7 +173,7 @@ def run_strategy_backtest():
                 source = get_script_source_service().get_source(script_source_id, user_id=g.user_id)
                 if source:
                     strategy = _build_script_source_strategy(source, script_source_id, override_config)
-            if strategy:
+            if strategy and _should_persist_backtest(payload):
                 resolver = StrategySnapshotResolver(user_id=g.user_id)
                 snapshot = resolver.resolve(strategy, override_config)
                 snapshot['user_id'] = g.user_id

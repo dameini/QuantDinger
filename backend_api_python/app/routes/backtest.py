@@ -327,7 +327,7 @@ def get_backtest_history():
 
         indicator_id = request.args.get('indicatorId')
         strategy_id = request.args.get('strategyId')
-        run_type = (request.args.get('runType') or '').strip()
+        run_type = (request.args.get('runType') or 'indicator').strip()
         symbol = (request.args.get('symbol') or '').strip()
         market = (request.args.get('market') or '').strip()
         timeframe = (request.args.get('timeframe') or '').strip()

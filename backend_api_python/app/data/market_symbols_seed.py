@@ -75,9 +75,95 @@ def search_symbols(market: str, keyword: str, limit: int = 20) -> List[Dict]:
     if not market or not kw:
         return []
     
-    # Use ILIKE for case-insensitive search in PostgreSQL
     pattern = f'%{kw}%'
+    prefix_pattern = f'{kw}%'
     
+    try:
+        with _get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT market, symbol, name FROM qd_market_symbols
+                WHERE market = ? AND is_active = 1 AND UPPER(symbol) = UPPER(?)
+                LIMIT ?
+                """,
+                (market, kw, max(limit, 0))
+            )
+            exact_rows = cur.fetchall() or []
+            if exact_rows:
+                cur.close()
+                return [
+                    {'market': r['market'], 'symbol': r['symbol'], 'name': r.get('name') or ''}
+                    for r in exact_rows
+                ]
+
+            cur.execute(
+                """
+                SELECT market, symbol, name FROM qd_market_symbols s
+                WHERE market = ? AND is_active = 1
+                  AND (
+                    UPPER(symbol) LIKE UPPER(?)
+                    OR UPPER(name) LIKE UPPER(?)
+                    OR EXISTS (
+                      SELECT 1 FROM qd_market_symbol_aliases a
+                      WHERE a.market = s.market
+                        AND UPPER(a.symbol) = UPPER(s.symbol)
+                        AND a.is_active = 1
+                        AND UPPER(a.alias) LIKE UPPER(?)
+                    )
+                  )
+                ORDER BY
+                  CASE
+                    WHEN UPPER(symbol) = UPPER(?) THEN 0
+                    WHEN UPPER(symbol) LIKE UPPER(?) THEN 1
+                    WHEN UPPER(symbol) LIKE UPPER(?) THEN 2
+                    WHEN UPPER(name) LIKE UPPER(?) THEN 3
+                    WHEN EXISTS (
+                      SELECT 1 FROM qd_market_symbol_aliases a
+                      WHERE a.market = s.market
+                        AND UPPER(a.symbol) = UPPER(s.symbol)
+                        AND a.is_active = 1
+                        AND UPPER(a.alias) = UPPER(?)
+                    ) THEN 4
+                    WHEN EXISTS (
+                      SELECT 1 FROM qd_market_symbol_aliases a
+                      WHERE a.market = s.market
+                        AND UPPER(a.symbol) = UPPER(s.symbol)
+                        AND a.is_active = 1
+                        AND UPPER(a.alias) LIKE UPPER(?)
+                    ) THEN 5
+                    ELSE 6
+                  END,
+                  sort_order DESC,
+                  LENGTH(symbol) ASC,
+                  symbol ASC
+                LIMIT ?
+                """,
+                (
+                    market,
+                    pattern,
+                    pattern,
+                    pattern,
+                    kw,
+                    prefix_pattern,
+                    pattern,
+                    prefix_pattern,
+                    kw,
+                    prefix_pattern,
+                    max(limit, 0),
+                )
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+            return [{'market': r['market'], 'symbol': r['symbol'], 'name': r.get('name') or ''} for r in rows]
+    except Exception as e:
+        logger.debug(f"search_symbols from DB failed: {e}")
+        return _search_symbols_without_aliases(market, kw, limit)
+
+
+def _search_symbols_without_aliases(market: str, keyword: str, limit: int) -> List[Dict]:
+    pattern = f'%{keyword}%'
+    prefix_pattern = f'{keyword}%'
     try:
         with _get_db_connection() as db:
             cur = db.cursor()
@@ -86,16 +172,35 @@ def search_symbols(market: str, keyword: str, limit: int = 20) -> List[Dict]:
                 SELECT market, symbol, name FROM qd_market_symbols
                 WHERE market = ? AND is_active = 1
                   AND (UPPER(symbol) LIKE UPPER(?) OR UPPER(name) LIKE UPPER(?))
-                ORDER BY sort_order DESC
+                ORDER BY
+                  CASE
+                    WHEN UPPER(symbol) = UPPER(?) THEN 0
+                    WHEN UPPER(symbol) LIKE UPPER(?) THEN 1
+                    WHEN UPPER(symbol) LIKE UPPER(?) THEN 2
+                    WHEN UPPER(name) LIKE UPPER(?) THEN 3
+                    ELSE 4
+                  END,
+                  sort_order DESC,
+                  LENGTH(symbol) ASC,
+                  symbol ASC
                 LIMIT ?
                 """,
-                (market, pattern, pattern, max(limit, 0))
+                (
+                    market,
+                    pattern,
+                    pattern,
+                    keyword,
+                    prefix_pattern,
+                    pattern,
+                    prefix_pattern,
+                    max(limit, 0),
+                )
             )
             rows = cur.fetchall() or []
             cur.close()
             return [{'market': r['market'], 'symbol': r['symbol'], 'name': r.get('name') or ''} for r in rows]
     except Exception as e:
-        logger.debug(f"search_symbols from DB failed: {e}")
+        logger.debug(f"search_symbols fallback failed: {e}")
         return []
 
 

@@ -1,20 +1,21 @@
 # QuantDinger Docker Compose - GHCR prebuilt images (zero-repo deploy)
 #
-# Pulls both backend and frontend images from GitHub Container Registry. The
-# repository does NOT need to be cloned — only this file (plus a backend.env
+# Pulls backend, frontend, and mobile H5 images from GitHub Container Registry. The
+# repository does NOT need to be cloned - only this file (plus a backend.env
 # for runtime config) is required.
 #
 # Minimal install (Linux / macOS):
 #
 #   curl -O https://raw.githubusercontent.com/brokermr810/QuantDinger/main/docker-compose.ghcr.yml
 #   curl -o backend.env https://raw.githubusercontent.com/brokermr810/QuantDinger/main/backend_api_python/env.example
+#   # Edit backend.env and set ADMIN_USER / ADMIN_PASSWORD before first start.
 #   docker compose -f docker-compose.ghcr.yml up -d
-#   # open http://localhost:8888  (login: quantdinger / 123456)
+#   # open http://localhost:8888  (web) or http://localhost:8889 (mobile H5)
 #
 # Two-file separation of concerns:
-#   - backend.env   — backend runtime config (SECRET_KEY, API keys, broker creds, ...);
+#   - backend.env   - backend runtime config (SECRET_KEY, API keys, broker creds, ...);
 #                     bind-mounted into the backend container as /app/.env
-#   - .env (optional) — docker compose orchestration knobs (IMAGE_TAG, ports, mirrors);
+#   - .env (optional) - docker compose orchestration knobs (IMAGE_TAG, ports, mirrors);
 #                       read by `docker compose` itself for ${VAR} substitution
 #
 # Database schema is bootstrapped automatically: the backend re-applies
@@ -27,22 +28,24 @@
 #   FRONTEND_TAG    - per-side override: pins frontend only (default: $IMAGE_TAG)
 #   BACKEND_IMAGE   - backend image path  (default: ghcr.io/brokermr810/quantdinger-backend)
 #   FRONTEND_IMAGE  - frontend image path (default: ghcr.io/brokermr810/quantdinger-frontend)
+#   MOBILE_IMAGE    - mobile H5 image path (default: ghcr.io/brokermr810/quantdinger-mobile)
 #   IMAGE_PREFIX    - postgres/redis registry prefix (e.g. docker.m.daocloud.io/library/)
 #
 # Normal use: set IMAGE_TAG once and both services move in lockstep.
 # Per-side overrides only kick in when BACKEND_TAG / FRONTEND_TAG are
-# explicitly set — useful for testing a frontend hotfix against a
+# explicitly set - useful for testing a frontend hotfix against a
 # stable backend, or vice versa.
 
 services:
   postgres:
-    image: ${IMAGE_PREFIX:-}postgres:16-alpine
+    image: ${POSTGRES_IMAGE:-${IMAGE_PREFIX:-}postgres:18.3-alpine}
     container_name: quantdinger-db
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-quantdinger}
       POSTGRES_USER: ${POSTGRES_USER:-quantdinger}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdinger123}
+      PGDATA: ${POSTGRES_PGDATA:-/var/lib/postgresql/18/docker}
       TZ: ${TZ:-Asia/Shanghai}
     command:
       - "postgres"
@@ -51,7 +54,7 @@ services:
       - "-c"
       - "shared_buffers=${PG_SHARED_BUFFERS:-256MB}"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${POSTGRES_DATA_SOURCE:-postgres_data}:${POSTGRES_PGDATA:-/var/lib/postgresql/18/docker}
     ports:
       - "${DB_PORT:-127.0.0.1:5432}:5432"
     networks:
@@ -83,6 +86,10 @@ services:
     pull_policy: always
     container_name: quantdinger-backend
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,7 +100,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      # Backend runtime config. Must exist as a *file* on the host — if missing,
+      # Backend runtime config. Must exist as a *file* on the host - if missing,
       # docker silently creates a directory at the mount target and shadows
       # /app/.env. The entrypoint will auto-generate SECRET_KEY on first start
       # and write it back through the bind mount, so the host file gets the
@@ -115,16 +122,12 @@ services:
       - DB_POOL_HEALTH_CHECK=${DB_POOL_HEALTH_CHECK:-true}
       - MARKET_EXECUTOR_WORKERS=${MARKET_EXECUTOR_WORKERS:-6}
       - PORTFOLIO_EXECUTOR_WORKERS=${PORTFOLIO_EXECUTOR_WORKERS:-3}
+      - RESOURCE_FD_COOLDOWN_SEC=${RESOURCE_FD_COOLDOWN_SEC:-180}
+      - PORTFOLIO_MONITOR_DUE_BATCH_LIMIT=${PORTFOLIO_MONITOR_DUE_BATCH_LIMIT:-5}
       - GUNICORN_WORKERS=${GUNICORN_WORKERS:-1}
       - GUNICORN_THREADS=${GUNICORN_THREADS:-8}
       - ALLOW_LOCAL_DESKTOP_BROKERS=${ALLOW_LOCAL_DESKTOP_BROKERS:-true}
-      # Container egress does not automatically inherit the host shell proxy.
-      # Set these in the project-root `.env` when exchanges are reachable only
-      # through a proxy / soft-router path.
-      - HTTP_PROXY=${HTTP_PROXY:-}
-      - HTTPS_PROXY=${HTTPS_PROXY:-}
-      - ALL_PROXY=${ALL_PROXY:-}
-      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:8888,http://localhost:8889}
     networks:
       - quantdinger-network
     healthcheck:
@@ -141,6 +144,26 @@ services:
     restart: unless-stopped
     ports:
       - "${FRONTEND_PORT:-8888}:80"
+    environment:
+      - BACKEND_URL=${BACKEND_URL:-http://backend:5000}
+    depends_on:
+      - backend
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mobile:
+    # Tag resolution: MOBILE_TAG > IMAGE_TAG > latest. See header comment.
+    image: ${MOBILE_IMAGE:-ghcr.io/brokermr810/quantdinger-mobile}:${MOBILE_TAG:-${IMAGE_TAG:-latest}}
+    pull_policy: always
+    container_name: quantdinger-mobile
+    restart: unless-stopped
+    ports:
+      - "${MOBILE_PORT:-8889}:80"
     environment:
       - BACKEND_URL=${BACKEND_URL:-http://backend:5000}
     depends_on:

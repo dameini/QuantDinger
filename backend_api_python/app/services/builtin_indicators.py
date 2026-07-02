@@ -46,7 +46,7 @@ _SUPERTREND_CODE = r'''# =======================================================
 #
 # Design notes:
 #   1) ATR uses Wilder smoothing (ewm alpha=1/N) so values match
-#      TradingView, MT5 and most pro charting tools.
+#      TradingView and most pro charting tools.
 #   2) Final upper / lower bands are path-dependent: they cannot
 #      drift in the unfavourable direction, so we recurse bar by bar
 #      in a Python loop instead of pure vectorisation.

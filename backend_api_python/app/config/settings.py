@@ -1,6 +1,4 @@
-"""
-应用主配置
-"""
+"""Application settings."""
 import os
 
 class MetaConfig(type):
@@ -83,9 +81,9 @@ class MetaConfig(type):
         return os.getenv('ENABLE_REQUEST_LOG', 'True').lower() == 'true'
 
 class Config(metaclass=MetaConfig):
-    """应用配置类"""
+    """Application configuration."""
     
     @classmethod
     def get_log_path(cls) -> str:
-        """获取日志文件完整路径"""
+        """Return the full log file path."""
         return os.path.join(cls.LOG_DIR, cls.LOG_FILE)

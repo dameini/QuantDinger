@@ -1,19 +1,37 @@
-import os
-import time
 import json
 import threading
 import uuid
 from typing import List, Dict, Any, Optional
-from datetime import datetime
 
 from app.utils.logger import get_logger
 from app.utils.db import get_db_connection
-from app.services.symbol_name import normalize_crypto_symbol
 from app.services.exchange_execution import coalesce_exchange_config_from_payload
+from app.services.strategy_config import (
+    apply_cross_sectional_trading_config as _apply_cross_sectional_trading_config,
+    apply_default_strict_mode as _apply_default_strict_mode,
+    apply_risk_flat_from_indicator_code as _apply_risk_flat_from_indicator_code,
+    strip_legacy_risk_pct_basis as _strip_legacy_risk_pct_basis,
+)
+from app.services.symbol_name import normalize_crypto_symbol
 
 logger = get_logger(__name__)
 
 _strategy_service_singleton: Optional["StrategyService"] = None
+MIN_STRATEGY_INVESTMENT_AMOUNT = 10.0
+MAX_STRATEGY_INVESTMENT_AMOUNT = 1_000_000.0
+
+
+def validate_strategy_investment_amount(value: Any) -> float:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("Investment amount must be a number")
+    if amount < MIN_STRATEGY_INVESTMENT_AMOUNT or amount > MAX_STRATEGY_INVESTMENT_AMOUNT:
+        raise ValueError(
+            f"Investment amount must be between {MIN_STRATEGY_INVESTMENT_AMOUNT:g} "
+            f"and {MAX_STRATEGY_INVESTMENT_AMOUNT:g}"
+        )
+    return amount
 
 
 def get_strategy_service() -> "StrategyService":
@@ -22,131 +40,6 @@ def get_strategy_service() -> "StrategyService":
     if _strategy_service_singleton is None:
         _strategy_service_singleton = StrategyService()
     return _strategy_service_singleton
-
-
-def _normalize_cross_sectional_symbol_list(
-    symbol_list: List[Any],
-    market_category: str,
-) -> List[str]:
-    """Normalize universe entries to ``Market:SYMBOL`` (Crypto symbols canonicalized)."""
-    out: List[str] = []
-    default_market = (market_category or "Crypto").strip() or "Crypto"
-    for entry in symbol_list or []:
-        raw = str(entry or "").strip()
-        if not raw:
-            continue
-        if ":" in raw:
-            mkt, sym = raw.split(":", 1)
-            mkt = (mkt or default_market).strip() or default_market
-        else:
-            mkt, sym = default_market, raw
-        sym = sym.strip()
-        if not sym:
-            continue
-        if mkt == "Crypto":
-            sym = normalize_crypto_symbol(sym)
-        out.append(f"{mkt}:{sym}")
-    return out
-
-
-def _apply_cross_sectional_trading_config(
-    trading_config: Dict[str, Any],
-    *,
-    cs_strategy_type: str,
-    symbol_list: List[Any],
-    portfolio_size: Any,
-    long_ratio: Any,
-    rebalance_frequency: Any,
-    market_category: str,
-    market_type: str,
-) -> Dict[str, Any]:
-    """Validate and persist cross-sectional fields inside trading_config."""
-    tc = dict(trading_config or {})
-    cs = (cs_strategy_type or "single").strip().lower()
-    if cs != "cross_sectional":
-        tc["cs_strategy_type"] = "single"
-        return tc
-
-    norm_list = _normalize_cross_sectional_symbol_list(symbol_list, market_category)
-    if len(norm_list) < 2:
-        raise ValueError("cross_sectional requires at least 2 symbols in symbol_list")
-
-    try:
-        psize = int(portfolio_size or 10)
-    except (TypeError, ValueError):
-        psize = 10
-    if psize < 1:
-        raise ValueError("portfolio_size must be >= 1")
-    if psize > len(norm_list):
-        raise ValueError("portfolio_size cannot exceed the number of symbols in symbol_list")
-
-    try:
-        lr = float(long_ratio if long_ratio is not None else 0.5)
-    except (TypeError, ValueError):
-        lr = 0.5
-    lr = max(0.0, min(1.0, lr))
-    mt = (market_type or "swap").strip().lower()
-    if mt == "spot" and lr < 1.0:
-        lr = 1.0
-
-    freq = (rebalance_frequency or "daily").strip().lower()
-    if freq not in ("daily", "weekly", "monthly"):
-        freq = "daily"
-
-    tc["cs_strategy_type"] = "cross_sectional"
-    tc["symbol_list"] = norm_list
-    tc["portfolio_size"] = psize
-    tc["long_ratio"] = lr
-    tc["rebalance_frequency"] = freq
-    tc["strategy_type"] = "cross_sectional"
-    primary_sym = norm_list[0].split(":", 1)[-1]
-    tc["symbol"] = primary_sym
-    return tc
-
-
-def _apply_default_strict_mode(trading_config: Dict[str, Any]) -> Dict[str, Any]:
-    """Default new strategies to strict (backtest-aligned) live execution."""
-    tc = dict(trading_config or {})
-    if "strict_mode" not in tc and "strictMode" not in tc:
-        tc["strict_mode"] = True
-    return tc
-
-
-def _strip_legacy_risk_pct_basis(trading_config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    SL / TP / trailing percentages are unified as the underlying's % price
-    move directly (no leverage scaling at trigger time). The legacy
-    ``risk_pct_basis`` toggle is removed; any stale value on incoming
-    payloads is discarded so it cannot re-introduce a margin-vs-price
-    branch on the server.
-    """
-    tc = dict(trading_config or {})
-    tc.pop("risk_pct_basis", None)
-    tc.pop("riskPctBasis", None)
-    return tc
-
-
-def _apply_risk_flat_from_indicator_code(
-    trading_config: Dict[str, Any],
-    indicator_config: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    When indicator code declares @strategy risk keys, persist matching flat
-    trading_config.*_pct fields (percent units) so DB/UI/backtest-center stay
-    aligned with the same semantics as live runtime code parsing.
-    """
-    ic = indicator_config if isinstance(indicator_config, dict) else {}
-    code = ic.get("indicator_code") or ""
-    if not str(code).strip():
-        return dict(trading_config or {})
-    from app.services.indicator_params import StrategyConfigParser
-
-    flat = StrategyConfigParser.to_trading_config_risk_flat(str(code))
-    if not flat:
-        return dict(trading_config or {})
-    tc = dict(trading_config or {})
-    tc.update(flat)
-    return tc
 
 
 # Note: broker / market / market_type / trade_direction / bot_type compatibility
@@ -219,56 +112,22 @@ class StrategyService:
 
             ex = str(exchange_id or "").strip().lower()
 
-            # IBKR / MT5 are not CCXT exchanges; do not fall through to crypto symbol list.
-            if ex in ("ibkr", "mt5"):
+            # IBKR is not a CCXT exchange; do not fall through to crypto symbol list.
+            if ex == "ibkr":
                 from app.utils.local_brokers import desktop_broker_cloud_reject_message, local_desktop_brokers_allowed
 
                 if not local_desktop_brokers_allowed():
                     return {"success": False, "message": desktop_broker_cloud_reject_message(), "symbols": []}
 
-                if ex == "ibkr":
-                    # US tickers for convenience; full universe is broker-side.
-                    common = [
-                        "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "NFLX", "INTC",
-                        "SPY", "QQQ", "IWM", "DIA", "VOO", "BABA", "JD", "PDD", "COIN", "MSTR",
-                    ]
-                    return {
-                        "success": True,
-                        "message": "IBKR: 以下为常用美股代码示例，也可手动输入其他在 TWS 中可交易的代码。",
-                        "symbols": common,
-                    }
-
-                if ex == "mt5":
-                    try:
-                        from app.services.live_trading.factory import create_mt5_client
-
-                        mt5_client = create_mt5_client(resolved)
-                        if mt5_client and mt5_client.connected:
-                            infos = mt5_client.get_symbols(group="*") or []
-                            names: List[str] = []
-                            for info in infos:
-                                if isinstance(info, dict):
-                                    n = str(info.get("name") or "").strip()
-                                    if n:
-                                        names.append(n)
-                            names = sorted(set(names))[:2000]
-                            return {
-                                "success": True,
-                                "message": f"MT5: {len(names)} symbols from terminal",
-                                "symbols": names,
-                            }
-                        return {
-                            "success": False,
-                            "message": "MT5 未连接：请确认本机已启动 MT5 终端且账号配置正确。",
-                            "symbols": [],
-                        }
-                    except Exception as e:
-                        logger.error(f"MT5 get_symbols failed: {e}")
-                        return {
-                            "success": False,
-                            "message": f"MT5 品种列表失败: {e}",
-                            "symbols": [],
-                        }
+                common = [
+                    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "NFLX", "INTC",
+                    "SPY", "QQQ", "IWM", "DIA", "VOO", "BABA", "JD", "PDD", "COIN", "MSTR",
+                ]
+                return {
+                    "success": True,
+                    "message": "IBKR common US stock symbols. You may also enter another tradable TWS symbol manually.",
+                    "symbols": common,
+                }
 
             # For these exchanges, prefer direct REST (no ccxt), aligned with local live-trading design.
             if ex in ("bybit", "coinbaseexchange", "coinbase_exchange", "kraken", "gate"):
@@ -433,7 +292,7 @@ class StrategyService:
                 if not exchange_id:
                     return {'success': False, 'message': 'Missing exchange_id', 'data': None}
 
-                if exchange_id in ("ibkr", "mt5"):
+                if exchange_id == "ibkr":
                     from app.utils.local_brokers import desktop_broker_cloud_reject_message, local_desktop_brokers_allowed
 
                     if not local_desktop_brokers_allowed():
@@ -442,50 +301,6 @@ class StrategyService:
                             "message": desktop_broker_cloud_reject_message(),
                             "data": {"exchange": safe_cfg},
                         }
-
-                # Handle MT5 (Forex) connection test
-                if exchange_id == 'mt5':
-                    # Validate that MT5 is only used for Forex market
-                    market_category = str(resolved.get("market_category") or exchange_config.get("market_category") or "").strip()
-                    if market_category and market_category != "Forex":
-                        return {
-                            'success': False,
-                            'message': f'MT5 can only be used for Forex trading, but market_category is {market_category}. Please use MT5 only with Forex market.',
-                            'data': {'exchange': safe_cfg}
-                        }
-                    
-                    try:
-                        from app.services.live_trading.factory import create_mt5_client
-                        mt5_client = create_mt5_client(resolved)
-                        if mt5_client and mt5_client.connected:
-                            # Get account info if available
-                            account_info = None
-                            try:
-                                account_info = mt5_client.get_account_info()
-                            except Exception:
-                                pass
-                            return {
-                                'success': True,
-                                'message': 'MT5 connection successful',
-                                'data': {
-                                    'exchange': safe_cfg,
-                                    'account': account_info
-                                }
-                            }
-                        else:
-                            return {
-                                'success': False,
-                                'message': 'Failed to connect to MT5. Please check credentials and ensure terminal is running.',
-                                'data': {'exchange': safe_cfg}
-                            }
-                    except Exception as e:
-                        error_msg = str(e)
-                        return {
-                            'success': False,
-                            'message': f'MT5 connection failed: {error_msg}',
-                            'data': {'exchange': safe_cfg}
-                        }
-
                 # Handle IBKR (US Stocks) connection test
                 if exchange_id == 'ibkr':
                     market_category_ib = str(
@@ -690,17 +505,16 @@ class StrategyService:
                                 )
                             msg = f"{msg} | {hint}"
                             hint_cn = (
-                                "币安接口返回 -2015（密钥/IP/权限不匹配）。请逐项核对："
-                                "① API Key 是否勾选与当前测试一致的业务（现货选现货权限，合约选合约/U 本位权限）；"
-                                "② 若启用 IP 白名单，是否包含当前服务器出口 IP（见下方 egress_ip）；"
-                                "③ base_url 与密钥环境一致（主网密钥配 api.binance.com / fapi.binance.com，"
-                                "模拟盘需在 testnet.binance.vision / testnet.binancefuture.com 单独申请的 Testnet Key，主网 Key 在测试网无效）；"
-                                "④ 无多余空格、复制完整 Secret。"
+                                "Binance returned -2015, usually caused by an API key, IP whitelist, "
+                                "permission, or environment mismatch. Check that the API key has the "
+                                "right product permissions for the selected market type, that the current "
+                                "egress_ip is allowed when IP whitelisting is enabled, that base_url matches "
+                                "mainnet or testnet keys, and that the secret was copied completely."
                             )
                             if alt_ok:
                                 hint_cn += (
-                                    f" 自动探测：同一密钥在 market_type={alt_market_type} 可通过，"
-                                    f"当前选择的 {market_type} 与密钥权限不一致的可能性很大。"
+                                    f" Auto-check passed for market_type={alt_market_type}, so the selected "
+                                    f"market_type={market_type} is likely inconsistent with the key permissions."
                                 )
                         else:
                             hint_cn = ""
@@ -790,9 +604,23 @@ class StrategyService:
                         "UPDATE qd_strategies_trading SET status = ?, updated_at = NOW() WHERE id = ?",
                         (status, strategy_id)
                     )
+                affected = int(getattr(cur, "rowcount", 0) or 0)
+                if affected <= 0:
+                    if user_id is not None:
+                        cur.execute(
+                            "SELECT status FROM qd_strategies_trading WHERE id = ? AND user_id = ?",
+                            (strategy_id, user_id)
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT status FROM qd_strategies_trading WHERE id = ?",
+                            (strategy_id,)
+                        )
+                    row = cur.fetchone()
+                    affected = 1 if row and str((row or {}).get('status') or '').lower() == str(status).lower() else 0
                 db.commit()
                 cur.close()
-            return True
+            return affected > 0
         except Exception as e:
             logger.error(f"update_strategy_status failed: {e}")
             return False
@@ -984,7 +812,7 @@ class StrategyService:
         return json.dumps(obj, ensure_ascii=False)
 
     def _compute_runtime_metrics(self, strategy_ids: List[int]) -> Dict[int, Dict[str, float]]:
-        """批量计算策略的已实现盈亏 / 未实现盈亏 / 当前权益。"""
+        """Batch compute realized PnL, unrealized PnL, and current equity."""
         result: Dict[int, Dict[str, float]] = {}
         if not strategy_ids:
             return result
@@ -1151,7 +979,7 @@ class StrategyService:
 
         # Validate broker / market / market_type / direction / bot_type as a
         # single unit through the centralized policy (broker_market_policy.py).
-        # That module is the single source of truth — adding a new broker or
+        # That module is the single source of truth; adding a new broker or
         # tightening a rule should only need a change in one place.
         from app.services.broker_market_policy import validate_strategy_config
         exchange_id = (resolved_ex_cfg.get('exchange_id') or '').strip().lower() if isinstance(resolved_ex_cfg, dict) else ''
@@ -1171,7 +999,7 @@ class StrategyService:
             )
 
         # When credential_id is present, strip raw API keys to avoid
-        # storing secrets in the strategy record — they live in qd_exchange_credentials.
+        # storing secrets in the strategy record. They live in qd_exchange_credentials.
         if isinstance(exchange_config, dict) and exchange_config.get('credential_id'):
             for _secret_key in ('api_key', 'secret_key', 'passphrase', 'apiKey', 'secret', 'password'):
                 exchange_config.pop(_secret_key, None)
@@ -1188,14 +1016,18 @@ class StrategyService:
         # underlying pair. Equity / FX / futures markets pass through
         # unchanged. Write the normalised value back into trading_config so
         # the JSON copy stored alongside the denormalised column also reflects
-        # the canonical form — the live trading worker and execution layer
+        # the canonical form. The live trading worker and execution layer
         # both read symbol from trading_config['symbol'].
         if market_category == 'Crypto' and isinstance(symbol, str) and symbol:
             symbol = normalize_crypto_symbol(symbol)
             if isinstance(trading_config, dict):
                 trading_config['symbol'] = symbol
         timeframe = (trading_config or {}).get('timeframe')
-        initial_capital = (trading_config or {}).get('initial_capital') or payload.get('initial_capital') or 1000
+        initial_capital = validate_strategy_investment_amount(
+            (trading_config or {}).get('initial_capital') or payload.get('initial_capital') or 1000
+        )
+        trading_config['initial_capital'] = initial_capital
+        trading_config['investment_amount'] = initial_capital
         leverage = (trading_config or {}).get('leverage') or 1
         market_type = (trading_config or {}).get('market_type') or 'swap'
         
@@ -1248,7 +1080,7 @@ class StrategyService:
                     payload.get('status') or 'stopped',
                     symbol,
                     timeframe,
-                    float(initial_capital or 1000),
+                    initial_capital,
                     int(leverage or 1),
                     market_type,
                     self._dump_json_or_encrypt(exchange_config, encrypt=False) if exchange_config else '',
@@ -1398,8 +1230,11 @@ class StrategyService:
 
         for sid in strategy_ids:
             try:
-                self.update_strategy_status(sid, 'stopped', user_id=user_id)
-                success_ids.append(sid)
+                ok = self.update_strategy_status(sid, 'stopped', user_id=user_id)
+                if ok:
+                    success_ids.append(sid)
+                else:
+                    failed_ids.append({'id': sid, 'error': 'status update affected 0 rows'})
             except Exception as e:
                 logger.error(f"Failed to stop strategy {sid}: {e}")
                 failed_ids.append({'id': sid, 'error': str(e)})
@@ -1419,9 +1254,35 @@ class StrategyService:
             return False
         tc = dict(existing.get('trading_config') or {})
         tc.update(patch)
+        amount_changed = 'initial_capital' in patch or 'investment_amount' in patch
+        initial_capital = None
+        if amount_changed:
+            initial_capital = validate_strategy_investment_amount(
+                tc.get('initial_capital') or tc.get('investment_amount') or existing.get('initial_capital') or 1000
+            )
+            tc['initial_capital'] = initial_capital
+            tc['investment_amount'] = initial_capital
         with get_db_connection() as db:
             cur = db.cursor()
-            if user_id is not None:
+            if amount_changed and user_id is not None:
+                cur.execute(
+                    """
+                    UPDATE qd_strategies_trading
+                    SET initial_capital = ?, trading_config = ?, updated_at = NOW()
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (initial_capital, self._dump_json_or_encrypt(tc, encrypt=False), strategy_id, user_id),
+                )
+            elif amount_changed:
+                cur.execute(
+                    """
+                    UPDATE qd_strategies_trading
+                    SET initial_capital = ?, trading_config = ?, updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (initial_capital, self._dump_json_or_encrypt(tc, encrypt=False), strategy_id),
+                )
+            elif user_id is not None:
                 cur.execute(
                     """
                     UPDATE qd_strategies_trading
@@ -1533,12 +1394,13 @@ class StrategyService:
         trading_config = self._sanitize_grid_trading_config(trading_config)
 
         # When credential_id is present, strip raw API keys to avoid
-        # storing secrets in the strategy record — they live in qd_exchange_credentials.
+        # storing secrets in the strategy record. They live in qd_exchange_credentials.
         if isinstance(exchange_config, dict) and exchange_config.get('credential_id'):
             for _secret_key in ('api_key', 'secret_key', 'passphrase', 'apiKey', 'secret', 'password'):
                 exchange_config.pop(_secret_key, None)
 
         # Handle cross-sectional strategy config updates
+        symbol = (trading_config or {}).get('symbol')
         _upd_cs = payload.get('cs_strategy_type')
         if _upd_cs is None:
             _upd_cs = trading_config.get('cs_strategy_type')
@@ -1602,7 +1464,7 @@ class StrategyService:
                 "Live order placement on MOEX is not implemented."
             )
 
-        symbol = (trading_config or {}).get('symbol')
+        symbol = (trading_config or {}).get('symbol') or symbol
         # Same canonicalisation as create_strategy: keep the persisted shape
         # consistent regardless of whether the row was written by create or
         # update. The runtime executor reads symbol from trading_config, so
@@ -1612,7 +1474,11 @@ class StrategyService:
             if isinstance(trading_config, dict):
                 trading_config['symbol'] = symbol
         timeframe = (trading_config or {}).get('timeframe')
-        initial_capital = (trading_config or {}).get('initial_capital') or existing.get('initial_capital') or 1000
+        initial_capital = validate_strategy_investment_amount(
+            (trading_config or {}).get('initial_capital') or existing.get('initial_capital') or 1000
+        )
+        trading_config['initial_capital'] = initial_capital
+        trading_config['investment_amount'] = initial_capital
         leverage = (trading_config or {}).get('leverage') or existing.get('leverage') or 1
         market_type = (trading_config or {}).get('market_type') or existing.get('market_type') or 'swap'
 
@@ -1668,7 +1534,7 @@ class StrategyService:
                     self._dump_json_or_encrypt(notification_config, encrypt=False),
                     symbol,
                     timeframe,
-                    float(initial_capital or 1000),
+                    initial_capital,
                     int(leverage or 1),
                     market_type,
                     self._dump_json_or_encrypt(exchange_config, encrypt=False) if exchange_config else '',

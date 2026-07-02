@@ -67,10 +67,92 @@ class ScriptSourceService:
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_script_sources_marketplace ON qd_script_sources(source_marketplace_indicator_id)"
                 )
+                self._ensure_version_schema(cur)
                 db.commit()
                 cur.close()
         except Exception as exc:
             logger.warning("script source schema ensure failed: %s", exc)
+
+    def _ensure_version_schema(self, cur) -> None:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qd_script_source_versions (
+                id SERIAL PRIMARY KEY,
+                source_id INTEGER NOT NULL REFERENCES qd_script_sources(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+                version_no INTEGER NOT NULL,
+                name VARCHAR(255) NOT NULL DEFAULT '',
+                description TEXT DEFAULT '',
+                code TEXT NOT NULL DEFAULT '',
+                template_key VARCHAR(80) DEFAULT '',
+                param_schema JSONB DEFAULT '{}'::jsonb,
+                metadata JSONB DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_script_source_versions_source
+            ON qd_script_source_versions (source_id, version_no DESC)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_script_source_versions_user
+            ON qd_script_source_versions (user_id)
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_script_source_versions_no
+            ON qd_script_source_versions (source_id, version_no)
+            """
+        )
+
+    def _insert_version(
+        self,
+        cur,
+        source_id: int,
+        user_id: int,
+        name: str,
+        description: str,
+        code: str,
+        template_key: str,
+        param_schema: Any,
+        metadata: Any,
+    ) -> int:
+        self._ensure_version_schema(cur)
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(version_no), 0) + 1 AS next_version
+            FROM qd_script_source_versions
+            WHERE source_id = ? AND user_id = ?
+            """,
+            (int(source_id), int(user_id)),
+        )
+        row = cur.fetchone() or {}
+        version_no = int(row.get("next_version") or 1)
+        cur.execute(
+            """
+            INSERT INTO qd_script_source_versions
+              (source_id, user_id, version_no, name, description, code,
+               template_key, param_schema, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, NOW())
+            """,
+            (
+                int(source_id),
+                int(user_id),
+                version_no,
+                name or "",
+                description or "",
+                code or "",
+                template_key or "",
+                _json_dump(param_schema),
+                _json_dump(metadata),
+            ),
+        )
+        return version_no
 
     def _row(self, row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not row:
@@ -78,6 +160,16 @@ class ScriptSourceService:
         item = dict(row)
         item["param_schema"] = _json_dict(item.get("param_schema"))
         item["metadata"] = _json_dict(item.get("metadata"))
+        return item
+
+    def _version_row(self, row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not row:
+            return None
+        item = dict(row)
+        if "param_schema" in item:
+            item["param_schema"] = _json_dict(item.get("param_schema"))
+        if "metadata" in item:
+            item["metadata"] = _json_dict(item.get("metadata"))
         return item
 
     def list_sources(self, user_id: int) -> List[Dict[str, Any]]:
@@ -166,6 +258,17 @@ class ScriptSourceService:
                 ),
             )
             new_id = int(cur.lastrowid or 0)
+            self._insert_version(
+                cur,
+                new_id,
+                user_id,
+                name,
+                description,
+                code,
+                template_key,
+                param_schema,
+                metadata,
+            )
             db.commit()
             cur.close()
         return new_id
@@ -203,9 +306,130 @@ class ScriptSourceService:
                 ),
             )
             ok = cur.rowcount > 0
+            if ok:
+                self._insert_version(
+                    cur,
+                    source_id,
+                    user_id,
+                    name,
+                    description,
+                    code,
+                    template_key,
+                    param_schema,
+                    metadata,
+                )
             db.commit()
             cur.close()
         return ok
+
+    def list_versions(self, source_id: int, user_id: int) -> tuple[bool, List[Dict[str, Any]]]:
+        self.ensure_schema()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            self._ensure_version_schema(cur)
+            cur.execute("SELECT id FROM qd_script_sources WHERE id = ? AND user_id = ?", (int(source_id), int(user_id)))
+            if not cur.fetchone():
+                cur.close()
+                return False, []
+            cur.execute(
+                """
+                SELECT id, source_id, user_id, version_no, name, description, template_key, created_at
+                FROM qd_script_source_versions
+                WHERE source_id = ? AND user_id = ?
+                ORDER BY version_no DESC
+                LIMIT 100
+                """,
+                (int(source_id), int(user_id)),
+            )
+            rows = cur.fetchall() or []
+            db.commit()
+            cur.close()
+        return True, [self._version_row(row) for row in rows if row]
+
+    def get_version(self, version_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        self.ensure_schema()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            self._ensure_version_schema(cur)
+            cur.execute(
+                """
+                SELECT id, source_id, user_id, version_no, name, description, code,
+                       template_key, param_schema, metadata, created_at
+                FROM qd_script_source_versions
+                WHERE id = ? AND user_id = ?
+                """,
+                (int(version_id), int(user_id)),
+            )
+            row = cur.fetchone()
+            db.commit()
+            cur.close()
+        return self._version_row(row)
+
+    def restore_version(self, version_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        self.ensure_schema()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            self._ensure_version_schema(cur)
+            cur.execute(
+                """
+                SELECT v.source_id, v.name, v.description, v.code, v.template_key,
+                       v.param_schema, v.metadata
+                FROM qd_script_source_versions v
+                JOIN qd_script_sources s ON s.id = v.source_id
+                WHERE v.id = ? AND v.user_id = ? AND s.user_id = ?
+                """,
+                (int(version_id), int(user_id), int(user_id)),
+            )
+            row = self._version_row(cur.fetchone())
+            if not row:
+                cur.close()
+                return None
+
+            source_id = int(row.get("source_id") or 0)
+            name = row.get("name") or "Untitled Script"
+            description = row.get("description") or ""
+            code = row.get("code") or ""
+            template_key = row.get("template_key") or ""
+            param_schema = row.get("param_schema") or {}
+            metadata = row.get("metadata") or {}
+            cur.execute(
+                """
+                UPDATE qd_script_sources
+                SET name = ?, description = ?, code = ?, template_key = ?,
+                    param_schema = ?::jsonb, metadata = ?::jsonb, updated_at = NOW()
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    name,
+                    description,
+                    code,
+                    template_key,
+                    _json_dump(param_schema),
+                    _json_dump(metadata),
+                    source_id,
+                    int(user_id),
+                ),
+            )
+            if cur.rowcount <= 0:
+                cur.close()
+                return None
+            version_no = self._insert_version(
+                cur,
+                source_id,
+                user_id,
+                name,
+                description,
+                code,
+                template_key,
+                param_schema,
+                metadata,
+            )
+            db.commit()
+            cur.close()
+
+        restored = self.get_source(source_id, user_id=user_id) or {}
+        restored["version_no"] = version_no
+        return restored
 
     def delete_source(self, source_id: int, user_id: int) -> bool:
         self.ensure_schema()

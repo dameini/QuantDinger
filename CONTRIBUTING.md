@@ -121,6 +121,19 @@ For local iteration without publishing, clone the Vue repo into `./QuantDinger-V
 
 ---
 
+## Code Organization
+
+Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/EXTENSION_GUIDE.md`](docs/EXTENSION_GUIDE.md), and [`docs/MODULE_BOUNDARIES.md`](docs/MODULE_BOUNDARIES.md) before larger backend changes.
+
+- Keep routes thin: validate input, call a service, return JSON.
+- Put exchange, broker, market data, and strategy behavior behind small services or adapters.
+- Avoid growing legacy hotspot files when a focused sibling module can hold new behavior.
+- Keep code comments, docstrings, and log messages in English unless a user-facing translation or external provider field requires another language.
+- Prefer simple, readable code over clever abstractions.
+- Ask for clarification before changing unclear product behavior.
+
+---
+
 ## 🌿 Branching & Pull Requests
 
 ### Branch naming

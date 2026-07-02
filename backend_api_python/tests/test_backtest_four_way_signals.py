@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from app.services.backtest import BacktestService
 from app.services.builtin_indicators import _builtin_specs
@@ -65,3 +66,14 @@ def test_builtin_indicator_sample_executes_with_four_way_contract():
     for col in ("open_long", "close_long", "open_short", "close_short"):
         assert col in out
         assert len(out[col]) == len(df)
+
+
+def test_execute_indicator_missing_signal_columns_raises_clear_error():
+    svc = BacktestService()
+    df = _sample_df()
+    code = """
+df = df.copy()
+df['some_plot_only_value'] = close.rolling(3).mean()
+"""
+    with pytest.raises(ValueError, match="Indicator must define either 4-way columns"):
+        svc._execute_indicator(code, df, backtest_params={})

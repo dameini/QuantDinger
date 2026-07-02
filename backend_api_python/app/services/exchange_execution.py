@@ -38,7 +38,7 @@ def _safe_json_loads(value: Any, default: Any) -> Any:
 
 
 # Map exchange_id -> implied market_category, used as a safety net so we never
-# silently route stock/forex strategies through the crypto data source just
+# silently route stock strategies through the crypto data source just
 # because `market_category` was missing from the row.
 #
 # Keep this list in sync with:
@@ -48,7 +48,6 @@ def _safe_json_loads(value: Any, default: Any) -> Any:
 _EXCHANGE_TO_MARKET: Dict[str, str] = {
     "ibkr": "USStock",
     "alpaca": "USStock",  # Alpaca primarily for US stocks; crypto is opt-in via market_category override
-    "mt5": "Forex",
 }
 _CRYPTO_EXCHANGES = supported_crypto_exchange_ids()
 

@@ -5,199 +5,21 @@ Community Service - 指标社区服务
 """
 import json
 import time
-import statistics
+from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any, List, Optional, Tuple
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.services.billing_service import get_billing_service
-from app.services.experiment.scoring import StrategyScoringService
+from app.services.community_kpis import (
+    fetch_market_asset_kpis,
+    parse_backtest_result,
+    summarise_indicator_runs,
+)
 from app.services.indicator_translator import pick_localized
 
 logger = get_logger(__name__)
-
-
-# Field set we pull out of qd_backtest_runs.result_json. Centralised so
-# get_market_indicators (list, N indicators) and get_indicator_performance
-# (single indicator, deeper detail) agree on parsing & units.
-#
-# Units (matching what services/backtest.py:_run() writes):
-#   totalReturn / annualReturn  – percent, e.g. 12.5 means +12.5%
-#   maxDrawdown                 – percent, NEGATIVE, e.g. -8.3 means -8.3%
-#   sharpeRatio                 – plain number
-#   winRate                     – percent 0..100
-#   profitFactor                – ratio, >1 means net winner
-#   totalTrades                 – integer count of closing trades
-def _parse_backtest_result(raw: str) -> Optional[Dict[str, Any]]:
-    """Decode result_json string -> dict, returning None on any parse error.
-
-    Returns the full result dict (not just KPI fields) because downstream
-    callers may need ``equityCurve``, ``startDate``, etc.
-    """
-    if not raw or not isinstance(raw, str):
-        return None
-    try:
-        rj = json.loads(raw)
-        return rj if isinstance(rj, dict) else None
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-
-
-def _summarise_indicator_runs(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate one indicator's successful backtest runs into a single
-    representative KPI block + a composite ``score``.
-
-    Args:
-        runs: list of qd_backtest_runs rows. Each row is expected to expose
-            at least ``id``, ``symbol``, ``timeframe`` and ``result_json``.
-
-    Strategy / why this is shaped like this:
-      * We *score every run individually* through ``StrategyScoringService``
-        (the same engine the parameter-optimisation page uses) and then
-        take the **median** of those scores as the indicator's headline.
-        Median, not mean, because one freak run on the most generous
-        symbol shouldn't single-handedly drag a mediocre indicator into
-        the top of the leaderboard.
-      * For the KPI numbers shown on the card (return / sharpe / drawdown
-        / win-rate) we also use the **median** across runs. Same reason.
-      * ``best_run_id`` is the run with the highest *individual* score —
-        that's the one whose equity curve we'll draw on the detail page,
-        because picking by raw return is gameable (one lucky backtest
-        with crazy DD wins it).
-      * ``applicable_symbols`` / ``applicable_timeframes`` are the union
-        of everywhere the author successfully ran a backtest. This is the
-        "automatic inference" path the user explicitly chose over having
-        authors hand-tag the publish form.
-    """
-    empty = {
-        'score': 0.0,
-        'total_return': 0.0,
-        'annual_return': 0.0,
-        'sharpe': 0.0,
-        'max_drawdown': 0.0,
-        'win_rate': 0.0,
-        'profit_factor': 0.0,
-        'sample_size': 0,
-        'best_run_id': None,
-        'symbols': [],
-        'timeframes': [],
-    }
-    if not runs:
-        return empty
-
-    scorer = StrategyScoringService()
-    scored: List[Tuple[float, int, Dict[str, Any]]] = []
-    returns: List[float] = []
-    annual_returns: List[float] = []
-    sharpes: List[float] = []
-    drawdowns: List[float] = []
-    win_rates: List[float] = []
-    profit_factors: List[float] = []
-    symbols: List[str] = []
-    timeframes: List[str] = []
-
-    for run in runs:
-        rj = _parse_backtest_result(run.get('result_json'))
-        if not rj:
-            continue
-        try:
-            score_info = scorer.score_result(rj)
-            # StrategyScoringService returns 'overallScore' (not 'overall').
-            # Reading the wrong key here previously made every indicator's
-            # market-page composite score read 0, regardless of backtest quality.
-            score_val = float(score_info.get('overallScore') or 0)
-        except Exception:
-            logger.debug("score_result failed for run %s", run.get('id'), exc_info=True)
-            score_val = 0.0
-
-        scored.append((score_val, int(run.get('id') or 0), rj))
-        returns.append(float(rj.get('totalReturn') or 0))
-        annual_returns.append(float(rj.get('annualReturn') or 0))
-        sharpes.append(float(rj.get('sharpeRatio') or 0))
-        drawdowns.append(float(rj.get('maxDrawdown') or 0))
-        win_rates.append(float(rj.get('winRate') or 0))
-        profit_factors.append(float(rj.get('profitFactor') or 0))
-
-        sym = (run.get('symbol') or '').strip()
-        tf = (run.get('timeframe') or '').strip()
-        if sym:
-            symbols.append(sym)
-        if tf:
-            timeframes.append(tf)
-
-    if not scored:
-        return empty
-
-    score_values = [s for s, _, _ in scored]
-    headline_score = round(statistics.median(score_values), 2)
-    best = max(scored, key=lambda x: x[0])
-    best_run_id = best[1] or None
-
-    def _median(xs: List[float]) -> float:
-        return round(statistics.median(xs), 2) if xs else 0.0
-
-    # Dedupe preserving first-seen order so the UI shows the most-used
-    # symbol first when truncating to "BTC/USDT +2 more".
-    def _dedup(xs: List[str]) -> List[str]:
-        seen = set()
-        out = []
-        for x in xs:
-            if x and x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
-
-    return {
-        'score': headline_score,
-        'total_return': _median(returns),
-        'annual_return': _median(annual_returns),
-        'sharpe': _median(sharpes),
-        'max_drawdown': _median(drawdowns),  # already negative %, keep sign
-        'win_rate': _median(win_rates),
-        'profit_factor': _median(profit_factors),
-        'sample_size': len(scored),
-        'best_run_id': best_run_id,
-        'symbols': _dedup(symbols),
-        'timeframes': _dedup(timeframes),
-    }
-
-
-def _fetch_indicator_kpis(cur, indicator_ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    """Batch-load KPI summary for several indicator ids in one round-trip.
-
-    Returns ``{indicator_id: kpi_dict}``. Indicators with zero successful
-    backtests get an empty kpi dict (score=0, symbols=[], etc.) — they
-    still appear in the dict so callers don't have to do KeyError dances.
-
-    Why batching: ``get_market_indicators`` returns up to ``page_size``
-    indicators per request. Running one ``SELECT … FROM qd_backtest_runs``
-    per indicator would scale linearly with page size and dominate the
-    request budget; a single ``IN (…)`` query plus an in-Python group-by
-    is O(N + M) where M is total runs across the page.
-    """
-    if not indicator_ids:
-        return {}
-    # Bucket runs by indicator_id first, then summarise each bucket.
-    buckets: Dict[int, List[Dict[str, Any]]] = {iid: [] for iid in indicator_ids}
-    placeholders = ','.join(['%s'] * len(indicator_ids))
-    try:
-        cur.execute(f"""
-            SELECT id, indicator_id, symbol, timeframe, result_json
-            FROM qd_backtest_runs
-            WHERE indicator_id IN ({placeholders})
-              AND status = 'success'
-              AND result_json IS NOT NULL AND result_json != ''
-        """, tuple(indicator_ids))
-        for row in cur.fetchall() or []:
-            iid = int(row.get('indicator_id') or 0)
-            if iid in buckets:
-                buckets[iid].append(dict(row))
-    except Exception:
-        logger.debug("Batch KPI query failed; returning empty KPIs", exc_info=True)
-        return {iid: _summarise_indicator_runs([]) for iid in indicator_ids}
-
-    return {iid: _summarise_indicator_runs(rows) for iid, rows in buckets.items()}
 
 
 class CommunityService:
@@ -229,6 +51,16 @@ class CommunityService:
                 cur.execute(
                     "ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS asset_type VARCHAR(32) DEFAULT 'indicator'"
                 )
+                cur.execute("ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_script_source_id INTEGER")
+                cur.execute("ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_strategy_id INTEGER")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_indicator_codes_source_script "
+                    "ON qd_indicator_codes USING btree (source_script_source_id)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_indicator_codes_source_strategy "
+                    "ON qd_indicator_codes USING btree (source_strategy_id)"
+                )
                 db.commit()
                 cur.close()
         except Exception:
@@ -256,7 +88,7 @@ class CommunityService:
             the caller asks for score-sorted results, we:
               1. Pull the *full set* of approved + published indicators
                  (id-only, very cheap row).
-              2. Batch-compute their scores via _fetch_indicator_kpis.
+              2. Batch-compute their scores via fetch_market_asset_kpis.
               3. Sort by score in Python.
               4. Slice [offset:offset+page_size] and re-query the full row
                  for just that slice.
@@ -315,11 +147,20 @@ class CommunityService:
                     # Score sort path: fetch ALL matching ids, score them,
                     # sort in Python, then refetch full rows for the page.
                     cur.execute(
-                        f"SELECT i.id FROM qd_indicator_codes i WHERE {where_sql}",
+                        f"""
+                        SELECT
+                            i.id,
+                            COALESCE(i.asset_type, 'indicator') as asset_type,
+                            i.source_script_source_id,
+                            i.source_strategy_id
+                        FROM qd_indicator_codes i
+                        WHERE {where_sql}
+                        """,
                         tuple(params)
                     )
-                    all_ids = [int(r['id']) for r in (cur.fetchall() or [])]
-                    kpi_by_id = _fetch_indicator_kpis(cur, all_ids)
+                    all_assets = [dict(r) for r in (cur.fetchall() or [])]
+                    all_ids = [int(r['id']) for r in all_assets]
+                    kpi_by_id = fetch_market_asset_kpis(cur, all_assets)
                     # Tie-break with created_at via id (newer id ≈ newer row)
                     # so deterministic ordering when many indicators score 0.
                     all_ids.sort(
@@ -340,6 +181,7 @@ class CommunityService:
                         SELECT
                             i.id, i.name, i.description, i.pricing_type, i.price, COALESCE(i.vip_free, FALSE) as vip_free,
                             COALESCE(i.asset_type, 'indicator') as asset_type,
+                            i.source_script_source_id, i.source_strategy_id,
                             i.preview_image, i.purchase_count, i.avg_rating, i.rating_count,
                             i.view_count, i.created_at, i.updated_at,
                             i.source_language, i.name_i18n, i.description_i18n,
@@ -353,13 +195,14 @@ class CommunityService:
                     # Preserve our score-sorted order even though SQL won't
                     by_id = {r['id']: r for r in rows_unordered}
                     rows = [by_id[iid] for iid in page_ids if iid in by_id]
-                    page_kpis = {iid: kpi_by_id.get(iid, _summarise_indicator_runs([])) for iid in page_ids}
+                    page_kpis = {iid: kpi_by_id.get(iid, summarise_indicator_runs([])) for iid in page_ids}
                 else:
                     order_sql = order_map.get(sort_by, 'i.created_at DESC')
                     query_sql = f"""
                         SELECT
                             i.id, i.name, i.description, i.pricing_type, i.price, COALESCE(i.vip_free, FALSE) as vip_free,
                             COALESCE(i.asset_type, 'indicator') as asset_type,
+                            i.source_script_source_id, i.source_strategy_id,
                             i.preview_image, i.purchase_count, i.avg_rating, i.rating_count,
                             i.view_count, i.created_at, i.updated_at,
                             i.source_language, i.name_i18n, i.description_i18n,
@@ -373,7 +216,7 @@ class CommunityService:
                     """
                     cur.execute(query_sql, tuple(params + [page_size, offset]))
                     rows = cur.fetchall() or []
-                    page_kpis = _fetch_indicator_kpis(cur, [r['id'] for r in rows])
+                    page_kpis = fetch_market_asset_kpis(cur, [dict(r) for r in rows])
 
                 purchased_ids = set()
                 if user_id:
@@ -390,7 +233,7 @@ class CommunityService:
 
                 items = []
                 for row in rows:
-                    kpi = page_kpis.get(row['id'], _summarise_indicator_runs([]))
+                    kpi = page_kpis.get(row['id'], summarise_indicator_runs([]))
                     _src_lang = row.get('source_language') if isinstance(row, dict) else None
                     localized_name = pick_localized(
                         row['name'],
@@ -466,6 +309,7 @@ class CommunityService:
         price: float = 0.0,
         is_admin: bool = False,
         existing_indicator_id: int = 0,
+        source_id: int = 0,
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """Publish a script strategy's code to the marketplace as script_template."""
         code = (code or '').strip()
@@ -491,6 +335,8 @@ class CommunityService:
                     cur.execute(
                         "ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS asset_type VARCHAR(32) DEFAULT 'indicator'"
                     )
+                    cur.execute("ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_script_source_id INTEGER")
+                    cur.execute("ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_strategy_id INTEGER")
                 except Exception:
                     pass
 
@@ -511,12 +357,14 @@ class CommunityService:
                         SET name = ?, code = ?, description = ?,
                             publish_to_community = 1, pricing_type = ?, price = ?,
                             asset_type = 'script_template',
+                            source_script_source_id = ?, source_strategy_id = ?,
                             review_status = ?, review_note = '', reviewed_at = NOW(), reviewed_by = ?,
                             updatetime = ?, updated_at = NOW()
                         WHERE id = ? AND user_id = ?
                         """,
                         (
                             name, code, description, pricing_type, price,
+                            int(source_id or 0) or None, int(strategy_id or 0) or None,
                             review_status, user_id if is_admin else None,
                             now_ts, existing_indicator_id, user_id,
                         ),
@@ -527,12 +375,14 @@ class CommunityService:
                         """
                         INSERT INTO qd_indicator_codes
                           (user_id, is_buy, end_time, name, code, description,
-                           publish_to_community, pricing_type, price, asset_type, review_status,
+                           publish_to_community, pricing_type, price, asset_type,
+                           source_script_source_id, source_strategy_id, review_status,
                            createtime, updatetime, created_at, updated_at)
-                        VALUES (?, 0, 1, ?, ?, ?, 1, ?, ?, 'script_template', ?, ?, ?, NOW(), NOW())
+                        VALUES (?, 0, 1, ?, ?, ?, 1, ?, ?, 'script_template', ?, ?, ?, ?, ?, NOW(), NOW())
                         """,
                         (
                             user_id, name, code, description, pricing_type, price,
+                            int(source_id or 0) or None, int(strategy_id or 0) or None,
                             review_status, now_ts, now_ts,
                         ),
                     )
@@ -546,6 +396,7 @@ class CommunityService:
                 'review_status': review_status,
                 'asset_type': 'script_template',
                 'strategy_id': strategy_id,
+                'source_id': int(source_id or 0),
             }
         except Exception as e:
             logger.error(f"publish_script_template_from_strategy failed: {e}")
@@ -674,6 +525,8 @@ class CommunityService:
                     cur.execute(
                         "ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS asset_type VARCHAR(32) DEFAULT 'indicator'"
                     )
+                    cur.execute("ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_script_source_id INTEGER")
+                    cur.execute("ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS source_strategy_id INTEGER")
                 except Exception:
                     pass
 
@@ -694,12 +547,14 @@ class CommunityService:
                         SET name = ?, code = ?, description = ?,
                             publish_to_community = 1, pricing_type = ?, price = ?,
                             asset_type = 'bot_preset',
+                            source_script_source_id = NULL, source_strategy_id = ?,
                             review_status = ?, review_note = '', reviewed_at = NOW(), reviewed_by = ?,
                             updatetime = ?, updated_at = NOW()
                         WHERE id = ? AND user_id = ?
                         """,
                         (
                             name, preset_code, description, pricing_type, price,
+                            int(strategy_id or 0) or None,
                             review_status, user_id if is_admin else None,
                             now_ts, existing_indicator_id, user_id,
                         ),
@@ -710,12 +565,14 @@ class CommunityService:
                         """
                         INSERT INTO qd_indicator_codes
                           (user_id, is_buy, end_time, name, code, description,
-                           publish_to_community, pricing_type, price, asset_type, review_status,
+                           publish_to_community, pricing_type, price, asset_type,
+                           source_script_source_id, source_strategy_id, review_status,
                            createtime, updatetime, created_at, updated_at)
-                        VALUES (?, 0, 1, ?, ?, ?, 1, ?, ?, 'bot_preset', ?, ?, ?, NOW(), NOW())
+                        VALUES (?, 0, 1, ?, ?, ?, 1, ?, ?, 'bot_preset', NULL, ?, ?, ?, ?, NOW(), NOW())
                         """,
                         (
                             user_id, name, preset_code, description, pricing_type, price,
+                            int(strategy_id or 0) or None,
                             review_status, now_ts, now_ts,
                         ),
                     )
@@ -729,6 +586,7 @@ class CommunityService:
                 'review_status': review_status,
                 'asset_type': 'bot_preset',
                 'strategy_id': strategy_id,
+                'source_strategy_id': int(strategy_id or 0),
             }
         except Exception as e:
             logger.error(f"publish_bot_preset_from_strategy failed: {e}")
@@ -785,6 +643,7 @@ class CommunityService:
                 local_copy_id = None
                 purchased_strategy_id = None
                 purchased_script_source_id = None
+                local_copy_missing = False
                 if user_id:
                     cur.execute(
                         "SELECT id, price, created_at FROM qd_indicator_purchases "
@@ -821,6 +680,8 @@ class CommunityService:
                                 original_code = original_row['code'] if original_row else None
                                 local_code = source.get('code')
                                 has_update = (original_code or '') != (local_code or '')
+                            else:
+                                local_copy_missing = True
                         elif asset_type == 'bot_preset':
                             strat = self._find_buyer_strategy_from_preset(
                                 cur, buyer_id=user_id, preset_id=indicator_id
@@ -839,6 +700,8 @@ class CommunityService:
                                     )
                                 except Exception:
                                     has_update = False
+                            else:
+                                local_copy_missing = True
                         else:
                             local_copy = self._find_buyer_local_copy(
                                 cur, buyer_id=user_id, indicator_id=indicator_id,
@@ -854,6 +717,8 @@ class CommunityService:
                                 original_code = original_row['code'] if original_row else None
                                 local_code = local_copy.get('code')
                                 has_update = (original_code or '') != (local_code or '')
+                            else:
+                                local_copy_missing = True
 
                 cur.execute(
                     "UPDATE qd_indicator_codes SET view_count = COALESCE(view_count, 0) + 1 WHERE id = ?",
@@ -895,6 +760,7 @@ class CommunityService:
                     'your_purchase_time': your_purchase_time,
                     'is_own': row['user_id'] == user_id,
                     'has_update': has_update,
+                    'local_copy_missing': bool(local_copy_missing),
                     'local_copy_id': local_copy_id,
                     'asset_type': str(row.get('asset_type') or 'indicator'),
                     'purchased_strategy_id': purchased_strategy_id,
@@ -1158,6 +1024,82 @@ class CommunityService:
                 pass
         return {}
 
+    def _restore_script_template_copy(self, buyer_id: int, original: Dict[str, Any]) -> Dict[str, Any]:
+        from app.services.script_source import get_script_source_service
+        source_id = get_script_source_service().create_from_marketplace_asset(
+            buyer_id,
+            {
+                'id': original['id'],
+                'name': original['name'],
+                'description': original.get('description') or '',
+                'code': original.get('code') or '',
+            },
+        )
+        return {
+            'script_source_id': source_id,
+            'updated': True,
+            'restored': True,
+            'indicator_name': original['name'],
+        }
+
+    def _restore_bot_preset_copy(self, buyer_id: int, original: Dict[str, Any]) -> Dict[str, Any]:
+        from app.services.strategy import get_strategy_service
+        preset = self._parse_bot_preset_json(original.get('code'))
+        tc = dict(preset.get('trading_config') or {})
+        bot_type = preset.get('bot_type') or tc.get('bot_type')
+        if bot_type and not tc.get('bot_type'):
+            tc['bot_type'] = bot_type
+        tc['source_preset_id'] = int(original['id'])
+        tc['from_marketplace'] = True
+        strategy_id = get_strategy_service().create_strategy({
+            'user_id': buyer_id,
+            'strategy_name': original['name'],
+            'strategy_type': preset.get('strategy_type') or 'ScriptStrategy',
+            'strategy_mode': 'bot',
+            'strategy_code': preset.get('strategy_code') or '',
+            'market_category': preset.get('market_category') or 'Crypto',
+            'execution_mode': preset.get('execution_mode') or 'live',
+            'exchange_config': {},
+            'notification_config': {'channels': ['browser'], 'targets': {}},
+            'marketplace_delivery': True,
+            'trading_config': tc,
+        })
+        return {
+            'strategy_id': strategy_id,
+            'updated': True,
+            'restored': True,
+            'indicator_name': original['name'],
+        }
+
+    def _restore_indicator_copy(self, cur, buyer_id: int, original: Dict[str, Any]) -> Dict[str, Any]:
+        now_ts = int(time.time())
+        cur.execute("""
+            INSERT INTO qd_indicator_codes
+            (user_id, is_buy, end_time, name, code, description,
+             publish_to_community, pricing_type, price, is_encrypted, preview_image, vip_free,
+            source_indicator_id,
+             createtime, updatetime, created_at, updated_at)
+            VALUES (?, 1, 0, ?, ?, ?, 0, 'free', 0, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+            RETURNING id
+        """, (
+            buyer_id,
+            original['name'],
+            original.get('code') or '',
+            original.get('description') or '',
+            original.get('is_encrypted') or 0,
+            original.get('preview_image') or '',
+            bool(original.get('vip_free') or False),
+            original['id'],
+            now_ts, now_ts,
+        ))
+        row = cur.fetchone()
+        return {
+            'local_copy_id': row['id'] if row else cur.lastrowid,
+            'updated': True,
+            'restored': True,
+            'indicator_name': original['name'],
+        }
+
     def _find_buyer_strategy_from_template(
         self, cur, buyer_id: int, template_id: int
     ) -> Optional[Dict[str, Any]]:
@@ -1250,6 +1192,7 @@ class CommunityService:
                 cur.execute(
                     """
                     SELECT id, user_id, name, code, description, preview_image, is_encrypted,
+                           COALESCE(vip_free, FALSE) as vip_free,
                            publish_to_community, review_status, updated_at,
                            COALESCE(asset_type, 'indicator') as asset_type
                     FROM qd_indicator_codes
@@ -1281,8 +1224,9 @@ class CommunityService:
                     )
                     local_source = cur.fetchone()
                     if not local_source:
+                        data = self._restore_script_template_copy(buyer_id, original)
                         cur.close()
-                        return False, 'local_copy_not_found', {}
+                        return True, 'restored', data
                     if (local_source.get('code') or '') == (original.get('code') or ''):
                         cur.close()
                         return True, 'already_latest', {
@@ -1316,8 +1260,9 @@ class CommunityService:
                         cur, buyer_id=buyer_id, preset_id=indicator_id
                     )
                     if not local_strategy:
+                        data = self._restore_bot_preset_copy(buyer_id, original)
                         cur.close()
-                        return False, 'local_copy_not_found', {}
+                        return True, 'restored', data
                     try:
                         preset = self._parse_bot_preset_json(original.get('code'))
                     except Exception:
@@ -1368,8 +1313,10 @@ class CommunityService:
                     original_name=original['name']
                 )
                 if not local:
+                    data = self._restore_indicator_copy(cur, buyer_id, original)
+                    db.commit()
                     cur.close()
-                    return False, 'local_copy_not_found', {}
+                    return True, 'restored', data
 
                 # 4. Short-circuit when already identical
                 if (local.get('code') or '') == (original.get('code') or ''):
@@ -1461,8 +1408,10 @@ class CommunityService:
                 items = []
                 for row in rows:
                     asset_type = str(row.get('asset_type') or 'indicator').strip().lower()
+                    local_copy_id = None
                     purchased_strategy_id = None
                     purchased_script_source_id = None
+                    local_copy_exists = False
                     if asset_type == 'script_template' and row.get('id'):
                         cur.execute(
                             """
@@ -1476,19 +1425,33 @@ class CommunityService:
                         source = cur.fetchone()
                         if source:
                             purchased_script_source_id = source['id']
+                            local_copy_exists = True
                     elif asset_type == 'bot_preset' and row.get('id'):
                         strat = self._find_buyer_strategy_from_preset(
                             cur, buyer_id=user_id, preset_id=int(row['id'])
                         )
                         if strat:
                             purchased_strategy_id = strat['id']
+                            local_copy_exists = True
+                    elif row.get('id'):
+                        local = self._find_buyer_local_copy(
+                            cur, buyer_id=user_id, indicator_id=int(row['id']),
+                            original_name=row.get('name') or ''
+                        )
+                        if local:
+                            local_copy_id = local['id']
+                            local_copy_exists = True
                     items.append({
                         'purchase_id': row['purchase_id'],
                         'purchase_price': float(row['purchase_price'] or 0),
                         'purchase_time': row['purchase_time'].isoformat() if row['purchase_time'] else None,
                         'purchased_strategy_id': purchased_strategy_id,
+                        'local_copy_id': local_copy_id,
                         'script_source_id': purchased_script_source_id,
                         'purchased_script_source_id': purchased_script_source_id,
+                        'local_copy_exists': local_copy_exists,
+                        'local_copy_missing': bool(row.get('id')) and not local_copy_exists,
+                        'restore_available': bool(row.get('id')) and not local_copy_exists,
                         'indicator': {
                             'id': row['id'],
                             'name': row['name'],
@@ -2258,16 +2221,45 @@ class CommunityService:
             with get_db_connection() as db:
                 cur = db.cursor()
 
-                # We re-use the same code path the list endpoint uses so
-                # detail and list pages never disagree on score / KPI.
-                cur.execute("""
-                    SELECT id, indicator_id, symbol, timeframe, start_date, end_date, result_json
-                    FROM qd_backtest_runs
-                    WHERE indicator_id = %s AND status = 'success'
-                          AND result_json IS NOT NULL AND result_json != ''
-                """, (indicator_id,))
-                bt_rows = [dict(r) for r in (cur.fetchall() or [])]
-                kpi = _summarise_indicator_runs(bt_rows)
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        COALESCE(asset_type, 'indicator') as asset_type,
+                        source_script_source_id,
+                        source_strategy_id
+                    FROM qd_indicator_codes
+                    WHERE id = %s
+                    """,
+                    (indicator_id,),
+                )
+                asset_row = dict(cur.fetchone() or {})
+                if not asset_row:
+                    cur.close()
+                    return default_result
+
+                # Re-use the list endpoint KPI path so cards and details
+                # use the same representative backtest and never disagree.
+                kpi = fetch_market_asset_kpis(cur, [asset_row]).get(indicator_id, summarise_indicator_runs([]))
+                bt_rows: List[Dict[str, Any]] = []
+                if asset_row.get('asset_type') == 'indicator':
+                    cur.execute("""
+                        SELECT id, indicator_id, symbol, timeframe, start_date, end_date,
+                               leverage, config_snapshot, result_json
+                        FROM qd_backtest_runs
+                        WHERE indicator_id = %s AND status = 'success'
+                              AND result_json IS NOT NULL AND result_json != ''
+                    """, (indicator_id,))
+                    bt_rows = [dict(r) for r in (cur.fetchall() or [])]
+                elif kpi['best_run_id']:
+                    cur.execute("""
+                        SELECT id, indicator_id, symbol, timeframe, start_date, end_date,
+                               leverage, config_snapshot, result_json
+                        FROM qd_backtest_runs
+                        WHERE id = %s
+                    """, (kpi['best_run_id'],))
+                    best_only = cur.fetchone()
+                    bt_rows = [dict(best_only)] if best_only else []
 
                 # Surface the "best" run's metadata so the detail UI can
                 # label the equity-curve panel with "this came from a
@@ -2278,16 +2270,39 @@ class CommunityService:
                 if kpi['best_run_id']:
                     best_row = next((r for r in bt_rows if int(r.get('id') or 0) == kpi['best_run_id']), None)
                     if best_row:
-                        rj = _parse_backtest_result(best_row.get('result_json')) or {}
+                        rj = parse_backtest_result(best_row.get('result_json')) or {}
+                        config_snapshot = self._parse_json_dict(best_row.get('config_snapshot'))
+                        market_config = config_snapshot.get('marketConfig') if isinstance(config_snapshot.get('marketConfig'), dict) else {}
+                        market_type = str(market_config.get('marketType') or market_config.get('market_type') or '').strip().lower()
+                        if market_type in ('futures', 'future', 'perp', 'perpetual'):
+                            market_type = 'swap'
+                        leverage = int(best_row.get('leverage') or 1)
+                        if market_type not in ('spot', 'swap'):
+                            market_type = 'swap' if leverage > 1 else 'spot'
+                        if market_type == 'spot':
+                            leverage = 1
+                        start_date = str(best_row.get('start_date') or '') or None
+                        end_date = str(best_row.get('end_date') or '') or None
+                        duration_days = 0
+                        if start_date and end_date:
+                            try:
+                                start_dt = datetime.strptime(start_date[:10], '%Y-%m-%d')
+                                end_dt = datetime.strptime(end_date[:10], '%Y-%m-%d')
+                                duration_days = max((end_dt - start_dt).days + 1, 1)
+                            except Exception:
+                                duration_days = 0
                         best_run_meta = {
                             'symbol': best_row.get('symbol') or '',
                             'timeframe': best_row.get('timeframe') or '',
+                            'market_type': market_type,
+                            'leverage': leverage,
+                            'duration_days': duration_days,
                             'total_return': float(rj.get('totalReturn') or 0),
                             'sharpe': float(rj.get('sharpeRatio') or 0),
                             'max_drawdown': float(rj.get('maxDrawdown') or 0),
                             'win_rate': float(rj.get('winRate') or 0),
-                            'start_date': str(best_row.get('start_date') or '') or None,
-                            'end_date': str(best_row.get('end_date') or '') or None,
+                            'start_date': start_date,
+                            'end_date': end_date,
                         }
 
                 # Equity curve for the best run. Pulled from
@@ -2375,7 +2390,7 @@ class CommunityService:
                 # a "size of evidence" hint on the detail page.
                 bt_trades_total = 0
                 for row in bt_rows:
-                    rj = _parse_backtest_result(row.get('result_json')) or {}
+                    rj = parse_backtest_result(row.get('result_json')) or {}
                     bt_trades_total += int(rj.get('totalTrades') or 0)
                 total_trade_count = bt_trades_total + live_trade_count
 

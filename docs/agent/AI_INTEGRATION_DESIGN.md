@@ -1,4 +1,4 @@
-# QuantDinger — AI / Agent Integration (Design)
+﻿# QuantDinger — AI / Agent Integration (Design)
 
 | Item | Value |
 |------|--------|
@@ -57,7 +57,7 @@ Capabilities are grouped by **risk class**. Every endpoint or MCP tool must decl
 
 **Rule:** A new agent token **cannot** acquire class `C` or `T` without an explicit operator action. Class `T` further requires a configured **paper / sandbox** path before it can be flipped to live.
 
-Capability set is sourced from existing route groups: `market`, `kline`, `indicator`, `backtest`, `strategy`, `experiment`, `portfolio`, `dashboard`, `quick_trade`, `ibkr`, `mt5`, `polymarket`, `credentials`, `settings`, `community`, `fast_analysis`, `ai_chat`, `health`. New code should not add a sixth way to do trading; it should expose existing services with proper class tags.
+Capability set is sourced from existing route groups: `market`, `kline`, `indicator`, `backtest`, `strategy`, `experiment`, `portfolio`, `dashboard`, `quick_trade`, `ibkr`, `polymarket`, `credentials`, `settings`, `community`, `fast_analysis`, `ai_chat`, `health`. New code should not add a sixth way to do trading; it should expose existing services with proper class tags.
 
 ---
 
@@ -113,7 +113,7 @@ Key decision: **the Agent Gateway is a thin layer**, not a parallel implementati
 - An **Agent token** belongs to a Tenant and carries:
   - `agent_id` (human-readable label, e.g. `cursor-mcp`, `strategy-bot-1`)
   - `scopes` (subset of capability classes from §3)
-  - `markets` allowlist (e.g. `crypto`, `ibkr`, `mt5`)
+  - `markets` allowlist (e.g. `crypto`, `ibkr`)
   - `instruments` allowlist (optional, for trading scope)
   - `expires_at`
   - `paper_only` flag (default true for any token with `T`)
@@ -272,7 +272,7 @@ We deliberately did **not** fork SaaS into a separate codebase:
 | Concern | Existing code | Reuse strategy |
 |---------|----------------|----------------|
 | User auth (JWT) | `app/routes/auth.py`, `app/utils/auth.py` | Keep. Agent tokens live in a parallel module (`app/utils/agent_auth.py` proposed). |
-| Trading | `quick_trade`, `ibkr`, `mt5`, `polymarket` | Wrap in `T`-class endpoints; reuse service layer; do **not** fork order logic. |
+| Trading | `quick_trade`, `ibkr`, `polymarket` | Wrap in `T`-class endpoints; reuse service layer; do **not** fork order logic. |
 | Backtest / experiment | `backtest`, `experiment`, `app/services/experiment/*` | Move long-running entrypoints behind an async job table; agent endpoints become thin polls. |
 | AI chat / code-gen | `ai_chat` | Refactor to call internal services; agent endpoints expose the same services without the chat shell. |
 | Health | `health` | Reuse for `/api/agent/v1/health`. |
@@ -336,3 +336,4 @@ A1–A4 are **safe to ship without trading exposure**. A5/A6 are gated and rever
 | 0.2 | 2026-05-02 | A0–A5 implemented (schema, auth, R/W/B + paper-only T, admin, MCP, tests, OpenAPI, quickstart) |
 | 0.3 | 2026-05-02 | Added: SSE progress streaming for jobs, MCP HTTP/SSE transport, Vue admin UI for token & audit management |
 | 0.4 | 2026-05-02 | Added §8 Deployment topologies; shipped hosted-mode guard (`QUANTDINGER_DEPLOYMENT_MODE=saas` → T-scope rejected, `paper_only` pinned); MCP package published to PyPI; README EN/CN now documents the SaaS vs self-host paths side-by-side |
+

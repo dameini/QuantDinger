@@ -8,6 +8,7 @@ MARKET = "Market"
 INDICATOR = "Indicator"
 BACKTEST = "Backtest"
 STRATEGY = "Strategy"
+ACCOUNT = "Account"
 COMMUNITY = "Community"
 CREDENTIALS = "Credentials"
 DASHBOARD = "Dashboard"
@@ -21,7 +22,6 @@ AI_CHAT = "AIChat"
 QUICK_TRADE = "QuickTrade"
 IBKR = "IBKR"
 ALPACA = "Alpaca"
-MT5 = "MT5"
 
 ALL_TAGS = [
     {"name": HEALTH, "description": "Liveness and API metadata (Public)"},
@@ -32,6 +32,7 @@ ALL_TAGS = [
     {"name": INDICATOR, "description": "Indicator IDE workspace (Public)"},
     {"name": BACKTEST, "description": "Indicator backtesting (Public)"},
     {"name": STRATEGY, "description": "Strategy runtime and bots (Internal)"},
+    {"name": ACCOUNT, "description": "Trading account snapshots and positions (Internal)"},
     {"name": COMMUNITY, "description": "Indicator marketplace (Public)"},
     {"name": CREDENTIALS, "description": "Exchange credential vault (Internal)"},
     {"name": DASHBOARD, "description": "Dashboard aggregates (Internal)"},
@@ -45,5 +46,4 @@ ALL_TAGS = [
     {"name": QUICK_TRADE, "description": "Manual quick trade (Internal)"},
     {"name": IBKR, "description": "Interactive Brokers adapter (Internal)"},
     {"name": ALPACA, "description": "Alpaca adapter (Internal)"},
-    {"name": MT5, "description": "MetaTrader 5 adapter (Internal)"},
 ]

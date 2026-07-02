@@ -1,4 +1,4 @@
-# QuantDinger Docker Compose - One-Click Deployment
+﻿# QuantDinger Docker Compose - One-Click Deployment
 # Usage:
 #   1. Copy env.example to .env and edit your settings
 #      cp backend_api_python/env.example backend_api_python/.env
@@ -6,12 +6,11 @@
 #      SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
 #      Or edit backend_api_python/.env and replace SECRET_KEY value
 #   3. docker-compose up -d --build
-#   4. Open http://localhost:8888
+#   4. Open http://localhost:8888 (web) or http://localhost:8889 (mobile H5)
 #
-# Backend is built from local source. Frontend is pulled from GHCR — its source
-# lives in the private QuantDinger-Vue repo, which publishes
-# `ghcr.io/<owner>/quantdinger-frontend` on every `v*` tag. Override the tag
-# or image path via FRONTEND_IMAGE / IMAGE_TAG in a project-root `.env`.
+# Backend is built from local source. Frontend and mobile H5 are pulled from
+# GHCR. Override tags or image paths via FRONTEND_IMAGE / MOBILE_IMAGE /
+# IMAGE_TAG in a project-root `.env`.
 #
 # Note: The container will NOT start if SECRET_KEY is using the default value.
 #       This is a security measure to prevent insecure deployments.
@@ -21,7 +20,8 @@
 #   To switch source globally, set a single `IMAGE_PREFIX` in project-root `.env`.
 #   Examples: empty (official), `docker.m.daocloud.io/library/`,
 #   `docker.xuanyuan.me/library/`.
-# Backend Dockerfile tries Aliyun apt/PyPI first and falls back to official (no extra env).
+# Backend Dockerfile uses official Debian/PyPI sources by default.
+# For mainland China builds, set BUILD_REGION=cn to use Aliyun mirrors with fallback.
 # For slow pulls of base images, optionally set IMAGE_PREFIX or Docker Engine registry-mirrors.
 
 services:
@@ -29,13 +29,14 @@ services:
   # PostgreSQL Database
   # ========================
   postgres:
-    image: ${IMAGE_PREFIX:-}postgres:16-alpine
+    image: ${POSTGRES_IMAGE:-${IMAGE_PREFIX:-}postgres:18.3-alpine}
     container_name: quantdinger-db
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-quantdinger}
       POSTGRES_USER: ${POSTGRES_USER:-quantdinger}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdinger123}
+      PGDATA: ${POSTGRES_PGDATA:-/var/lib/postgresql/18/docker}
       TZ: ${TZ:-Asia/Shanghai}
     # Raise PostgreSQL's max_connections so the backend pool (default
     # DB_POOL_MAX=50) plus psql/admin connections never exceed PG's own
@@ -47,7 +48,7 @@ services:
       - "-c"
       - "shared_buffers=${PG_SHARED_BUFFERS:-256MB}"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${POSTGRES_DATA_SOURCE:-postgres_data}:${POSTGRES_PGDATA:-/var/lib/postgresql/18/docker}
       - ./backend_api_python/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql
     ports:
       - "${DB_PORT:-127.0.0.1:5432}:5432"
@@ -86,15 +87,19 @@ services:
       dockerfile: Dockerfile
       args:
         BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
-        # cn (default): use Aliyun apt/PyPI mirrors with fallback to official.
-        # global: use official sources directly (recommended for overseas builds).
-        BUILD_REGION: ${BUILD_REGION:-cn}
+        # global (default): use official Debian/PyPI sources.
+        # cn: use Aliyun apt/PyPI mirrors with fallback to official.
+        BUILD_REGION: ${BUILD_REGION:-global}
         # Release CI injects APP_VERSION from the Git tag. Local builds may set
         # APP_VERSION explicitly, or GIT_TAG/IMAGE_TAG as a non-floating fallback.
         APP_VERSION: ${APP_VERSION:-}
         GIT_TAG: ${GIT_TAG:-${IMAGE_TAG:-}}
     container_name: quantdinger-backend
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       postgres:
         condition: service_healthy
@@ -127,10 +132,12 @@ services:
       # Route-level executor tuning (each worker may use one DB connection).
       - MARKET_EXECUTOR_WORKERS=${MARKET_EXECUTOR_WORKERS:-6}
       - PORTFOLIO_EXECUTOR_WORKERS=${PORTFOLIO_EXECUTOR_WORKERS:-3}
+      - RESOURCE_FD_COOLDOWN_SEC=${RESOURCE_FD_COOLDOWN_SEC:-180}
+      - PORTFOLIO_MONITOR_DUE_BATCH_LIMIT=${PORTFOLIO_MONITOR_DUE_BATCH_LIMIT:-5}
       # Gunicorn concurrency (threads within the single worker process).
       - GUNICORN_WORKERS=${GUNICORN_WORKERS:-1}
       - GUNICORN_THREADS=${GUNICORN_THREADS:-8}
-      # IBKR/MT5 need local TWS or MT5 terminal; set false on SaaS cloud (see env.example).
+      # IBKR needs local TWS or IB Gateway; set false on SaaS cloud (see env.example).
       - ALLOW_LOCAL_DESKTOP_BROKERS=${ALLOW_LOCAL_DESKTOP_BROKERS:-true}
       # Spot full close / open fee buffer (Admin → Settings → Live Trading, or backend_api_python/.env)
       - SPOT_CLOSE_SAFETY_RATIO=${SPOT_CLOSE_SAFETY_RATIO:-0.998}
@@ -144,7 +151,7 @@ services:
       - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,::1,postgres,redis}
       # Takes precedence over mounted .env (run.py load_dotenv override=False).
       # Include :8000 when using Vite dev server alongside this stack.
-      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:8888,http://localhost:8000}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:8888,http://localhost:8889,http://localhost:8000}
     networks:
       - quantdinger-network
     healthcheck:
@@ -189,6 +196,31 @@ services:
       timeout: 10s
       retries: 3
 
+  # ========================
+  # Mobile H5 (Nginx serving prebuilt mobile SPA)
+  # ========================
+  # Open http://localhost:8889 for the touch-first mobile web client.
+  # It proxies /api to the same backend service, so users do not need to
+  # manually configure a server URL for the one-click Docker stack.
+  mobile:
+    image: ${MOBILE_IMAGE:-ghcr.io/brokermr810/quantdinger-mobile}:${MOBILE_TAG:-${IMAGE_TAG:-latest}}
+    pull_policy: always
+    container_name: quantdinger-mobile
+    restart: unless-stopped
+    ports:
+      - "${MOBILE_PORT:-8889}:80"
+    environment:
+      - BACKEND_URL=${BACKEND_URL:-http://backend:5000}
+    depends_on:
+      - backend
+    networks:
+      - quantdinger-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 volumes:
   postgres_data:
     driver: local
@@ -200,3 +232,4 @@ volumes:
 networks:
   quantdinger-network:
     driver: bridge
+

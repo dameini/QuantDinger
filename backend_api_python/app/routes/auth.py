@@ -7,8 +7,14 @@ Supports both multi-user (database) and single-user (legacy) modes.
 import os
 from flask import g, jsonify, redirect, request
 from app.openapi.blueprint import HumanBlueprint as Blueprint
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from app.config.settings import Config
+from app.services.auth_session import (
+    build_frontend_login_redirect,
+    get_client_ip,
+    get_user_agent,
+    issue_login_token,
+    touch_last_login,
+)
 from app.utils.auth import generate_token, login_required, authenticate_legacy
 from app.utils.logger import get_logger
 
@@ -17,77 +23,8 @@ logger = get_logger(__name__)
 auth_blp = Blueprint('auth', __name__)
 
 def _build_frontend_login_redirect(frontend_url: str, **params) -> str:
-    """
-    Build a redirect URL to the frontend login page for OAuth flows.
-
-    Supports both:
-    - PC (hash mode, path `/#/user/login`) — default behavior when only an origin
-      is supplied via FRONTEND_URL.
-    - Mobile / SPA history mode (e.g. `https://m.example.com/login`) — when the
-      caller provides a full URL with a real path (and optional query/hash), we
-      preserve that path instead of overwriting it with `/#/user/login`.
-
-    The decision rule:
-    1. If `frontend_url` contains a hash fragment (starts with `#/`), treat it as
-       a PC hash-mode URL and normalize to `{origin}/#/user/login`.
-    2. If `frontend_url` has a path other than `/` or empty, preserve the full
-       URL (origin + path) and just append the OAuth params as query string.
-    3. Otherwise (origin only), fall back to PC `/#/user/login`.
-    """
-    base = (frontend_url or '').strip().rstrip('/')
-    if not base:
-        base = 'http://localhost:8080'
-
-    # Ensure we can parse the URL
-    candidate = base if '://' in base else f'https://{base}'
-    try:
-        parsed = urlparse(candidate)
-    except Exception:
-        parsed = None
-
-    origin = ''
-    has_real_path = False
-    has_hash_route = False
-
-    if parsed and parsed.scheme and parsed.netloc:
-        origin = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
-        # Hash-mode PC login URL, e.g. https://pc.example.com/#/user/login
-        if parsed.fragment:
-            has_hash_route = True
-        path_part = (parsed.path or '').rstrip('/')
-        if path_part and path_part != '':
-            has_real_path = True
-    else:
-        origin = base
-
-    clean_params = {k: v for k, v in params.items() if v is not None and v != ''}
-    qs = urlencode(clean_params)
-
-    if has_hash_route:
-        # PC / hash-mode: always normalize to /#/user/login
-        login_url = f"{origin}/#/user/login"
-        return f"{login_url}?{qs}" if qs else login_url
-
-    if has_real_path:
-        # SPA history-mode (mobile etc.) — keep the caller-provided path and
-        # merge OAuth params into existing query string.
-        existing_qs = dict(parse_qsl(parsed.query or '', keep_blank_values=True))
-        existing_qs.update(clean_params)
-        merged_qs = urlencode(existing_qs)
-        rebuilt = urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            merged_qs,
-            ''  # drop the fragment deliberately for history-mode SPAs
-        ))
-        return rebuilt
-
-    # Origin only — fall back to PC hash route for backward compatibility
-    login_url = f"{origin}/#/user/login"
-    return f"{login_url}?{qs}" if qs else login_url
-
+    """Back-compatible wrapper for OAuth redirect callers."""
+    return build_frontend_login_redirect(frontend_url, **params)
 
 def _is_single_user_mode() -> bool:
     """Check if system is in single-user (legacy) mode"""
@@ -95,18 +32,13 @@ def _is_single_user_mode() -> bool:
 
 
 def _get_client_ip() -> str:
-    """Get client IP address from request"""
-    # Check for proxy headers
-    if request.headers.get('X-Forwarded-For'):
-        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
-    if request.headers.get('X-Real-IP'):
-        return request.headers.get('X-Real-IP')
-    return request.remote_addr or '0.0.0.0'
+    """Back-compatible wrapper for request client IP."""
+    return get_client_ip()
 
 
 def _get_user_agent() -> str:
-    """Get user agent from request"""
-    return request.headers.get('User-Agent', '')[:500]
+    """Back-compatible wrapper for request user agent."""
+    return get_user_agent()
 
 
 def _userinfo_must_change_initial_password(user_id: int) -> bool:
@@ -134,28 +66,15 @@ def _build_userinfo(user: dict, user_id: int, username: str) -> dict:
 
 
 def _issue_login_token(user: dict, user_id: int, username: str) -> tuple:
-    from app.services.user_service import get_user_service
-    try:
-        new_token_version = get_user_service().increment_token_version(user_id)
-    except Exception as e:
-        logger.warning(f"Failed to increment token_version: {e}")
-        new_token_version = 1
-
-    token = generate_token(
-        user_id=user_id,
-        username=user.get('username', username),
-        role=user.get('role', 'admin'),
-        token_version=new_token_version
+    return issue_login_token(
+        user,
+        user_id,
+        username,
+        _get_permissions(user.get('role', 'admin')),
     )
-    return token, _build_userinfo(user, user_id, username)
-
 
 def _touch_last_login(user_id: int) -> None:
-    try:
-        from app.services.user_service import get_user_service
-        get_user_service().touch_last_login(int(user_id))
-    except Exception as e:
-        logger.warning(f"Failed to touch last_login_at for user {user_id}: {e}")
+    touch_last_login(user_id)
 
 
 # =============================================================================
@@ -420,7 +339,6 @@ def login_with_code():
     Request body:
         email: str
         code: str (verification code)
-        turnstile_token: str (optional)
         referral_code: str (optional, referrer's user ID - only for new users)
     """
     ip_address = _get_client_ip()
@@ -443,7 +361,6 @@ def login_with_code():
         
         email = (data.get('email') or '').strip().lower()
         code = data.get('code', '').strip()
-        turnstile_token = data.get('turnstile_token')
         referral_code = data.get('referral_code', '').strip()
         
         # Validate inputs
@@ -452,11 +369,6 @@ def login_with_code():
         
         if not code:
             return jsonify({'code': 0, 'msg': 'Verification code is required', 'data': None}), 400
-        
-        # Verify Turnstile
-        turnstile_ok, turnstile_msg = security.verify_turnstile(turnstile_token, ip_address)
-        if not turnstile_ok:
-            return jsonify({'code': 0, 'msg': turnstile_msg, 'data': None}), 400
         
         # Verify email code
         code_valid, code_msg = email_service.verify_code(email, code, 'login')
@@ -753,7 +665,6 @@ def register():
         code: str (verification code)
         username: str
         password: str
-        turnstile_token: str (optional)
         referral_code: str (optional, referrer's user ID)
     """
     ip_address = _get_client_ip()
@@ -782,7 +693,6 @@ def register():
         code = data.get('code', '').strip()
         username = (data.get('username') or '').strip()
         password = data.get('password', '')
-        turnstile_token = data.get('turnstile_token')
         referral_code = data.get('referral_code', '').strip()
         
         # Validate inputs
@@ -804,11 +714,6 @@ def register():
         pwd_valid, pwd_msg = security.validate_password_strength(password)
         if not pwd_valid:
             return jsonify({'code': 0, 'msg': pwd_msg, 'data': None}), 400
-        
-        # Verify Turnstile
-        turnstile_ok, turnstile_msg = security.verify_turnstile(turnstile_token, ip_address)
-        if not turnstile_ok:
-            return jsonify({'code': 0, 'msg': turnstile_msg, 'data': None}), 400
         
         # Verify email code
         code_valid, code_msg = email_service.verify_code(email, code, 'register')
@@ -944,7 +849,6 @@ def reset_password():
         email: str
         code: str (verification code)
         new_password: str
-        turnstile_token: str (optional)
     """
     ip_address = _get_client_ip()
     user_agent = _get_user_agent()
@@ -965,7 +869,6 @@ def reset_password():
         email = (data.get('email') or '').strip().lower()
         code = data.get('code', '').strip()
         new_password = data.get('new_password', '')
-        turnstile_token = data.get('turnstile_token')
         
         # Validate inputs
         if not email or not code or not new_password:
@@ -975,11 +878,6 @@ def reset_password():
         pwd_valid, pwd_msg = security.validate_password_strength(new_password)
         if not pwd_valid:
             return jsonify({'code': 0, 'msg': pwd_msg, 'data': None}), 400
-        
-        # Verify Turnstile
-        turnstile_ok, turnstile_msg = security.verify_turnstile(turnstile_token, ip_address)
-        if not turnstile_ok:
-            return jsonify({'code': 0, 'msg': turnstile_msg, 'data': None}), 400
         
         # Verify email code
         code_valid, code_msg = email_service.verify_code(email, code, 'reset_password')
@@ -1357,3 +1255,4 @@ def _get_permissions(role: str) -> list:
 
 # openapi-compat: legacy import name
 auth_bp = auth_blp
+

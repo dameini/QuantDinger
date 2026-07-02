@@ -5,11 +5,16 @@ New high-performance analysis endpoints that replace the slow multi-agent system
 """
 from flask import g, jsonify, request
 from app.openapi.blueprint import HumanBlueprint as Blueprint
-import threading
-import time
 
 from app.utils.auth import login_required
 from app.utils.logger import get_logger
+from app.services.fast_analysis_tasks import (
+    acquire_inflight,
+    build_inflight_key,
+    release_inflight,
+    start_async_analysis_task,
+    try_refund_credits,
+)
 from app.services.fast_analysis import get_fast_analysis_service
 from app.services.analysis_memory import get_analysis_memory
 from app.services.billing_service import get_billing_service
@@ -17,98 +22,6 @@ from app.services.billing_service import get_billing_service
 logger = get_logger(__name__)
 
 fast_analysis_blp = Blueprint('fast_analysis', __name__)
-
-# In-memory in-flight guard to avoid duplicate analysis charges caused by rapid repeated clicks.
-_analysis_inflight_lock = threading.Lock()
-_analysis_inflight = {}  # key -> expire_ts
-
-
-def _try_refund_credits(user_id: int, amount: int, remark: str):
-    """Best-effort async refund when task fails after pre-charge."""
-    try:
-        if int(amount or 0) <= 0:
-            return
-        billing = get_billing_service()
-        billing.add_credits(
-            user_id=int(user_id),
-            amount=int(amount),
-            action='refund',
-            remark=remark
-        )
-    except Exception as e:
-        logger.error(f"Async auto refund failed: {e}", exc_info=True)
-
-
-def _run_async_analysis_task(task_memory_id: int, market: str, symbol: str, language: str,
-                             model: str, timeframe: str, user_id: int, inflight_key: str,
-                             credits_charged: int = 0):
-    """
-    Background worker: execute analysis and update pending history record.
-    """
-    try:
-        service = get_fast_analysis_service()
-        memory = get_analysis_memory()
-        result = service.analyze(
-            market=market,
-            symbol=symbol,
-            language=language,
-            model=model,
-            timeframe=timeframe,
-            user_id=user_id
-        )
-        memory.finalize_pending_task(task_memory_id, result)
-        if result.get("error"):
-            _try_refund_credits(
-                user_id=int(user_id),
-                amount=int(credits_charged or 0),
-                remark=f'Auto refund: async fast-analysis failed ({market}:{symbol}:{timeframe})'
-            )
-
-        # analyze() already stores a separate memory row; remove it to avoid duplicates.
-        auto_memory_id = result.get("memory_id")
-        if auto_memory_id and int(auto_memory_id) != int(task_memory_id):
-            try:
-                memory.delete_history(int(auto_memory_id), user_id=user_id)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error(f"Async analysis task failed: {e}", exc_info=True)
-        _try_refund_credits(
-            user_id=int(user_id),
-            amount=int(credits_charged or 0),
-            remark=f'Auto refund: async fast-analysis exception ({market}:{symbol}:{timeframe})'
-        )
-        try:
-            get_analysis_memory().fail_pending_task(task_memory_id, str(e))
-        except Exception:
-            pass
-    finally:
-        try:
-            _release_inflight(inflight_key)
-        except Exception:
-            pass
-
-
-def _build_inflight_key(user_id: int, market: str, symbol: str, timeframe: str) -> str:
-    return f"{int(user_id)}|{str(market or '').strip().upper()}|{str(symbol or '').strip().upper()}|{str(timeframe or '').strip().upper()}"
-
-
-def _acquire_inflight(key: str, ttl_sec: int = 90) -> bool:
-    now = time.time()
-    with _analysis_inflight_lock:
-        # Cleanup stale entries
-        stale = [k for k, exp in _analysis_inflight.items() if float(exp) <= now]
-        for k in stale[:1024]:
-            _analysis_inflight.pop(k, None)
-        if key in _analysis_inflight and float(_analysis_inflight.get(key) or 0) > now:
-            return False
-        _analysis_inflight[key] = now + int(ttl_sec)
-        return True
-
-
-def _release_inflight(key: str):
-    with _analysis_inflight_lock:
-        _analysis_inflight.pop(key, None)
 
 
 @fast_analysis_blp.route('/analyze', methods=['POST'])
@@ -147,8 +60,8 @@ def analyze():
         if not user_id:
             return jsonify({'code': 0, 'msg': 'Unauthorized', 'data': None}), 401
 
-        inflight_key = _build_inflight_key(user_id, market, symbol, timeframe)
-        if not _acquire_inflight(inflight_key, ttl_sec=90):
+        inflight_key = build_inflight_key(user_id, market, symbol, timeframe)
+        if not acquire_inflight(inflight_key, ttl_sec=90):
             return jsonify({
                 'code': 0,
                 'msg': 'Analysis already in progress for this symbol/timeframe. Please wait.',
@@ -213,12 +126,10 @@ def analyze():
             if not pending_id:
                 return jsonify({'code': 0, 'msg': 'Failed to create analysis task', 'data': None}), 500
 
-            t = threading.Thread(
-                target=_run_async_analysis_task,
-                args=(int(pending_id), market, symbol, language, model, timeframe, int(user_id), inflight_key, int(credits_charged or 0)),
-                daemon=True
+            start_async_analysis_task(
+                int(pending_id), market, symbol, language, model, timeframe,
+                int(user_id), inflight_key, int(credits_charged or 0),
             )
-            t.start()
             # worker owns inflight release
             inflight_key = None
 
@@ -250,10 +161,9 @@ def analyze():
             # Best-effort refund if we already charged but analysis failed.
             if billing_consumed and billing and credits_charged > 0:
                 try:
-                    billing.add_credits(
+                    try_refund_credits(
                         user_id=int(user_id),
                         amount=int(credits_charged),
-                        action='refund',
                         remark=f'Auto refund: fast-analysis failed ({market}:{symbol}:{timeframe})'
                     )
                     remaining_credits = float(billing.get_user_credits(int(user_id)))
@@ -285,10 +195,9 @@ def analyze():
         # Best-effort refund on unexpected error after charge.
         try:
             if 'billing_consumed' in locals() and billing_consumed and 'billing' in locals() and billing and credits_charged > 0 and 'user_id' in locals() and user_id:
-                billing.add_credits(
+                try_refund_credits(
                     user_id=int(user_id),
                     amount=int(credits_charged),
-                    action='refund',
                     remark=f'Auto refund: fast-analysis exception ({market}:{symbol}:{timeframe})'
                 )
         except Exception:
@@ -302,7 +211,7 @@ def analyze():
     finally:
         try:
             if 'inflight_key' in locals() and inflight_key:
-                _release_inflight(inflight_key)
+                release_inflight(inflight_key)
         except Exception:
             pass
 

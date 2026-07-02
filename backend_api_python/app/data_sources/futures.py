@@ -31,6 +31,7 @@ _TD_FUTURES_SYMBOLS = {
     'GC': 'GC', 'SI': 'SI', 'CL': 'CL', 'NG': 'NG',
     'ZC': 'ZC', 'ZW': 'ZW', 'HG': 'HG', 'PL': 'PL',
     'ES': 'ES', 'NQ': 'NQ', 'YM': 'YM', 'RTY': 'RTY',
+    'ZS': 'ZS',
 }
 
 
@@ -49,6 +50,11 @@ def _get_td_api_key() -> str:
 _TIINGO_PRECIOUS_METALS_MAP = {
     'GC': 'xauusd',
     'SI': 'xagusd',
+}
+
+_FOREX_METALS_MAP = {
+    'GC': 'XAUUSD',
+    'SI': 'XAGUSD',
 }
 
 _TIINGO_TIMEFRAME_MAP = {
@@ -229,7 +235,8 @@ class FuturesDataSource(BaseDataSource):
             after_time: 预留与基类一致（当前期货链路未使用）
         """
         _ = after_time
-        if symbol in self.YF_SYMBOLS or symbol.endswith('=F'):
+        base_symbol = symbol.replace("=F", "").upper()
+        if base_symbol in _TD_FUTURES_SYMBOLS or symbol.endswith('=F'):
             return self._get_traditional_futures(symbol, timeframe, limit, before_time)
         else:
             return self._get_crypto_futures(symbol, timeframe, limit, before_time)
@@ -245,6 +252,7 @@ class FuturesDataSource(BaseDataSource):
         for fetcher in (
             self._get_traditional_futures_td,
             self._get_traditional_futures_yf,
+            self._get_traditional_futures_forex_spot,
             self._get_traditional_futures_tiingo,
         ):
             try:
@@ -254,6 +262,21 @@ class FuturesDataSource(BaseDataSource):
             except Exception as e:
                 logger.debug("Futures kline %s failed for %s: %s", fetcher.__name__, symbol, e)
         return []
+
+    def _get_traditional_futures_forex_spot(
+        self, symbol: str, timeframe: str, limit: int, before_time: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Fallback GC/SI to spot metals when futures feeds are rate-limited."""
+        spot_symbol = _FOREX_METALS_MAP.get(symbol.replace("=F", "").upper())
+        if not spot_symbol:
+            return []
+        try:
+            from app.data_sources.forex import ForexDataSource
+
+            return ForexDataSource().get_kline(spot_symbol, timeframe, limit, before_time)
+        except Exception as e:
+            logger.debug("Forex metals fallback failed %s: %s", symbol, e)
+            return []
 
     def _get_traditional_futures_td(
         self, symbol: str, timeframe: str, limit: int, before_time: Optional[int] = None

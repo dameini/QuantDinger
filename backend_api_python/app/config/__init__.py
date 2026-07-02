@@ -1,7 +1,4 @@
-"""
-配置模块
-统一导出所有配置
-"""
+"""Configuration package exports."""
 from app.config.settings import Config
 from app.config.api_keys import APIKeys
 from app.config.database import RedisConfig, CacheConfig

@@ -475,7 +475,7 @@ class BinanceFuturesClient(BaseRestClient):
         return 0.0, ""
 
     def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
-        sym = symbol.upper().replace("-", "").replace("/", "")
+        sym = to_binance_futures_symbol(symbol)
         try:
             data = self._signed_request("GET", "/fapi/v1/commissionRate", params={"symbol": sym})
             if isinstance(data, dict):
@@ -484,7 +484,7 @@ class BinanceFuturesClient(BaseRestClient):
                 if maker > 0 or taker > 0:
                     return {"maker": maker, "taker": taker}
         except Exception as e:
-            logger.warning(f"Binance get_fee_rate({symbol}) failed: {e}")
+            logger.warning(f"Binance get_fee_rate({symbol}, symbol_param={sym}) failed: {e}")
         return None
 
     def set_leverage(self, *, symbol: str, leverage: float) -> Dict[str, Any]:

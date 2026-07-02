@@ -21,7 +21,8 @@ Two reconciliation paths, tried in order:
 Env vars (preferred):
     ETHERSCAN_API_KEY        — V2 unified key (paid plan needed for BSC)
     ETHERSCAN_V2_BASE_URL    — V2 host override (default api.etherscan.io/v2/api)
-    BSC_RPC_URLS             — comma-separated BSC RPCs (fallback)
+    BSC_RPC_URLS             — comma-separated BSC RPCs (fallback; add API-key
+                               URLs here if your provider requires auth)
     ETH_RPC_URLS             — comma-separated ETH RPCs (fallback)
 
 Backward-compatible legacy env vars (used when no V2 key is set OR when
@@ -75,8 +76,10 @@ _RPC_URL_ENV: Dict[str, str] = {
 _DEFAULT_RPCS: Dict[str, List[str]] = {
     "BEP20": [
         "https://bsc-dataseed1.binance.org",
+        "https://bsc-dataseed2.binance.org",
+        "https://bsc-dataseed3.binance.org",
+        "https://bsc-dataseed4.binance.org",
         "https://bsc.publicnode.com",
-        "https://rpc.ankr.com/bsc",
     ],
     "ERC20": [
         "https://ethereum-rpc.publicnode.com",
@@ -337,16 +340,16 @@ def _rpc_call(url: str, method: str, params: List[Any], timeout: float = 12.0) -
 
 
 def _try_rpcs(urls: List[str], method: str, params: List[Any]) -> Tuple[Any, Optional[str], Optional[str]]:
-    """Try each URL in turn until one succeeds. Returns ``(result, used_url, last_err)``."""
-    last_err: Optional[str] = None
+    """Try each URL in turn until one succeeds. Returns ``(result, used_url, errors)``."""
+    errors: List[str] = []
     for url in urls:
         try:
             res = _rpc_call(url, method, params)
             return res, url, None
         except (requests.RequestException, ValueError, RuntimeError) as exc:
-            last_err = f"{url}:{type(exc).__name__}:{exc}"
+            errors.append(f"{url}:{type(exc).__name__}:{exc}")
             logger.debug("RPC call failed on %s: %s", url, exc)
-    return None, None, last_err
+    return None, None, " | ".join(errors[-5:]) if errors else None
 
 
 def _address_to_topic(address: str) -> str:

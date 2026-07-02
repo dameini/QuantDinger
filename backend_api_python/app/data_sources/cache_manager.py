@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-数据缓存管理模块
+Data Cache Manager
 ===================================
 
-参考 daily_stock_analysis 项目实现
-用于缓存实时行情和K线数据，减少重复请求
+Caches realtime quotes and K-line data to reduce repeated upstream requests.
 
-特性：
-1. TTL (Time To Live) 过期机制
-2. LRU (Least Recently Used) 淘汰策略
-3. 按数据类型分区管理
+Features:
+1. TTL expiration.
+2. LRU eviction.
+3. Separate cache partitions by data type.
 """
 
 import time
@@ -26,37 +25,37 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CacheEntry:
-    """缓存条目"""
+    """One cache entry."""
     data: Any
     timestamp: float
     ttl: float
     hit_count: int = 0
     
     def is_expired(self) -> bool:
-        """检查是否过期"""
+        """Return whether the entry has expired."""
         return time.time() - self.timestamp > self.ttl
     
     def age(self) -> float:
-        """返回缓存年龄（秒）"""
+        """Return entry age in seconds."""
         return time.time() - self.timestamp
 
 
 class DataCache:
     """
-    数据缓存管理器
+    Thread-safe TTL and LRU cache.
     
-    特性：
-    - TTL 过期机制
-    - 最大容量限制
-    - LRU 淘汰策略
-    - 线程安全
+    Features:
+    - TTL expiration.
+    - Maximum size limit.
+    - LRU eviction.
+    - Thread safety.
     """
     
     def __init__(
         self,
         name: str = "default",
-        default_ttl: float = 600.0,  # 默认10分钟
-        max_size: int = 1000         # 最大缓存条目数
+        default_ttl: float = 600.0,  # Default: 10 minutes
+        max_size: int = 1000         # Maximum cache entries
     ):
         self.name = name
         self.default_ttl = default_ttl
@@ -69,10 +68,10 @@ class DataCache:
     
     def get(self, key: str) -> Optional[Any]:
         """
-        获取缓存数据
+        Get cached data.
         
         Returns:
-            缓存的数据，不存在或过期返回 None
+            Cached data, or None when missing or expired.
         """
         with self._lock:
             if key not in self._cache:
@@ -84,14 +83,14 @@ class DataCache:
             if entry.is_expired():
                 del self._cache[key]
                 self._misses += 1
-                logger.debug(f"[缓存] {self.name}:{key} 已过期，删除")
+                logger.debug(f"[cache] {self.name}:{key} expired; removed")
                 return None
             
             self._cache.move_to_end(key)
             entry.hit_count += 1
             self._hits += 1
             
-            logger.debug(f"[缓存命中] {self.name}:{key} (年龄: {entry.age():.0f}s/{entry.ttl:.0f}s)")
+            logger.debug(f"[cache hit] {self.name}:{key} (age: {entry.age():.0f}s/{entry.ttl:.0f}s)")
             return entry.data
     
     def set(
@@ -101,17 +100,17 @@ class DataCache:
         ttl: Optional[float] = None
     ) -> None:
         """
-        设置缓存数据
+        Set cached data.
         
         Args:
-            key: 缓存键
-            data: 缓存数据
-            ttl: 过期时间（秒），None 使用默认值
+            key: Cache key.
+            data: Cached data.
+            ttl: Expiration in seconds. None uses the default value.
         """
         with self._lock:
             while len(self._cache) >= self.max_size:
                 oldest_key, _ = self._cache.popitem(last=False)
-                logger.debug(f"[缓存] {self.name} 容量已满，淘汰: {oldest_key}")
+                logger.debug(f"[cache] {self.name} full; evicted: {oldest_key}")
             
             actual_ttl = ttl if ttl is not None else self.default_ttl
             self._cache[key] = CacheEntry(
@@ -120,27 +119,27 @@ class DataCache:
                 ttl=actual_ttl
             )
             
-            logger.debug(f"[缓存更新] {self.name}:{key} TTL={actual_ttl}s")
+            logger.debug(f"[cache update] {self.name}:{key} TTL={actual_ttl}s")
     
     def delete(self, key: str) -> bool:
-        """删除缓存条目"""
+        """Delete one cache entry."""
         with self._lock:
             if key in self._cache:
                 del self._cache[key]
-                logger.debug(f"[缓存] {self.name}:{key} 已删除")
+                logger.debug(f"[cache] {self.name}:{key} deleted")
                 return True
             return False
     
     def clear(self) -> int:
-        """清空缓存"""
+        """Clear all cache entries."""
         with self._lock:
             count = len(self._cache)
             self._cache.clear()
-            logger.info(f"[缓存] {self.name} 已清空 {count} 条记录")
+            logger.info(f"[cache] {self.name} cleared {count} entries")
             return count
     
     def cleanup_expired(self) -> int:
-        """清理过期条目"""
+        """Remove expired cache entries."""
         with self._lock:
             expired_keys = [
                 key for key, entry in self._cache.items()
@@ -150,11 +149,11 @@ class DataCache:
                 del self._cache[key]
             
             if expired_keys:
-                logger.debug(f"[缓存] {self.name} 清理 {len(expired_keys)} 条过期记录")
+                logger.debug(f"[cache] {self.name} cleaned {len(expired_keys)} expired entries")
             return len(expired_keys)
     
     def stats(self) -> Dict[str, Any]:
-        """获取缓存统计信息"""
+        """Return cache statistics."""
         with self._lock:
             total_requests = self._hits + self._misses
             hit_rate = self._hits / total_requests if total_requests > 0 else 0
@@ -175,35 +174,35 @@ class DataCache:
 
 _realtime_cache = DataCache(
     name="realtime",
-    default_ttl=1200.0,  # 20分钟
+    default_ttl=1200.0,  # 20 minutes
     max_size=6000
 )
 
 _kline_cache = DataCache(
     name="kline",
-    default_ttl=300.0,   # 5分钟
-    max_size=500         # 最多500个交易对
+    default_ttl=300.0,   # 5 minutes
+    max_size=500         # Up to 500 symbols
 )
 
 _stock_info_cache = DataCache(
     name="stock_info",
-    default_ttl=86400.0,  # 24小时
+    default_ttl=86400.0,  # 24 hours
     max_size=6000
 )
 
 
 def get_realtime_cache() -> DataCache:
-    """获取实时行情缓存"""
+    """Return the realtime quote cache."""
     return _realtime_cache
 
 
 def get_kline_cache() -> DataCache:
-    """获取K线数据缓存"""
+    """Return the K-line data cache."""
     return _kline_cache
 
 
 def get_stock_info_cache() -> DataCache:
-    """获取股票信息缓存"""
+    """Return the stock info cache."""
     return _stock_info_cache
 
 
@@ -214,9 +213,9 @@ def generate_kline_cache_key(
     before_time: Optional[int] = None
 ) -> str:
     """
-    生成K线缓存键
+    Generate a K-line cache key.
     
-    格式: symbol:timeframe:limit[:before_time]
+    Format: symbol:timeframe:limit[:before_time]
     """
     key = f"{symbol}:{timeframe}:{limit}"
     if before_time:

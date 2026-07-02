@@ -22,3 +22,12 @@ services:
       args:
         APP_VERSION: ${APP_VERSION:-}
         GIT_TAG: ${GIT_TAG:-${FRONTEND_TAG:-${IMAGE_TAG:-}}}
+
+  mobile:
+    pull_policy: build
+    build:
+      context: ${MOBILE_SRC_PATH:-./QuantDinger-Mobile}
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-}
+        GIT_TAG: ${GIT_TAG:-${MOBILE_TAG:-${IMAGE_TAG:-}}}

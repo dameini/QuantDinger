@@ -5,7 +5,6 @@ Admin-only endpoints for system configuration management.
 """
 import os
 import re
-import importlib
 from flask import jsonify, request
 from app.openapi.blueprint import HumanBlueprint as Blueprint
 from app._version import APP_VERSION
@@ -13,63 +12,13 @@ from app.markets.registry import market_options
 from app.utils.logger import get_logger
 from app.utils.config_loader import clear_config_cache
 from app.utils.auth import login_required, admin_required
-from dotenv import load_dotenv
+from app.services.settings.branding import build_brand_config
+from app.services.settings.env_file import read_env_file, write_env_file
+from app.services.settings.runtime import reload_runtime_env, refresh_runtime_services
 
 logger = get_logger(__name__)
 
 settings_blp = Blueprint('settings', __name__)
-
-ENV_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
-
-
-def _reload_runtime_env() -> None:
-    """
-    Reload .env into current process so settings take effect immediately.
-    Priority keeps backend_api_python/.env over repo-root/.env.
-    """
-    backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-    root_dir = os.path.dirname(backend_dir)
-
-    # Load root first, then backend .env to keep backend file higher priority
-    load_dotenv(os.path.join(root_dir, '.env'), override=True)
-    load_dotenv(os.path.join(backend_dir, '.env'), override=True)
-
-
-def _refresh_runtime_services() -> None:
-    """
-    Reset singleton services so new env/config is picked up lazily
-    on next request without restarting the Python process.
-    """
-    # Prefer dedicated reset function where available.
-    try:
-        search_mod = importlib.import_module('app.services.search')
-        if hasattr(search_mod, 'reset_search_service'):
-            search_mod.reset_search_service()
-    except Exception as e:
-        logger.warning(f"reset_search_service skipped: {e}")
-
-    # Generic singleton fields used across services.
-    singleton_fields = [
-        ('app.services.fast_analysis', '_fast_analysis_service'),
-        ('app.services.billing_service', '_billing_service'),
-        ('app.services.security_service', '_security_service'),
-        ('app.services.mfa_service', '_mfa_service'),
-        ('app.services.oauth_service', '_oauth_service'),
-        ('app.services.user_service', '_user_service'),
-        ('app.services.email_service', '_email_service'),
-        ('app.services.community_service', '_community_service'),
-        ('app.services.usdt_payment_service', '_svc'),
-        ('app.services.usdt_payment_service', '_worker'),
-        ('app.services.analysis_memory', '_memory_instance'),
-    ]
-
-    for module_name, field_name in singleton_fields:
-        try:
-            mod = importlib.import_module(module_name)
-            if hasattr(mod, field_name):
-                setattr(mod, field_name, None)
-        except Exception as e:
-            logger.warning(f"Singleton reset skipped: {module_name}.{field_name}: {e}")
 
 # ---------------------------------------------------------------
 # ---------------------------------------------------------------
@@ -689,7 +638,7 @@ CONFIG_SCHEMA = {
             },
             {
                 'key': 'ALLOW_LOCAL_DESKTOP_BROKERS',
-                'label': 'Allow IBKR / MT5 (local desktop brokers)',
+                'label': 'Allow IBKR (local desktop broker)',
                 'type': 'boolean',
                 'default': 'True',
                 'description': 'Disable on a multi-tenant SaaS deployment so users see a clear "broker not supported" message instead of broken connect flows. Crypto exchange API keys are unaffected.'
@@ -711,10 +660,10 @@ CONFIG_SCHEMA = {
         ]
     },
 
-    'data_source': {
-        'title': 'Data Sources',
-        'icon': 'database',
-        'order': 4,
+    'market_modules': {
+        'title': 'Market Modules',
+        'icon': 'appstore',
+        'order': 3.5,
         'items': [
             {
                 'key': 'ENABLED_MARKETS',
@@ -724,6 +673,14 @@ CONFIG_SCHEMA = {
                 'options': market_options(),
                 'description': 'Markets exposed to research, strategy, market data, Agent API, and live-trading entry points. Saved as ENABLED_MARKETS in .env for backward compatibility. Empty = whitelist disabled and legacy SHOW_* flags apply.'
             },
+        ]
+    },
+
+    'data_source': {
+        'title': 'Data Sources',
+        'icon': 'database',
+        'order': 4,
+        'items': [
             {
                 'key': 'CCXT_DEFAULT_EXCHANGE',
                 'label': 'Default Crypto Exchange',
@@ -1590,7 +1547,7 @@ CONFIG_SCHEMA = {
                 'label': 'BEP20 Receiving Address',
                 'type': 'text',
                 'required': False,
-                'description': 'Your BSC wallet address (0x...). Reconciliation runs on public BSC RPC by default — no API key needed.'
+                'description': 'Your BSC wallet address (0x...). Reconciliation uses public BSC RPC by default; for production, configure BSC_RPC_URLS with your own reliable RPC endpoint.'
             },
             {
                 'key': 'USDT_ERC20_ADDRESS',
@@ -1618,7 +1575,14 @@ CONFIG_SCHEMA = {
                 'label': 'Etherscan API Key',
                 'type': 'password',
                 'required': False,
-                'description': 'Optional. Used for ERC20 reconciliation via Etherscan V2 (free plan covers Ethereum mainnet). BEP20 ignores this — it uses public BSC RPC. Get a key at https://etherscan.io/myapikey.'
+                'description': 'Optional. Used for ERC20 reconciliation via Etherscan V2 (free plan covers Ethereum mainnet). BEP20 uses BSC RPC unless you explicitly enable explorer mode. Get a key at https://etherscan.io/myapikey.'
+            },
+            {
+                'key': 'BSC_RPC_URLS',
+                'label': 'BSC RPC URLs',
+                'type': 'text',
+                'required': False,
+                'description': 'Optional comma-separated BSC JSON-RPC endpoints for BEP20 reconciliation. Use provider URLs with API keys here if public RPCs are unstable.'
             },
             {
                 'key': 'USDT_PAY_CONFIRM_SECONDS',
@@ -1703,87 +1667,6 @@ CONFIG_SCHEMA = {
 }
 
 
-def read_env_file():
-    """读取 .env 文件"""
-    env_values = {}
-    
-    if not os.path.exists(ENV_FILE_PATH):
-        logger.warning(f".env file not found at {ENV_FILE_PATH}")
-        return env_values
-    
-    try:
-        with open(ENV_FILE_PATH, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                if '=' in line:
-                    key, value = line.split('=', 1)
-                    key = key.strip()
-                    value = value.strip()
-                    if (value.startswith('"') and value.endswith('"')) or \
-                       (value.startswith("'") and value.endswith("'")):
-                        value = value[1:-1]
-                    env_values[key] = value
-    except Exception as e:
-        logger.error(f"Failed to read .env file: {e}")
-    
-    return env_values
-
-
-def write_env_file(env_values):
-    """写入 .env 文件，保留注释和格式"""
-    lines = []
-    existing_keys = set()
-    
-    if os.path.exists(ENV_FILE_PATH):
-        try:
-            with open(ENV_FILE_PATH, 'r', encoding='utf-8') as f:
-                for line in f:
-                    original_line = line
-                    stripped = line.strip()
-                    
-                    if not stripped or stripped.startswith('#'):
-                        lines.append(original_line)
-                        continue
-                    
-                    if '=' in stripped:
-                        key = stripped.split('=', 1)[0].strip()
-                        if key in env_values:
-                            existing_keys.add(key)
-                            value = env_values[key]
-                            if ' ' in str(value) or '"' in str(value) or "'" in str(value):
-                                lines.append(f'{key}="{value}"\n')
-                            else:
-                                lines.append(f'{key}={value}\n')
-                        else:
-                            lines.append(original_line)
-                    else:
-                        lines.append(original_line)
-        except Exception as e:
-            logger.error(f"Failed to read .env file for update: {e}")
-    
-    new_keys = set(env_values.keys()) - existing_keys
-    if new_keys:
-        if lines and not lines[-1].endswith('\n'):
-            lines.append('\n')
-        lines.append('\n# Added by Settings UI\n')
-        for key in sorted(new_keys):
-            value = env_values[key]
-            if ' ' in str(value) or '"' in str(value) or "'" in str(value):
-                lines.append(f'{key}="{value}"\n')
-            else:
-                lines.append(f'{key}={value}\n')
-    
-    try:
-        with open(ENV_FILE_PATH, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to write .env file: {e}")
-        return False
-
-
 def _schema_with_advanced_flags():
     """Return a deep-ish copy of CONFIG_SCHEMA with ``is_advanced`` annotated on
     every item according to ``ADVANCED_KEYS``. Lets the frontend split settings
@@ -1824,34 +1707,6 @@ def get_public_config():
     })
 
 
-# Default brand values. Used when the matching ENV var is empty or absent so a
-# fresh install still ships with sane copy / links instead of blanks.
-_BRAND_DEFAULTS = {
-    'app_name': 'QuantDinger',
-    'copyright': '© 2025-2026 QuantDinger. All rights reserved.',
-    'contact_email': 'support@quantdinger.com',
-    'contact_support_url': 'https://t.me/quantdinger',
-    'contact_feature_request_url': 'https://github.com/brokermr810/QuantDinger/issues',
-    'contact_live_chat_url': 'https://t.me/quantdinger',
-    'social_github': 'https://github.com/brokermr810/QuantDinger',
-    'social_x': 'https://x.com/quantdinger_en',
-    'social_discord': 'https://discord.com/invite/tyx5B6TChr',
-    'social_telegram': 'https://t.me/quantdinger',
-    'social_youtube': 'https://youtube.com/@quantdinger',
-}
-
-
-def _brand_env(name: str, default: str = '') -> str:
-    """Read a BRAND_* env var and fall back to the bundled default."""
-    value = os.getenv(name, '')
-    if value is None:
-        value = ''
-    value = value.strip()
-    if value:
-        return value
-    return _BRAND_DEFAULTS.get(default, '')
-
-
 @settings_blp.route('/brand-config', methods=['GET'])
 def get_brand_config():
     """Public, no-auth endpoint exposing branding / legal / contact info.
@@ -1863,50 +1718,10 @@ def get_brand_config():
     Empty ENV values fall back to the bundled QuantDinger defaults so a fresh
     install still ships with working links instead of blanks.
     """
-    social_specs = [
-        ('GitHub', 'github', 'BRAND_SOCIAL_GITHUB', 'social_github'),
-        ('X', 'x', 'BRAND_SOCIAL_X', 'social_x'),
-        ('Discord', 'discord', 'BRAND_SOCIAL_DISCORD', 'social_discord'),
-        ('Telegram', 'telegram', 'BRAND_SOCIAL_TELEGRAM', 'social_telegram'),
-        ('YouTube', 'youtube', 'BRAND_SOCIAL_YOUTUBE', 'social_youtube'),
-    ]
-    social_accounts = []
-    for name, icon, env_key, default_key in social_specs:
-        url = _brand_env(env_key, default_key)
-        if url:
-            social_accounts.append({'name': name, 'icon': icon, 'url': url})
-
     return jsonify({
         'code': 1,
         'msg': 'success',
-        'data': {
-            'app_name': _brand_env('BRAND_APP_NAME', 'app_name'),
-            'app_version': APP_VERSION,
-            'copyright': _brand_env('BRAND_COPYRIGHT', 'copyright'),
-            'logos': {
-                'light': _brand_env('BRAND_LOGO_LIGHT_URL'),
-                'dark': _brand_env('BRAND_LOGO_DARK_URL'),
-                'collapsed': _brand_env('BRAND_LOGO_COLLAPSED_URL'),
-                'favicon': _brand_env('BRAND_FAVICON_URL'),
-            },
-            'contact': {
-                'email': _brand_env('BRAND_CONTACT_EMAIL', 'contact_email'),
-                'support_url': _brand_env('BRAND_CONTACT_SUPPORT_URL', 'contact_support_url'),
-                'feature_request_url': _brand_env('BRAND_CONTACT_FEATURE_REQUEST_URL', 'contact_feature_request_url'),
-                'live_chat_url': _brand_env('BRAND_CONTACT_LIVE_CHAT_URL', 'contact_live_chat_url'),
-            },
-            'social_accounts': social_accounts,
-            'legal': {
-                'user_agreement_url': _brand_env('BRAND_LEGAL_USER_AGREEMENT_URL'),
-                'user_agreement_text': _brand_env('BRAND_LEGAL_USER_AGREEMENT_TEXT'),
-                'privacy_policy_url': _brand_env('BRAND_LEGAL_PRIVACY_POLICY_URL'),
-                'privacy_policy_text': _brand_env('BRAND_LEGAL_PRIVACY_POLICY_TEXT'),
-            },
-            'mobile_app': {
-                'latest_version': _brand_env('MOBILE_APP_LATEST_VERSION'),
-                'download_url': _brand_env('MOBILE_APP_DOWNLOAD_URL'),
-            },
-        }
+        'data': build_brand_config(APP_VERSION)
     })
 
 
@@ -2000,8 +1815,8 @@ def save_settings():
         
         if write_env_file(current_env):
             clear_config_cache()
-            _reload_runtime_env()
-            _refresh_runtime_services()
+            reload_runtime_env()
+            refresh_runtime_services()
 
             if 'ADMIN_EMAIL' in updates:
                 try:

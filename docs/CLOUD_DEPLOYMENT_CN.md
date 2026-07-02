@@ -1,48 +1,47 @@
 # QuantDinger 云服务器部署指南
 
-本文面向生产/准生产环境，使用云服务器 + Docker Compose 部署 QuantDinger，并补充域名、HTTPS、反向代理与前后端分离说明。
+本文说明当前版本 QuantDinger 在云服务器上的 Docker 部署方式，覆盖推荐的 GHCR 预构建镜像部署、可选源码部署、Nginx、HTTPS、升级和常见排错。
+
+首次安装时如果遇到 Docker 拉镜像或 Postgres 启动问题，也请参考 [安装排错指南](INSTALL_TROUBLESHOOTING.md)。
 
 ## 推荐架构
 
-推荐使用“同域名 + Nginx 反向代理”：
+推荐使用一个公网域名加宿主机 Nginx 反向代理：
 
-- 用户访问：`https://app.example.com`
-- 宿主机 Nginx：监听 `80/443`
-- Docker `frontend`：绑定到 `127.0.0.1:8888`
-- Docker `backend`：绑定到 `127.0.0.1:5000`
-- Docker `postgres`：绑定到 `127.0.0.1:5432`
+- Web 访问地址：`https://app.example.com`
+- 可选移动 H5 地址：`https://m.example.com`
+- 宿主机 Nginx 监听 `80/443`
+- Docker `frontend` 绑定到 `127.0.0.1:8888`
+- Docker `mobile` 绑定到 `127.0.0.1:8889`
+- Docker `backend` 绑定到 `127.0.0.1:5000`
+- Docker `postgres` 和 `redis` 只绑定本机地址
 
-这样做的好处：
+公网只开放 `80` 和 `443`。不要把 `5000`、`5432`、`6379` 暴露到公网。
 
-- 外网只暴露 `80/443`
-- 前端和 API 走同域名，最省心
-- 数据库与后端管理端口不直接暴露到公网
+## 1. 准备服务器
 
-## 1. 服务器准备
+推荐配置：
 
-建议配置：
+- Ubuntu 22.04 / 24.04 或 Debian 12
+- 最低 2 核 4 GB 内存；AI 使用较多时建议 4 核 8 GB
+- 30 GB 以上磁盘空间
+- 安全组或防火墙开放 `22`、`80`、`443`
+- 一个域名，例如 `app.example.com`
 
-- Ubuntu 22.04 / Debian 12
-- 2C4G 及以上
-- 已开放安全组端口：`22`、`80`、`443`
-- 已准备域名，例如 `app.example.com`
+配置 DNS：
 
-域名解析：
+```text
+app.example.com -> 服务器公网 IP
+m.example.com   -> 服务器公网 IP  # 可选移动 H5 域名
+```
 
-1. 在 DNS 服务商后台添加一条 `A` 记录
-2. 主机记录填 `app`
-3. 记录值填云服务器公网 IP
-4. 等待解析生效
-
-验证：
+验证解析：
 
 ```bash
 ping app.example.com
 ```
 
-## 2. 安装 Docker 与 Docker Compose
-
-Ubuntu / Debian 示例：
+## 2. 安装 Docker
 
 ```bash
 curl -fsSL https://get.docker.com | sh
@@ -52,111 +51,108 @@ docker --version
 docker compose version
 ```
 
-如果你的网络拉取 Docker Hub 较慢，可稍后通过项目根 `.env` 的 `IMAGE_PREFIX` 切换镜像源。
+请使用 Compose v2 命令：`docker compose ...`。
 
-## 3. 拉取项目
+## 3. 选择部署模式
+
+### 推荐：GHCR 预构建镜像部署
+
+普通云服务器部署建议使用这个模式。后端、Web 前端、移动 H5 都从 GHCR 拉取镜像，不需要在服务器上本地构建 Python 或 Node 项目。
+
+```bash
+mkdir -p ~/quantdinger
+cd ~/quantdinger
+curl -O https://raw.githubusercontent.com/brokermr810/QuantDinger/main/docker-compose.ghcr.yml
+curl -o backend.env https://raw.githubusercontent.com/brokermr810/QuantDinger/main/backend_api_python/env.example
+```
+
+首次启动前编辑 `backend.env`：
+
+```ini
+ADMIN_USER=your_admin_user
+ADMIN_PASSWORD=your_strong_password
+FRONTEND_URL=https://app.example.com,https://m.example.com
+ALLOW_LOCAL_DESKTOP_BROKERS=false
+```
+
+GHCR 后端入口脚本可以在首次启动时自动生成 `SECRET_KEY` 并写回 `backend.env`。你也可以手动设置一个足够长的随机字符串。
+
+可选：创建项目根目录 `.env`，用于 Docker Compose 编排配置：
+
+```ini
+FRONTEND_PORT=127.0.0.1:8888
+MOBILE_PORT=127.0.0.1:8889
+BACKEND_PORT=127.0.0.1:5000
+DB_PORT=127.0.0.1:5432
+REDIS_PORT=127.0.0.1:6379
+
+# 固定版本，避免一直使用 latest，例如：
+# IMAGE_TAG=3.0.10
+
+# postgres/redis 拉取慢时可设置 Docker Hub 镜像前缀：
+# IMAGE_PREFIX=docker.m.daocloud.io/library/
+```
+
+启动：
+
+```bash
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+docker compose -f docker-compose.ghcr.yml ps
+```
+
+### 可选：完整源码部署
+
+只有需要在服务器上基于本地源码构建后端时，才建议使用这个模式。
 
 ```bash
 git clone https://github.com/brokermr810/QuantDinger.git
 cd QuantDinger
-```
-
-## 4. 配置后端 `.env`
-
-复制模板：
-
-```bash
 cp backend_api_python/env.example backend_api_python/.env
-```
-
-生成并写入 `SECRET_KEY`：
-
-```bash
 ./scripts/generate-secret-key.sh
 ```
 
-至少检查并修改这些配置：
+编辑 `backend_api_python/.env`：
 
 ```ini
-ADMIN_USER=quantdinger
+ADMIN_USER=your_admin_user
 ADMIN_PASSWORD=your_strong_password
-SECRET_KEY=your_generated_secret
+FRONTEND_URL=https://app.example.com,https://m.example.com
+ALLOW_LOCAL_DESKTOP_BROKERS=false
 ```
 
-如果你需要 AI 功能，再补充至少一个模型提供商密钥，例如：
+也可以按上面的示例创建项目根目录 `.env`。
 
-```ini
-OPENROUTER_API_KEY=your_key
-```
-
-## 5. 配置项目根 `.env`
-
-项目根 `.env` 用于 Docker Compose 的端口和镜像源控制。
-
-推荐生产配置：
+启动：
 
 ```bash
-cp .env.example .env
+docker compose pull
+docker compose up -d --build
+docker compose ps
 ```
 
-编辑为：
+## 4. 理解两个 env 文件
 
-```ini
-FRONTEND_PORT=127.0.0.1:8888
-BACKEND_PORT=127.0.0.1:5000
-DB_PORT=127.0.0.1:5432
-IMAGE_PREFIX=
-```
+请区分这几类配置文件：
 
-说明：
+| 文件 | 使用方 | 用途 |
+|------|--------|------|
+| `backend.env` | `docker-compose.ghcr.yml` 的后端容器 | 应用运行时配置：管理员账号、`SECRET_KEY`、LLM key、OAuth、券商或交易所 key |
+| `backend_api_python/.env` | 完整源码部署的后端容器 | 源码部署时的应用运行时配置 |
+| 项目根目录 `.env` | Docker Compose | 端口、镜像 tag、镜像地址、Postgres 镜像和数据目录、镜像源 |
 
-- `FRONTEND_PORT=127.0.0.1:8888`：只允许宿主机本地访问，由外层 Nginx 转发
-- `BACKEND_PORT=127.0.0.1:5000`：避免后端 API 直接暴露公网
-- `DB_PORT=127.0.0.1:5432`：避免数据库端口暴露公网
-- `IMAGE_PREFIX=`：空值表示官方 Docker Hub
+除非 Compose 明确需要，不要把交易所 API key 这类业务密钥放到项目根目录 `.env`。
 
-如果拉镜像失败，可改成：
+## 5. 配置 Nginx
 
-```ini
-IMAGE_PREFIX=docker.m.daocloud.io/library/
-```
-
-或：
-
-```ini
-IMAGE_PREFIX=docker.xuanyuan.me/library/
-```
-
-## 6. 启动容器
-
-```bash
-docker-compose up -d --build
-docker-compose ps
-```
-
-查看日志：
-
-```bash
-docker-compose logs -f backend
-docker-compose logs -f frontend
-```
-
-此时服务通常已在本机监听：
-
-- `127.0.0.1:8888`
-- `127.0.0.1:5000`
-- `127.0.0.1:5432`
-
-## 7. 安装并配置 Nginx
-
-安装：
+安装 Nginx：
 
 ```bash
 sudo apt update
 sudo apt install -y nginx
 ```
 
-推荐站点配置 `/etc/nginx/sites-available/quantdinger.conf`：
+创建 `/etc/nginx/sites-available/quantdinger.conf`：
 
 ```nginx
 server {
@@ -174,7 +170,25 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
+
+server {
+    listen 80;
+    server_name m.example.com;
+
+    client_max_body_size 20m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8889;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
 ```
+
+如果不需要独立移动端域名，可以删除第二个 `server` 块。移动 H5 也可以通过你自己配置的端口、路径或域名访问。
 
 启用站点：
 
@@ -184,7 +198,7 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-如果启用了防火墙：
+如果使用 UFW：
 
 ```bash
 sudo ufw allow OpenSSH
@@ -192,71 +206,32 @@ sudo ufw allow 'Nginx Full'
 sudo ufw enable
 ```
 
-## 8. 配置 HTTPS（Let's Encrypt）
-
-安装 Certbot：
+## 6. 开启 HTTPS
 
 ```bash
 sudo apt install -y certbot python3-certbot-nginx
-```
-
-申请证书：
-
-```bash
-sudo certbot --nginx -d app.example.com
-```
-
-自动续期测试：
-
-```bash
+sudo certbot --nginx -d app.example.com -d m.example.com
 sudo certbot renew --dry-run
 ```
 
-完成后访问：
+如果只配置了 `app.example.com`，证书申请命令里只保留这个域名即可。
+
+访问：
 
 ```text
 https://app.example.com
+https://m.example.com
 ```
 
-## 9. 推荐生产模式：同域名部署
+## 7. 可选 API 子域名
 
-这是开源版最推荐的方式。
-
-原因：
-
-- 前端以预构建镜像（`ghcr.io/brokermr810/quantdinger-frontend`）方式拉取，无需本地构建
-- 前端容器内部已把 `/api/*` 代理到 Docker 网络中的 `backend:5000`
-- 用户只需要维护一个域名和一套 HTTPS
-
-拓扑如下：
+推荐部署方式是让 API 通过前端容器保持同源访问：
 
 ```text
-Browser
-  -> https://app.example.com
-  -> Host Nginx :443
-  -> 127.0.0.1:8888 (frontend container)
-  -> /api/* 再由 frontend 容器代理到 backend:5000
+Browser -> https://app.example.com -> 宿主机 Nginx -> frontend 容器 -> /api -> backend:5000
 ```
 
-## 10. 高级方案：前后端分离 / 双域名
-
-如果你希望：
-
-- 前端域名：`app.example.com`
-- API 域名：`api.example.com`
-
-可以使用双域名方案，但请注意：
-
-1. 需要前端能够把 API 指向 `api.example.com`
-2. 后端需要正确处理跨域
-3. 这种方式更适合有前端源码控制权或二次开发的部署场景
-
-宿主机 Nginx 可拆成两个站点：
-
-- `app.example.com` -> `127.0.0.1:8888`
-- `api.example.com` -> `127.0.0.1:5000`
-
-`api.example.com` 示例：
+如果确实需要 `api.example.com`，只通过 Nginx 暴露宿主机本地后端端口：
 
 ```nginx
 server {
@@ -276,172 +251,149 @@ server {
 }
 ```
 
-如果你只是想“前后端逻辑分离”，但不想处理跨域，建议仍使用同域名：
+同时在后端运行时 env 中设置 `FRONTEND_URL`，包含所有用户实际访问的前端域名。
 
-- `https://app.example.com/`
-- `https://app.example.com/api/`
+## 8. 常用运维
 
-## 11. 常用运维命令
-
-查看状态：
+GHCR 部署：
 
 ```bash
-docker-compose ps
+docker compose -f docker-compose.ghcr.yml ps
+docker compose -f docker-compose.ghcr.yml logs -f backend
+docker compose -f docker-compose.ghcr.yml logs -f postgres
+docker compose -f docker-compose.ghcr.yml restart backend
 ```
 
-查看日志：
+更新 GHCR 镜像：
 
 ```bash
-docker-compose logs -f backend
-docker-compose logs -f frontend
-docker-compose logs -f postgres
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-更新版本：
+完整源码部署更新：
 
 ```bash
 git pull
-docker-compose up -d --build
+docker compose pull
+docker compose up -d --build
 ```
 
-重启：
+大版本升级前建议先备份 Postgres：
 
 ```bash
-docker-compose restart backend
-docker-compose restart frontend
+docker exec quantdinger-db pg_dump -U quantdinger quantdinger > quantdinger_backup.sql
 ```
 
-停止：
+## 9. Postgres 18 和已有数据
+
+当前默认 Postgres 镜像是 `postgres:18.3-alpine`，`PGDATA=/var/lib/postgresql/18/docker`。
+
+如果已有数据卷是 Postgres 16 初始化的，不要直接用 Postgres 18 启动。请选择：
+
+- 继续使用匹配的 Postgres 16 镜像，直到完成迁移；
+- 使用 `pg_dump` 和 `pg_restore` 导出导入；
+- 使用正式的 `pg_upgrade` 大版本迁移流程。
+
+只有开发环境且数据库数据可以丢弃时，按你的部署模式选择命令。
+
+GHCR 部署：
 
 ```bash
-docker-compose down
+docker compose -f docker-compose.ghcr.yml down -v
+docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-## 12. 常见问题排查
+完整源码部署：
 
-### 1. 拉镜像失败
+```bash
+docker compose down -v
+docker compose up -d
+```
 
-现象：
+生产数据不要使用 `down -v`。
 
-- `failed to resolve source metadata`
-- `registry-1.docker.io`
-- `Docker Desktop has no HTTPS proxy`
+## 10. 常见问题
 
-处理：
+### 镜像拉取失败
+
+如果 `redis`、`postgres` 或 Docker Hub 镜像拉取失败，可在项目根目录 `.env` 设置镜像前缀：
 
 ```ini
 IMAGE_PREFIX=docker.m.daocloud.io/library/
 ```
 
-然后重新：
+然后重试：
 
 ```bash
-docker-compose up -d --build
+docker compose -f docker-compose.ghcr.yml pull
 ```
 
-### 2. 后端日志出现 `exec /usr/local/bin/docker-entrypoint.sh: no such file or directory`
-
-处理：
+如果 GHCR 镜像拉取失败：
 
 ```bash
-docker-compose build --no-cache backend
-docker-compose up -d backend
-```
-
-### 3. 前端日志出现 `host not found in upstream "backend"`
-
-通常表示后端没先起来。
-
-处理：
-
-```bash
-docker-compose ps
-docker-compose logs backend --tail=100
-docker-compose restart frontend
-```
-
-### 4. `docker compose up` 拉不到 `quantdinger-frontend`
-
-前端镜像托管在 GHCR（`ghcr.io/brokermr810/quantdinger-frontend`）。若拉取失败：
-
-```bash
+docker pull ghcr.io/brokermr810/quantdinger-backend:latest
 docker pull ghcr.io/brokermr810/quantdinger-frontend:latest
+docker pull ghcr.io/brokermr810/quantdinger-mobile:latest
+```
+
+常见原因包括网络阻断、包可见性不是 public、或者固定的 tag 不存在。
+
+### 后端启动后立刻退出
+
+查看日志：
+
+```bash
+docker compose -f docker-compose.ghcr.yml logs --tail=100 backend
 ```
 
 常见原因：
 
-- GHCR 包可见性是私有 —— 在 GitHub 上把包设为 public，或先 `docker login ghcr.io`
-- 网络封禁 GHCR —— 在项目根 `.env` 用 `FRONTEND_IMAGE` 指向国内镜像
-- `IMAGE_TAG`(或 `BACKEND_TAG` / `FRONTEND_TAG`)pin 的版本不存在 —— 回退到 `latest` 或选一个已发布的 semver tag
+- 后端 env 文件语法错误；
+- 完整源码部署时 `SECRET_KEY` 仍是默认占位值；
+- 数据库没有健康启动；
+- 手动覆盖了错误的 `DATABASE_URL`。
 
-### 5. 后台保存配置时报 `Read-only file system: '/app/.env'`
+### Nginx 502 或页面空白
 
-原因是 `backend_api_python/.env` 被只读挂载到容器内。
-
-请检查 `docker-compose.yml`，确保不要使用：
-
-```yaml
-- ./backend_api_python/.env:/app/.env:ro
-```
-
-而应改为可写挂载：
-
-```yaml
-- ./backend_api_python/.env:/app/.env
-```
-
-然后执行：
+先检查本机服务：
 
 ```bash
-docker-compose up -d backend
+curl http://127.0.0.1:8888/health
+curl http://127.0.0.1:8889/health
+curl http://127.0.0.1:5000/api/health
+sudo nginx -t
 ```
 
-### 6. Docker 内代理不生效
+再检查容器：
 
-如果宿主机代理监听在本机 `127.0.0.1:10808`，容器内不能直接写 `127.0.0.1`，因为那会指向容器自己。
+```bash
+docker compose -f docker-compose.ghcr.yml ps
+docker compose -f docker-compose.ghcr.yml logs --tail=100 frontend
+docker compose -f docker-compose.ghcr.yml logs --tail=100 backend
+```
 
-Docker 部署请改为：
+### 交易所或 LLM 出网需要代理
+
+后端运行时请求外网需要代理时，在 `backend.env` 或 `backend_api_python/.env` 设置 `PROXY_URL`。
+
+在 Docker 容器内不要直接写宿主机的 `127.0.0.1`，除非代理就在同一个容器里。可以使用容器可访问的宿主机地址，例如：
 
 ```ini
 PROXY_URL=socks5h://host.docker.internal:10808
 ```
 
-### 7. 交易所日志出现 `symbol not found`
+Linux 服务器上可能需要把代理监听到内网地址，或配置 Docker host gateway。
 
-如果你已经确认代理和外网访问正常，但日志仍出现某些币对不存在，例如：
+### 公网端口
 
-```text
-Symbol 'MATIC/USDT' not found on okx
-```
+不要公开这些端口：
 
-这通常是交易所的符号映射/代币更名问题，不一定是网络故障。
-
-### 8. Nginx 502 / 504
-
-检查：
-
-```bash
-docker-compose ps
-curl http://127.0.0.1:8888/health
-curl http://127.0.0.1:5000/api/health
-sudo nginx -t
-```
-
-### 9. 数据库不应暴露公网
-
-生产环境建议：
-
-```ini
-DB_PORT=127.0.0.1:5432
-```
-
-不要开放：
-
-- `5432`
 - `5000`
+- `5432`
+- `6379`
 
 公网只开放：
 
 - `80`
 - `443`
-

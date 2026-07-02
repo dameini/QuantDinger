@@ -1,4 +1,4 @@
-# QuantDinger API conventions (OpenAPI SSOT)
+﻿# QuantDinger API conventions (OpenAPI SSOT)
 
 This document defines the **contract rules** for QuantDinger HTTP APIs.
 Machine-readable specs:
@@ -89,7 +89,7 @@ Tag or extension every operation when migrating to flask-smorest:
 
 **Public modules (migration priority):** `community`, `market`, `indicator`, `backtest`, `global-market`, `health`.
 
-**Internal / sensitive:** `strategy`, `credentials`, `billing`, `quick-trade`, broker adapters (`ibkr`, `alpaca`, `mt5`).
+**Internal / sensitive:** `strategy`, `credentials`, `billing`, `quick-trade`, broker adapters (`ibkr`, `alpaca`).
 
 ---
 
@@ -141,3 +141,4 @@ Local interactive docs (debug mode): `/api/docs/swagger` and `/api/docs/redoc` w
 | All other modules | Legacy Flask Blueprint | Not yet in `openapi.yaml` |
 
 Phase 1+ will migrate `community`, `market`, etc. incrementally.
+

@@ -27,7 +27,7 @@ credentials_blp = Blueprint('credentials', __name__)
 @login_required
 def desktop_brokers_policy():
     """
-    Whether IBKR / MT5 (local TWS or MT5 terminal) may be configured on this deployment.
+    Whether IBKR (local TWS or IB Gateway) may be configured on this deployment.
     Frontend uses this to disable options and show guidance before save/test.
     """
     from app.utils.local_brokers import desktop_broker_cloud_reject_message, local_desktop_brokers_allowed
@@ -138,7 +138,7 @@ def get_egress_ip():
 def create_credential():
     """Create a new credential for the current user.
 
-    Supports crypto exchanges, IBKR (US stocks) and MT5 (Forex).
+    Supports crypto exchanges, IBKR (US stocks), and Alpaca.
     """
     try:
         user_id = g.user_id
@@ -149,7 +149,7 @@ def create_credential():
         if not exchange_id:
             return jsonify({'code': 0, 'msg': 'Missing exchange_id', 'data': None}), 400
 
-        if exchange_id in ('ibkr', 'mt5'):
+        if exchange_id == 'ibkr':
             from app.utils.local_brokers import desktop_broker_cloud_reject_message, local_desktop_brokers_allowed
 
             if not local_desktop_brokers_allowed():
@@ -195,20 +195,6 @@ def create_credential():
                 'ibkr_account': (data.get('ibkr_account') or '').strip()
             })
             hint = f"{config['ibkr_host']}:{config['ibkr_port']}"
-        elif exchange_id == 'mt5':
-            # MetaTrader 5 (Forex)
-            mt5_server = (data.get('mt5_server') or '').strip()
-            mt5_login = str(data.get('mt5_login') or '').strip()
-            mt5_password = (data.get('mt5_password') or '').strip()
-            if not mt5_server or not mt5_login or not mt5_password:
-                return jsonify({'code': 0, 'msg': 'Missing mt5_server/mt5_login/mt5_password', 'data': None}), 400
-            config.update({
-                'mt5_server': mt5_server,
-                'mt5_login': mt5_login,
-                'mt5_password': mt5_password,
-                'mt5_terminal_path': (data.get('mt5_terminal_path') or '').strip()
-            })
-            hint = f"{mt5_server}/{mt5_login}"
         elif exchange_id in CRYPTO_EXCHANGES:
             # Crypto exchanges
             api_key = (data.get('api_key') or '').strip()

@@ -6,7 +6,7 @@ Provides placeholder conversion for backward compatibility with legacy code.
 
 Pool tuning (all via env, safe defaults):
     DB_POOL_MIN               minconn                       default 5
-    DB_POOL_MAX               maxconn                       default 50
+    DB_POOL_MAX               maxconn or "auto"             default auto
     DB_POOL_ACQUIRE_TIMEOUT   seconds to wait on exhaustion default 10
     DB_POOL_HEALTH_CHECK      "true" / "false"              default "true"
 """
@@ -43,6 +43,21 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_optional_int(key: str) -> Optional[int]:
+    raw = os.getenv(key)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if not value or value in ("auto", "default"):
+        return None
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    except Exception:
+        logger.warning("Invalid %s=%r; using auto", key, raw)
+        return None
+
+
 def _env_bool(key: str, default: bool) -> bool:
     v = os.getenv(key)
     if v is None:
@@ -51,9 +66,14 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 DB_POOL_MIN = _env_int("DB_POOL_MIN", 5)
-DB_POOL_MAX = _env_int("DB_POOL_MAX", 50)
+DB_POOL_MAX_CONFIGURED = _env_optional_int("DB_POOL_MAX")
+DB_POOL_AUTO_DEFAULT_MAX = _env_int("DB_POOL_AUTO_DEFAULT_MAX", 50)
+DB_POOL_MAX = DB_POOL_MAX_CONFIGURED or DB_POOL_AUTO_DEFAULT_MAX
 DB_POOL_ACQUIRE_TIMEOUT = _env_int("DB_POOL_ACQUIRE_TIMEOUT", 10)
 DB_POOL_HEALTH_CHECK = _env_bool("DB_POOL_HEALTH_CHECK", True)
+DB_POOL_AUTO_CAP = _env_bool("DB_POOL_AUTO_CAP", True)
+DB_POOL_RESERVE_FOR_OTHER_CLIENTS = _env_int("DB_POOL_RESERVE_FOR_OTHER_CLIENTS", 20)
+DB_APPLICATION_NAME = os.getenv("DB_APPLICATION_NAME", "quantdinger_api").strip() or "quantdinger_api"
 
 
 def _get_database_url() -> str:
@@ -126,16 +146,19 @@ def _get_connection_pool():
         if not params:
             raise RuntimeError(f"Invalid DATABASE_URL format: {db_url}")
         
+        effective_min, effective_max = _resolve_effective_pool_limits(params)
+
         try:
             _connection_pool = pool.ThreadedConnectionPool(
-                minconn=DB_POOL_MIN,
-                maxconn=DB_POOL_MAX,
+                minconn=effective_min,
+                maxconn=effective_max,
                 host=params.get('host', 'localhost'),
                 port=params.get('port', 5432),
                 user=params.get('user', 'quantdinger'),
                 password=params.get('password', ''),
                 dbname=params.get('dbname', 'quantdinger'),
                 connect_timeout=10,
+                application_name=DB_APPLICATION_NAME,
                 # Apply timezone at connection establishment so we don't need
                 # per-checkout SET TIME ZONE (which left connections in an
                 # "idle in transaction" state when no explicit commit/rollback
@@ -150,7 +173,8 @@ def _get_connection_pool():
             logger.info(
                 f"PostgreSQL connection pool created: "
                 f"{params.get('host')}:{params.get('port')}/{params.get('dbname')} "
-                f"(min={DB_POOL_MIN}, max={DB_POOL_MAX}, "
+                f"(min={effective_min}, max={effective_max}, "
+                f"configured_min={DB_POOL_MIN}, configured_max={_pool_max_config_label()}, "
                 f"acquire_timeout={DB_POOL_ACQUIRE_TIMEOUT}s, "
                 f"health_check={DB_POOL_HEALTH_CHECK})"
             )
@@ -159,6 +183,129 @@ def _get_connection_pool():
             raise
         
         return _connection_pool
+
+
+def _show_pg_int(conn, setting: str, default: int = 0) -> int:
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SHOW {setting}")
+        row = cur.fetchone()
+        return int(row[0]) if row else default
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return default
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+def _probe_pg_connection_limit(params: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Read PostgreSQL connection limits using a short-lived probe connection."""
+    if not DB_POOL_AUTO_CAP:
+        return None
+    probe = None
+    try:
+        probe = psycopg2.connect(
+            host=params.get('host', 'localhost'),
+            port=params.get('port', 5432),
+            user=params.get('user', 'quantdinger'),
+            password=params.get('password', ''),
+            dbname=params.get('dbname', 'quantdinger'),
+            connect_timeout=5,
+            application_name=f"{DB_APPLICATION_NAME}_pool_probe",
+            options="-c timezone=UTC",
+        )
+        max_connections = _show_pg_int(probe, "max_connections", 0)
+        superuser_reserved = _show_pg_int(probe, "superuser_reserved_connections", 0)
+        reserved = _show_pg_int(probe, "reserved_connections", 0)
+        if max_connections <= 0:
+            return None
+        return {
+            "max_connections": max_connections,
+            "superuser_reserved_connections": superuser_reserved,
+            "reserved_connections": reserved,
+        }
+    except Exception as exc:
+        logger.warning("Could not probe PostgreSQL max_connections; using configured DB pool limits: %s", exc)
+        return None
+    finally:
+        if probe is not None:
+            try:
+                probe.close()
+            except Exception:
+                pass
+
+
+def _resolve_effective_pool_limits(params: Dict[str, Any]) -> tuple[int, int]:
+    """Cap per-process pool size so app pools cannot exceed PostgreSQL capacity.
+
+    psycopg2's pool max is per Python process. With Gunicorn, total possible
+    DB connections is roughly GUNICORN_WORKERS * DB_POOL_MAX, plus pgAdmin,
+    psql, migrations, and Postgres reserved slots. If DB_POOL_MAX is larger
+    than server max_connections, PostgreSQL rejects new sockets with
+    "sorry, too many clients already" before the application pool can queue.
+    """
+    configured_min = max(1, DB_POOL_MIN)
+    explicit_max = DB_POOL_MAX_CONFIGURED
+    default_auto_max = max(configured_min, DB_POOL_AUTO_DEFAULT_MAX)
+    limits = _probe_pg_connection_limit(params)
+    if not limits:
+        configured_max = max(configured_min, explicit_max or default_auto_max)
+        if explicit_max is None:
+            logger.info(
+                "DB_POOL_MAX=auto selected fallback max=%s because PostgreSQL limits could not be probed.",
+                configured_max,
+            )
+        return configured_min, configured_max
+
+    pg_max = int(limits.get("max_connections") or 0)
+    pg_reserved = int(limits.get("superuser_reserved_connections") or 0)
+    pg_reserved += int(limits.get("reserved_connections") or 0)
+    workers = _env_int("GUNICORN_WORKERS", 1)
+    usable_total = max(1, pg_max - pg_reserved - DB_POOL_RESERVE_FOR_OTHER_CLIENTS)
+    per_process_cap = max(1, usable_total // max(1, workers))
+
+    if explicit_max is None:
+        configured_max = default_auto_max
+        effective_max = min(configured_max, per_process_cap)
+        logger.info(
+            "DB_POOL_MAX=auto selected max=%s "
+            "(postgres max_connections=%s, reserved=%s, reserve_for_other_clients=%s, "
+            "gunicorn_workers=%s, auto_default_max=%s).",
+            effective_max,
+            pg_max,
+            pg_reserved,
+            DB_POOL_RESERVE_FOR_OTHER_CLIENTS,
+            workers,
+            default_auto_max,
+        )
+    else:
+        configured_max = max(configured_min, explicit_max)
+        effective_max = min(configured_max, per_process_cap)
+    effective_min = min(configured_min, effective_max)
+    if explicit_max is not None and effective_max < configured_max:
+        logger.warning(
+            "DB_POOL_MAX=%s exceeds safe PostgreSQL capacity; using effective max=%s "
+            "(postgres max_connections=%s, reserved=%s, reserve_for_other_clients=%s, "
+            "gunicorn_workers=%s). Use DB_POOL_MAX=auto, lower DB_POOL_MAX/DB_POOL_RESERVE_FOR_OTHER_CLIENTS, "
+            "or raise PostgreSQL max_connections if needed.",
+            configured_max,
+            effective_max,
+            pg_max,
+            pg_reserved,
+            DB_POOL_RESERVE_FOR_OTHER_CLIENTS,
+            workers,
+        )
+    return effective_min, effective_max
+
+
+def _pool_max_config_label() -> str:
+    return str(DB_POOL_MAX_CONFIGURED) if DB_POOL_MAX_CONFIGURED is not None else "auto"
 
 
 def _is_connection_healthy(conn) -> bool:
@@ -203,15 +350,45 @@ def _acquire_conn_with_wait(pg_pool):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.error(
-                    f"PostgreSQL pool exhausted: all {DB_POOL_MAX} connections are in use "
-                    f"and waiting {DB_POOL_ACQUIRE_TIMEOUT}s did not free any. "
-                    f"Consider raising DB_POOL_MAX or investigating long-running queries."
+                    "PostgreSQL pool exhausted: all %s connections are in use and waiting %ss "
+                    "did not free any. stats=%s. Consider lowering request concurrency or "
+                    "investigating long-running DB sections.",
+                    getattr(pg_pool, "maxconn", DB_POOL_MAX),
+                    DB_POOL_ACQUIRE_TIMEOUT,
+                    _pool_stats(pg_pool),
                 )
                 raise
             if not warned:
                 logger.warning(
-                    f"PostgreSQL pool exhausted ({DB_POOL_MAX} in use); "
-                    f"waiting up to {DB_POOL_ACQUIRE_TIMEOUT}s for a slot..."
+                    "PostgreSQL pool exhausted (%s in use); waiting up to %ss for a slot. stats=%s",
+                    getattr(pg_pool, "maxconn", DB_POOL_MAX),
+                    DB_POOL_ACQUIRE_TIMEOUT,
+                    _pool_stats(pg_pool),
+                )
+                warned = True
+            time.sleep(min(backoff, max(0.0, remaining)))
+            backoff = min(backoff * 2, 0.5)
+            continue
+        except OperationalError as e:
+            last_err = e
+            if "too many clients already" not in str(e).lower():
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error(
+                    "PostgreSQL server refused connections for %ss: too many clients already. "
+                    "pool_stats=%s. Lower DB_POOL_MAX/request concurrency or raise PostgreSQL "
+                    "max_connections.",
+                    DB_POOL_ACQUIRE_TIMEOUT,
+                    _pool_stats(pg_pool),
+                )
+                raise
+            if not warned:
+                logger.warning(
+                    "PostgreSQL server is at max_connections; waiting up to %ss before failing. "
+                    "pool_stats=%s",
+                    DB_POOL_ACQUIRE_TIMEOUT,
+                    _pool_stats(pg_pool),
                 )
                 warned = True
             time.sleep(min(backoff, max(0.0, remaining)))
@@ -232,6 +409,25 @@ def _acquire_conn_with_wait(pg_pool):
             continue
 
         return conn
+
+
+def _pool_stats(pg_pool) -> Dict[str, int]:
+    try:
+        idle = len(getattr(pg_pool, "_pool", []) or [])
+    except Exception:
+        idle = -1
+    try:
+        used = len(getattr(pg_pool, "_used", {}) or {})
+    except Exception:
+        used = -1
+    opened = idle + used if idle >= 0 and used >= 0 else -1
+    return {
+        "min": int(getattr(pg_pool, "minconn", -1) or -1),
+        "max": int(getattr(pg_pool, "maxconn", -1) or -1),
+        "idle": idle,
+        "used": used,
+        "opened": opened,
+    }
 
 
 class PostgresCursor:

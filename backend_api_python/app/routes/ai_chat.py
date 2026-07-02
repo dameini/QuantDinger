@@ -1,4 +1,4 @@
-﻿"""AI Copilot chat routes.
+"""AI Copilot chat routes.
 
 The Copilot is intentionally thin: it stores conversations, accepts optional
 chart screenshots, charges credits through the central billing service, and
@@ -9,11 +9,9 @@ from __future__ import annotations
 import json
 import math
 import re
-from io import BytesIO
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 
-import requests
 from flask import Response, g, jsonify, request, stream_with_context
 
 from app.openapi.blueprint import HumanBlueprint as Blueprint
@@ -29,6 +27,21 @@ from app.services.ai_skill_registry import (
     set_skill_enabled,
 )
 from app.services.ai_tool_registry import build_tool_prompt, public_tool_registry
+from app.services.ai_copilot_store import (
+    create_session as store_create_session,
+    detect_memory_candidates as store_detect_memory_candidates,
+    ensure_tables as store_ensure_tables,
+    get_session as store_get_session,
+    get_user_memories as store_get_user_memories,
+    insert_message as store_insert_message,
+    json_dumps as store_json_dumps,
+    json_loads as store_json_loads,
+    load_recent_messages as store_load_recent_messages,
+    now_utc as store_now_utc,
+    row_to_dict as store_row_to_dict,
+    title_from_message as store_title_from_message,
+)
+from app.services.ai_report_pdf import build_ai_report_pdf
 from app.services.kline import KlineService
 from app.services.llm import LLMService
 from app.services.search import get_search_service
@@ -50,11 +63,11 @@ ALLOWED_IMAGE_MIME = {"image/png", "image/jpeg", "image/webp"}
 
 
 def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+    return store_now_utc()
 
 
 def _json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return store_json_dumps(value)
 
 
 def _plain_text(value: Any) -> str:
@@ -66,156 +79,26 @@ def _plain_text(value: Any) -> str:
 
 
 def _row_to_dict(row: Any) -> dict:
-    return dict(row or {})
+    return store_row_to_dict(row)
 
 
 def _json_loads(value: Any, default: Any = None) -> Any:
-    if value is None or value == "":
-        return default
-    try:
-        return json.loads(value)
-    except Exception:
-        return default
+    return store_json_loads(value, default)
 
 
 def _get_user_memories(cur, user_id: int, limit: int = 12) -> list[dict]:
-    try:
-        cur.execute(
-            """
-            SELECT id, category, title, content, confidence, updated_at
-            FROM qd_ai_user_memories
-            WHERE user_id = ? AND is_active = TRUE
-            ORDER BY updated_at DESC, id DESC
-            LIMIT ?
-            """,
-            (user_id, int(limit)),
-        )
-        rows = cur.fetchall() or []
-        return [_row_to_dict(r) for r in rows]
-    except Exception as e:
-        logger.debug(f"Failed to load user memories: {e}")
-        return []
+    return store_get_user_memories(cur, user_id, limit)
 
 
 def _detect_memory_candidates(message: str, language: str) -> list[dict]:
-    text = (message or "").strip()
-    if len(text) < 8:
-        return []
-    lower = text.lower()
-    zh = (language or "").lower().startswith("zh")
-    markers = [
-        "我偏好", "我的偏好", "我喜欢", "我不喜欢", "不要", "不希望", "风险偏好", "交易周期",
-        "timeframe", "risk profile", "i prefer", "i like", "i don't want", "avoid", "do not"
-    ]
-    if not any(m.lower() in lower for m in markers):
-        return []
-    title = "交易偏好" if zh else "Trading preference"
-    if any(m in lower for m in ("不要", "不希望", "avoid", "don't want", "do not")):
-        title = "交易限制" if zh else "Trading constraint"
-    return [{
-        "category": "preference",
-        "title": title,
-        "content": text[:500],
-        "confidence": 75,
-    }]
+    return store_detect_memory_candidates(message, language)
 
 
 def _ensure_tables(cur) -> None:
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS qd_ai_copilot_sessions (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            title VARCHAR(160),
-            context_symbol VARCHAR(64),
-            context_market VARCHAR(32),
-            context_strategy_id INTEGER,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS qd_ai_copilot_messages (
-            id SERIAL PRIMARY KEY,
-            session_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            role VARCHAR(16) NOT NULL,
-            content TEXT NOT NULL,
-            attachments_json TEXT,
-            actions_json TEXT,
-            report_json TEXT,
-            report_target_json TEXT,
-            report_error TEXT,
-            report_error_tone VARCHAR(32),
-            intent VARCHAR(48),
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS qd_ai_copilot_tool_calls (
-            id SERIAL PRIMARY KEY,
-            session_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            tool_name VARCHAR(64) NOT NULL,
-            status VARCHAR(24) NOT NULL,
-            input_json TEXT,
-            output_json TEXT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS qd_ai_user_memories (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            category VARCHAR(48) NOT NULL DEFAULT 'preference',
-            title VARCHAR(160) NOT NULL,
-            content TEXT NOT NULL,
-            source VARCHAR(48) DEFAULT 'copilot',
-            confidence INTEGER DEFAULT 70,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
-        )
-        """
-    )
-    for ddl in (
-        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS actions_json TEXT",
-        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS report_json TEXT",
-        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS report_target_json TEXT",
-        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS report_error TEXT",
-        "ALTER TABLE qd_ai_copilot_messages ADD COLUMN IF NOT EXISTS report_error_tone VARCHAR(32)",
-    ):
-        try:
-            cur.execute(ddl)
-        except Exception:
-            try:
-                cur.execute(ddl.replace(" IF NOT EXISTS", ""))
-            except Exception:
-                # SQLite compatibility in older local deployments.
-                pass
-    for ddl in (
-        "CREATE INDEX IF NOT EXISTS idx_qd_ai_copilot_sessions_user ON qd_ai_copilot_sessions(user_id, updated_at)",
-        "CREATE INDEX IF NOT EXISTS idx_qd_ai_copilot_messages_session ON qd_ai_copilot_messages(session_id, id)",
-        "CREATE INDEX IF NOT EXISTS idx_qd_ai_user_memories_user ON qd_ai_user_memories(user_id, is_active, updated_at)",
-    ):
-        try:
-            cur.execute(ddl)
-        except Exception:
-            pass
-
+    store_ensure_tables(cur)
 
 def _title_from_message(message: str) -> str:
-    title = re.sub(r"\s+", " ", (message or "").strip())
-    if not title:
-        return "New Copilot Chat"
-    return title[:60]
-
+    return store_title_from_message(message)
 
 def _detect_intent(message: str, has_image: bool) -> str:
     text = (message or "").lower()
@@ -482,92 +365,46 @@ def _attachment_meta(attachments: list[dict]) -> list[dict]:
 
 
 def _get_session(cur, user_id: int, session_id: int | None) -> dict | None:
-    if not session_id:
-        return None
-    cur.execute(
-        "SELECT * FROM qd_ai_copilot_sessions WHERE id = ? AND user_id = ?",
-        (session_id, user_id),
-    )
-    row = cur.fetchone()
-    return _row_to_dict(row) if row else None
+    return store_get_session(cur, user_id, session_id)
 
 
 def _create_session(cur, user_id: int, title: str, context: dict) -> int:
-    cur.execute(
-        """
-        INSERT INTO qd_ai_copilot_sessions
-        (user_id, title, context_symbol, context_market, context_strategy_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        RETURNING id
-        """,
-        (
-            user_id,
-            title,
-            (context.get("symbol") or "")[:64],
-            (context.get("market") or "")[:32],
-            context.get("strategy_id"),
-            _now_utc(),
-            _now_utc(),
-        ),
-    )
-    row = cur.fetchone()
-    return int(row["id"] if isinstance(row, dict) else row[0])
+    return store_create_session(cur, user_id, title, context)
 
 
 def _insert_message(
     cur,
+    *,
     session_id: int,
     user_id: int,
     role: str,
     content: str,
-    attachments: list[dict],
-    intent: str,
+    attachments: list[dict] | None = None,
     actions: list[dict] | None = None,
     report: dict | None = None,
     report_target: dict | None = None,
     report_error: str | None = None,
     report_error_tone: str | None = None,
+    intent: str | None = None,
 ) -> int:
-    cur.execute(
-        """
-        INSERT INTO qd_ai_copilot_messages
-        (session_id, user_id, role, content, attachments_json, actions_json, report_json, report_target_json, report_error, report_error_tone, intent, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        RETURNING id
-        """,
-        (
-            session_id,
-            user_id,
-            role,
-            content,
-            _json_dumps(_attachment_meta(attachments)) if attachments else None,
-            _json_dumps(actions or []) if actions else None,
-            _json_dumps(report) if isinstance(report, dict) and report else None,
-            _json_dumps(report_target) if isinstance(report_target, dict) and report_target else None,
-            str(report_error or "")[:1000] if report_error else None,
-            str(report_error_tone or "")[:32] if report_error_tone else None,
-            intent,
-            _now_utc(),
-        ),
+    return store_insert_message(
+        cur,
+        session_id=session_id,
+        user_id=user_id,
+        role=role,
+        content=content,
+        attachments=attachments,
+        actions=actions,
+        report=report,
+        report_target=report_target,
+        report_error=report_error,
+        report_error_tone=report_error_tone,
+        intent=intent,
     )
-    row = cur.fetchone()
-    return int(row["id"] if isinstance(row, dict) else row[0])
 
 
 def _load_recent_messages(cur, session_id: int, limit: int = 12) -> list[dict]:
-    cur.execute(
-        """
-        SELECT role, content, attachments_json, actions_json, intent, created_at
-        FROM qd_ai_copilot_messages
-        WHERE session_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (session_id, limit),
-    )
-    rows = cur.fetchall() or []
-    return [_row_to_dict(r) for r in reversed(rows)]
-
+    return store_load_recent_messages(cur, session_id, limit)
 
 def _to_float(value: Any, default: float | None = None) -> float | None:
     try:
@@ -643,8 +480,6 @@ def _summarize_klines(klines: list[dict], timeframe: str) -> dict:
         return {"timeframe": timeframe, "available": False, "bars": len(clean)}
 
     closes = [x["close"] for x in clean]
-    highs = [x["high"] for x in clean]
-    lows = [x["low"] for x in clean]
     volumes = [x["volume"] for x in clean if x["volume"] is not None]
     last = clean[-1]
     ema20 = _ema(closes, 20)
@@ -997,7 +832,7 @@ def _search_intelligence(message: str, candidates: list[dict], language: str) ->
 
 def _macro_intelligence(message: str) -> dict:
     text = (message or "").lower()
-    if not any(k in text for k in ("非农", "nfp", "cpi", "fomc", "fed", "利率", "就业", "失业", "pce", "gdp", "通胀", "macro", "payroll")):
+    if not any(k in text for k in ("非农", "nfp", "cpi", "fomc", "fed", "利率", "就业", "失业", "pce", "gdp", "通胀", "宏观", "macro", "payroll", "inflation", "rate")):
         return {}
     profile = _macro_question_profile(message)
     try:
@@ -1029,11 +864,11 @@ def _macro_question_profile(message: str) -> dict:
         indicator = "US_NONFARM_PAYROLLS"
         aliases = ["nonfarm payroll", "non farm payroll", "nfp", "非农", "就业人口"]
         country = "US"
-    elif any(k in text for k in ("cpi", "通胀", "inflation")):
+    elif any(k in text for k in ("cpi", "通胀", "inflation", "consumer price")):
         indicator = "US_CPI"
         aliases = ["cpi", "consumer price index", "通胀", "消费者物价"]
-        country = "US" if any(k in text for k in ("美国", "us", "u.s", "america")) else ""
-    elif any(k in text for k in ("fomc", "fed", "利率", "降息", "加息")):
+        country = "US"
+    elif any(k in text for k in ("fomc", "fed", "利率", "降息", "加息", "rate")):
         indicator = "FOMC_RATE_DECISION"
         aliases = ["fomc", "fed", "federal funds", "interest rate", "利率", "降息", "加息"]
         country = "US" if any(k in text for k in ("美国", "us", "u.s", "america", "fed", "fomc")) else ""
@@ -1074,8 +909,10 @@ def _filter_macro_events(events: list[dict], profile: dict) -> list[dict]:
             str(event.get(key) or "")
             for key in ("event", "event_en", "name", "title", "country", "country_code", "category", "description")
         ).lower()
+        if country and country not in haystack:
+            continue
         score = sum(2 for alias in aliases if alias and alias in haystack)
-        if score and country and country in haystack:
+        if score and country:
             score += 1
         if score:
             scored.append((score, event))
@@ -1104,15 +941,41 @@ def _macro_release_lookup(message: str, profile: dict, events: list[dict], paylo
         "setup_guidance": [],
     }
 
-    event_value = _extract_macro_value_from_events(events)
-    if event_value.get("actual") is not None or event_value.get("forecast") is not None or event_value.get("previous") is not None:
-        result.update(event_value)
+    calendar_value = _extract_macro_value_from_events(events)
+    if calendar_value.get("actual") is not None:
+        result.update(calendar_value)
         result["status"] = "ok"
-        result["answerable"] = result.get("actual") is not None
+        result["answerable"] = True
         result["source_chain"].append("economic_calendar")
         return result
+    if calendar_value.get("forecast") is not None or calendar_value.get("previous") is not None:
+        result["provider_status"]["calendar_release"] = calendar_value
+        result.update(calendar_value)
+        result["status"] = "partial_calendar"
+        result["source_chain"].append("economic_calendar")
+
+    if indicator == "US_CPI":
+        bls_value = _fetch_bls_cpi()
+        result["source_chain"].append("bls_public_api")
+        if bls_value.get("status") == "ok":
+            result.update(bls_value)
+            if result.get("forecast") is None and calendar_value.get("forecast") is not None:
+                result["forecast"] = calendar_value.get("forecast")
+            result["answerable"] = True
+            return result
+        result["provider_status"]["bls"] = bls_value
 
     if indicator == "US_NONFARM_PAYROLLS":
+        bls_value = _fetch_bls_nonfarm_payrolls()
+        result["source_chain"].append("bls_public_api")
+        if bls_value.get("status") == "ok":
+            result.update(bls_value)
+            if result.get("forecast") is None and calendar_value.get("forecast") is not None:
+                result["forecast"] = calendar_value.get("forecast")
+            result["answerable"] = True
+            return result
+        result["provider_status"]["bls"] = bls_value
+
         akshare_value = _fetch_akshare_nonfarm_payrolls()
         result["source_chain"].append("akshare_macro_usa_non_farm")
         if akshare_value.get("status") == "ok":
@@ -1120,14 +983,6 @@ def _macro_release_lookup(message: str, profile: dict, events: list[dict], paylo
             result["answerable"] = True
             return result
         result["provider_status"]["akshare_non_farm"] = akshare_value
-
-        bls_value = _fetch_bls_nonfarm_payrolls()
-        result["source_chain"].append("bls_public_api")
-        if bls_value.get("status") == "ok":
-            result.update(bls_value)
-            result["answerable"] = True
-            return result
-        result["provider_status"]["bls"] = bls_value
 
     search_value = _macro_search_lookup(message, profile)
     result["source_chain"].append("web_search")
@@ -1172,27 +1027,88 @@ def _first_present(obj: dict, keys: tuple[str, ...]) -> Any:
     return None
 
 
-def _fetch_bls_nonfarm_payrolls() -> dict:
-    current_year = _now_utc().year
-    url = "https://api.bls.gov/publicAPI/v2/timeseries/data/CES0000000001"
-    params = {"startyear": str(current_year - 1), "endyear": str(current_year)}
-    try:
-        response = requests.get(url, params=params, timeout=4)
-        response.raise_for_status()
-        data = response.json()
-        series = (((data.get("Results") or {}).get("series") or [{}])[0].get("data") or [])
-        points = []
-        for item in series:
-            period = str(item.get("period") or "")
-            if not period.startswith("M") or period == "M13":
-                continue
+def _bls_monthly_points(series: list[dict]) -> list[tuple[int, int, float, dict]]:
+    points: list[tuple[int, int, float, dict]] = []
+    for item in series or []:
+        period = str(item.get("period") or "")
+        if not period.startswith("M") or period == "M13":
+            continue
+        try:
             year = int(item.get("year"))
             month = int(period[1:])
             value = float(item.get("value"))
-            points.append((year, month, value, item))
-        points.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        except Exception:
+            continue
+        points.append((year, month, value, item))
+    points.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return points
+
+
+def _fetch_bls_cpi() -> dict:
+    current_year = _now_utc().year
+    series_id = "CUSR0000SA0"
+    try:
+        data = get_macro_series_provider().fetch_bls_series([series_id], current_year - 2, current_year)
+        series = ((data.get("series") or [{}])[0].get("data") or [])
+        points = _bls_monthly_points(series)
+        if len(points) < 13:
+            return {
+                "status": "empty",
+                "message": "BLS returned fewer than 13 monthly CPI observations.",
+                "bls_status": data.get("status"),
+                "bls_messages": data.get("messages") or [],
+            }
+        latest = points[0]
+        previous_month = points[1]
+        same_month_last_year = next((p for p in points if p[0] == latest[0] - 1 and p[1] == latest[1]), None)
+        prior_same_month_last_year = next((p for p in points if p[0] == previous_month[0] - 1 and p[1] == previous_month[1]), None)
+        if not same_month_last_year:
+            return {"status": "empty", "message": "BLS CPI series has no same-month prior-year observation."}
+        yoy_pct = ((latest[2] / same_month_last_year[2]) - 1.0) * 100.0
+        mom_pct = ((latest[2] / previous_month[2]) - 1.0) * 100.0 if previous_month[2] else None
+        previous_yoy_pct = (
+            ((previous_month[2] / prior_same_month_last_year[2]) - 1.0) * 100.0
+            if prior_same_month_last_year and prior_same_month_last_year[2]
+            else None
+        )
+        return {
+            "status": "ok",
+            "actual": round(yoy_pct, 2),
+            "forecast": None,
+            "previous": round(previous_yoy_pct, 2) if previous_yoy_pct is not None else None,
+            "period": f"{latest[0]}-{latest[1]:02d}",
+            "release_time": "",
+            "unit": "CPI-U seasonally adjusted, year-over-year percent change",
+            "details": {
+                "series_id": series_id,
+                "index_level": latest[2],
+                "month_over_month_pct": round(mom_pct, 2) if mom_pct is not None else None,
+            },
+            "evidence": [{
+                "source": "BLS public API",
+                "title": "CUSR0000SA0 CPI for All Urban Consumers: All Items, seasonally adjusted",
+                "snippet": f"Latest CPI index {latest[2]:.3f}; YoY {yoy_pct:.2f}%; MoM {mom_pct:.2f}%." if mom_pct is not None else f"Latest CPI index {latest[2]:.3f}; YoY {yoy_pct:.2f}%.",
+                "url": "https://api.bls.gov/publicAPI/v2/timeseries/data/",
+            }],
+        }
+    except Exception as exc:
+        return {"status": "unavailable", "message": str(exc)}
+
+
+def _fetch_bls_nonfarm_payrolls() -> dict:
+    current_year = _now_utc().year
+    series_id = "CES0000000001"
+    try:
+        data = get_macro_series_provider().fetch_bls_series([series_id], current_year - 1, current_year)
+        series = ((data.get("series") or [{}])[0].get("data") or [])
+        points = _bls_monthly_points(series)
         if len(points) < 2:
-            return {"status": "empty", "message": "BLS returned fewer than two monthly observations."}
+            return {
+                "status": "empty",
+                "message": "BLS returned fewer than two monthly observations.",
+                "bls_status": data.get("status"),
+                "bls_messages": data.get("messages") or [],
+            }
         latest, previous = points[0], points[1]
         change_thousands = latest[2] - previous[2]
         return {
@@ -1207,7 +1123,7 @@ def _fetch_bls_nonfarm_payrolls() -> dict:
                 "source": "BLS public API",
                 "title": "CES0000000001 All employees, total nonfarm, seasonally adjusted",
                 "snippet": f"Latest level {latest[2]:.0f}k vs previous {previous[2]:.0f}k; computed change {change_thousands:.0f}k.",
-                "url": url,
+                "url": "https://api.bls.gov/publicAPI/v2/timeseries/data/",
             }],
         }
     except Exception as exc:
@@ -1700,7 +1616,7 @@ def _build_system_prompt(language: str, context: dict, intent: str, has_image: b
         "Be practical and careful. Do not promise profit or invent unavailable live data. "
         "If the user asks to write strategy code, stay inside QuantDinger native workflows. "
         "Use Indicator IDE code for indicator strategies, Python ScriptStrategy for script strategies, and Trading Bot parameters for bot workflows. "
-        "Never output Pine Script, TradingView-only code, MT4/MT5 MQL, or unrelated platform syntax unless the user explicitly asks for that platform. "
+        "Never output Pine Script, TradingView-only code, broker-specific scripts, or unrelated platform syntax unless the user explicitly asks for that platform. "
         "For strategy work, first clarify missing requirements, then propose design, then generate runnable code only when the user confirms or asks to generate. "
         "If the user asks for market/chart diagnosis, separate observable facts from inference. "
         "If market_snapshot is provided, use its actual numbers and avoid generic textbook checklists. "
@@ -2182,7 +2098,15 @@ def chat_message():
                 sid = int(session["id"])
             else:
                 sid = _create_session(cur, user_id, _title_from_message(message or "Chart analysis"), context)
-            user_message_id = _insert_message(cur, sid, user_id, "user", message or "[image]", attachments, intent)
+            user_message_id = _insert_message(
+                cur,
+                session_id=sid,
+                user_id=user_id,
+                role="user",
+                content=message or "[image]",
+                attachments=attachments,
+                intent=intent,
+            )
             cur.execute("UPDATE qd_ai_copilot_sessions SET updated_at = NOW() WHERE id = ?", (sid,))
             db.commit()
 
@@ -2203,7 +2127,16 @@ def chat_message():
             if not answer:
                 answer = "The model did not return a usable answer."
 
-            assistant_id = _insert_message(cur, sid, user_id, "assistant", answer, [], intent, actions=parsed.get("actions") or [])
+            assistant_id = _insert_message(
+                cur,
+                session_id=sid,
+                user_id=user_id,
+                role="assistant",
+                content=answer,
+                attachments=[],
+                intent=intent,
+                actions=parsed.get("actions") or [],
+            )
             cur.execute(
                 "UPDATE qd_ai_copilot_sessions SET title = COALESCE(NULLIF(title, ''), ?), updated_at = NOW() WHERE id = ?",
                 ((parsed.get("summary") or _title_from_message(message or answer))[:120], sid),
@@ -2276,7 +2209,15 @@ def chat_message_stream():
                     sid = int(session["id"])
                 else:
                     sid = _create_session(cur, user_id, _title_from_message(message or "Chart analysis"), context)
-                user_message_id = _insert_message(cur, sid, user_id, "user", message or "[image]", attachments, intent)
+                user_message_id = _insert_message(
+                    cur,
+                    session_id=sid,
+                    user_id=user_id,
+                    role="user",
+                    content=message or "[image]",
+                    attachments=attachments,
+                    intent=intent,
+                )
                 cur.execute("UPDATE qd_ai_copilot_sessions SET updated_at = NOW() WHERE id = ?", (sid,))
                 db.commit()
 
@@ -2302,7 +2243,15 @@ def chat_message_stream():
                     yield _sse("delta", {"text": delta})
 
                 answer = "".join(chunks).strip() or "The model did not return a usable answer."
-                assistant_id = _insert_message(cur, sid, user_id, "assistant", answer, [], intent)
+                assistant_id = _insert_message(
+                    cur,
+                    session_id=sid,
+                    user_id=user_id,
+                    role="assistant",
+                    content=answer,
+                    attachments=[],
+                    intent=intent,
+                )
                 cur.execute(
                     "UPDATE qd_ai_copilot_sessions SET title = COALESCE(NULLIF(title, ''), ?), updated_at = NOW() WHERE id = ?",
                     (_title_from_message(message or answer)[:120], sid),
@@ -2505,12 +2454,12 @@ def save_local_chat_message():
                 sid = _create_session(cur, user_id, _title_from_message(content), context)
             mid = _insert_message(
                 cur,
-                sid,
-                user_id,
-                role,
-                content,
-                attachments,
-                intent,
+                session_id=sid,
+                user_id=user_id,
+                role=role,
+                content=content,
+                attachments=attachments,
+                intent=intent,
                 actions=actions,
                 report=report,
                 report_target=report_target,
@@ -2526,252 +2475,6 @@ def save_local_chat_message():
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
-def _has_cjk_text(value: Any) -> bool:
-    text = _plain_text(value)
-    return bool(re.search(r"[\u2e80-\u9fff\uac00-\ud7af\u3040-\u30ff]", text))
-
-
-def _register_report_pdf_font(prefer_cjk: bool = False) -> str:
-    from pathlib import Path
-
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-
-    candidates = [
-        ("C:/Windows/Fonts/msyh.ttc", True),
-        ("C:/Windows/Fonts/msyh.ttf", True),
-        ("C:/Windows/Fonts/simsun.ttc", True),
-        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", True),
-        ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", True),
-        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", True),
-        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", False),
-    ]
-    for path, is_cjk in candidates:
-        if prefer_cjk and not is_cjk:
-            continue
-        try:
-            if Path(path).exists():
-                pdfmetrics.registerFont(TTFont("QuantDingerSans", path))
-                return "QuantDingerSans"
-        except Exception as e:
-            logger.debug(f"Failed to register PDF font {path}: {e}")
-    if prefer_cjk:
-        try:
-            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-
-            pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-            return "STSong-Light"
-        except Exception as e:
-            logger.debug(f"Failed to register built-in CJK PDF font: {e}")
-    return "Helvetica"
-
-
-def _build_ai_report_pdf(report: dict, target: dict | None = None, language: str = "en-US") -> bytes:
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfgen import canvas
-
-    target = target or {}
-    zh = str(language or "").lower().startswith("zh")
-    prefer_cjk = zh or _has_cjk_text(report) or _has_cjk_text(target)
-    font_name = _register_report_pdf_font(prefer_cjk=prefer_cjk)
-    title_font = font_name
-    width, height = A4
-    margin = 18 * mm
-    y = height - margin
-    line_gap = 4
-    page_no = 1
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-
-    labels = {
-        "title": "QuantDinger AI Analysis Report" if not zh else "QuantDinger AI 分析报告",
-        "target": "Target" if not zh else "标的",
-        "generated": "Generated" if not zh else "生成时间",
-        "summary": "Summary" if not zh else "摘要",
-        "plan": "Trading Plan" if not zh else "交易计划",
-        "scores": "Scores" if not zh else "评分",
-        "trend": "Trend Outlook" if not zh else "周期趋势预测",
-        "crypto": "Crypto Market Structure" if not zh else "加密市场结构",
-        "details": "Detailed Analysis" if not zh else "详细分析",
-        "reasons": "Key Reasons" if not zh else "核心理由",
-        "risks": "Risks" if not zh else "风险提示",
-        "indicators": "Indicators" if not zh else "技术指标",
-    }
-
-    def fit_text(text: Any, max_width: float, font_size: int = 10) -> list[str]:
-        raw = _plain_text(text).replace("\r\n", "\n").replace("\r", "\n")
-        lines: list[str] = []
-        for paragraph in raw.split("\n"):
-            if not paragraph:
-                lines.append("")
-                continue
-            current = ""
-            tokens = paragraph.split(" ")
-            if len(tokens) == 1:
-                tokens = list(paragraph)
-                joiner = ""
-            else:
-                joiner = " "
-            for token in tokens:
-                candidate = token if not current else current + joiner + token
-                if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
-                    current = candidate
-                else:
-                    if current:
-                        lines.append(current)
-                    current = token
-            if current:
-                lines.append(current)
-        return lines
-
-    def footer() -> None:
-        c.setFont(font_name, 8)
-        c.setFillColor(colors.HexColor("#8a94a6"))
-        c.drawRightString(width - margin, 12 * mm, f"QuantDinger · {page_no}")
-
-    def ensure(space: float) -> None:
-        nonlocal y, page_no
-        if y - space >= margin:
-            return
-        footer()
-        c.showPage()
-        page_no += 1
-        y = height - margin
-
-    def draw_text(text: Any, font_size: int = 10, color: str = "#1f2937", bold: bool = False, indent: float = 0) -> None:
-        nonlocal y
-        c.setFillColor(colors.HexColor(color))
-        c.setFont(title_font if bold else font_name, font_size)
-        max_width = width - margin * 2 - indent
-        lines = fit_text(text, max_width, font_size)
-        for line in lines:
-            ensure(font_size + line_gap)
-            c.drawString(margin + indent, y, line)
-            y -= font_size + line_gap
-
-    def draw_section(title: str) -> None:
-        nonlocal y
-        ensure(24)
-        y -= 5
-        c.setStrokeColor(colors.HexColor("#d9e2f2"))
-        c.line(margin, y, width - margin, y)
-        y -= 17
-        draw_text(title, 13, "#0f172a", True)
-
-    def draw_pairs(items: list[tuple[str, Any]]) -> None:
-        nonlocal y
-        for i in range(0, len(items), 2):
-            ensure(20)
-            row = items[i:i + 2]
-            for col, (name, value) in enumerate(row):
-                x = margin + col * ((width - margin * 2) / 2)
-                c.setFont(font_name, 8)
-                c.setFillColor(colors.HexColor("#7b8797"))
-                c.drawString(x, y, _plain_text(name))
-                c.setFont(font_name, 10)
-                c.setFillColor(colors.HexColor("#111827"))
-                c.drawString(x + 32 * mm, y, _plain_text(value)[:48])
-            y -= 15
-
-    def add_list(items: Any) -> None:
-        if not isinstance(items, list):
-            return
-        for item in items:
-            draw_text(f"• {_plain_text(item)}", 10, "#374151", False, 3 * mm)
-
-    symbol = report.get("symbol") or target.get("symbol") or ""
-    market = report.get("market") or target.get("market") or ""
-    c.setTitle(labels["title"])
-    c.setFont(title_font, 20)
-    c.setFillColor(colors.HexColor("#0f172a"))
-    c.drawString(margin, y, labels["title"])
-    y -= 20
-    draw_pairs([
-        (labels["target"], f"{market}:{symbol}" if market or symbol else "-"),
-        (labels["generated"], _now_utc().strftime("%Y-%m-%d %H:%M UTC")),
-    ])
-
-    decision = _plain_text(report.get("decision") or "HOLD").upper()
-    decision_color = "#16a34a" if decision == "BUY" else "#dc2626" if decision == "SELL" else "#d97706"
-    ensure(36)
-    c.setFillColor(colors.HexColor(decision_color))
-    c.roundRect(margin, y - 24, 42 * mm, 22, 5, fill=1, stroke=0)
-    c.setFillColor(colors.white)
-    c.setFont(title_font, 13)
-    c.drawCentredString(margin + 21 * mm, y - 17, decision)
-    c.setFillColor(colors.HexColor("#111827"))
-    c.setFont(font_name, 10)
-    c.drawString(margin + 48 * mm, y - 10, f"Confidence: {report.get('confidence', '-')}")
-    y -= 34
-
-    if report.get("summary"):
-        draw_section(labels["summary"])
-        draw_text(report.get("summary"), 10)
-
-    market_data = report.get("market_data") if isinstance(report.get("market_data"), dict) else {}
-    plan = report.get("trading_plan") if isinstance(report.get("trading_plan"), dict) else {}
-    plan_items = [
-        ("Current Price", market_data.get("current_price")),
-        ("24h Change", market_data.get("change_24h")),
-        ("Entry", plan.get("entry_price") or plan.get("entryPrice")),
-        ("Stop Loss", plan.get("stop_loss") or plan.get("stopLoss")),
-        ("Take Profit", plan.get("take_profit") or plan.get("takeProfit")),
-        ("Risk/Reward", plan.get("risk_reward_ratio") or plan.get("riskRewardRatio")),
-    ]
-    if any(v not in (None, "") for _, v in plan_items):
-        draw_section(labels["plan"])
-        draw_pairs([(k, "-" if v in (None, "") else v) for k, v in plan_items])
-
-    scores = report.get("scores") if isinstance(report.get("scores"), dict) else {}
-    if scores:
-        draw_section(labels["scores"])
-        draw_pairs([(str(k).replace("_", " ").title(), v) for k, v in scores.items()])
-
-    trend = report.get("trend_outlook") or report.get("trendOutlook")
-    trend_summary = report.get("trend_outlook_summary") or report.get("trendOutlookSummary")
-    if trend_summary or trend:
-        draw_section(labels["trend"])
-        if trend_summary:
-            draw_text(trend_summary, 10)
-        if isinstance(trend, dict):
-            draw_pairs([(str(k), _plain_text(v)) for k, v in trend.items()])
-
-    crypto_summary = report.get("crypto_factor_summary")
-    crypto_factors = report.get("crypto_factors") if isinstance(report.get("crypto_factors"), dict) else {}
-    if crypto_summary or crypto_factors:
-        draw_section(labels["crypto"])
-        if crypto_summary:
-            draw_text(crypto_summary, 10)
-        if crypto_factors:
-            draw_pairs([(str(k).replace("_", " "), _plain_text(v)) for k, v in crypto_factors.items() if k != "signals"])
-
-    details = report.get("detailed_analysis") if isinstance(report.get("detailed_analysis"), dict) else {}
-    if details:
-        draw_section(labels["details"])
-        for key, value in details.items():
-            draw_text(str(key).replace("_", " ").title(), 11, "#0f172a", True)
-            draw_text(value, 10)
-
-    if report.get("reasons"):
-        draw_section(labels["reasons"])
-        add_list(report.get("reasons"))
-    if report.get("risks"):
-        draw_section(labels["risks"])
-        add_list(report.get("risks"))
-
-    indicators = report.get("indicators") if isinstance(report.get("indicators"), dict) else {}
-    if indicators:
-        draw_section(labels["indicators"])
-        draw_pairs([(str(k).replace("_", " "), _plain_text(v)) for k, v in indicators.items()])
-
-    footer()
-    c.save()
-    return buf.getvalue()
-
-
 @ai_chat_blp.route("/chat/report/pdf", methods=["POST"])
 @login_required
 def export_chat_report_pdf():
@@ -2782,7 +2485,7 @@ def export_chat_report_pdf():
     target = data.get("target") if isinstance(data.get("target"), dict) else {}
     language = str(data.get("language") or request.headers.get("X-App-Lang") or "en-US")
     try:
-        pdf_bytes = _build_ai_report_pdf(report, target, language)
+        pdf_bytes = build_ai_report_pdf(report, target, language)
     except ImportError:
         return jsonify({"code": 0, "msg": "PDF export dependency missing: install reportlab", "data": None}), 500
     except Exception as e:
@@ -2810,3 +2513,5 @@ def save_chat_history():
 
 # openapi-compat: legacy import name
 ai_chat_bp = ai_chat_blp
+
+

@@ -8,6 +8,7 @@ ENABLED_MARKETS / legacy SHOW_* flags via app.utils.market_visibility.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
@@ -26,6 +27,10 @@ MARKET_ORDER = [
     "Futures",
     "MOEX",
 ]
+
+_RUNTIME_ENV_CACHE: Dict[str, str] = {}
+_RUNTIME_ENV_CACHE_UNTIL = 0.0
+_RUNTIME_ENV_CACHE_TTL = 5.0
 
 
 MARKET_MODULES: Dict[str, MarketModule] = {
@@ -144,11 +149,11 @@ MARKET_MODULES: Dict[str, MarketModule] = {
     "Forex": MarketModule(
         key="Forex",
         label="Forex",
-        description="FX pairs and precious metals routed through FX data sources and MT5.",
+        description="FX pairs and precious metals for research and backtesting.",
         asset_class="forex",
         symbol_hint="EURUSD",
         base_currency="USD",
-        features=["research", "backtest", "paper", "live"],
+        features=["research", "backtest", "paper"],
         data_requirements=[
             DataRequirement(
                 key="yfinance",
@@ -170,7 +175,7 @@ MARKET_MODULES: Dict[str, MarketModule] = {
                 purpose="FX fallback",
             ),
         ],
-        supports={"spot": True, "swap": False, "short": True, "session": "24/5"},
+        supports={"spot": True, "swap": False, "short": False, "session": "24/5"},
     ),
     "Futures": MarketModule(
         key="Futures",
@@ -210,12 +215,25 @@ def _backend_env_path() -> Path:
 
 def load_runtime_env() -> Dict[str, str]:
     """Return .env values overlaid with process env values."""
+    global _RUNTIME_ENV_CACHE, _RUNTIME_ENV_CACHE_UNTIL
+    now = time.monotonic()
+    if _RUNTIME_ENV_CACHE and now < _RUNTIME_ENV_CACHE_UNTIL:
+        return dict(_RUNTIME_ENV_CACHE)
+
     values: Dict[str, str] = {}
     path = _backend_env_path()
     if path.exists():
         values.update({k: str(v or "") for k, v in dotenv_values(path).items()})
     values.update({k: str(v) for k, v in os.environ.items()})
+    _RUNTIME_ENV_CACHE = dict(values)
+    _RUNTIME_ENV_CACHE_UNTIL = now + _RUNTIME_ENV_CACHE_TTL
     return values
+
+
+def clear_runtime_env_cache() -> None:
+    global _RUNTIME_ENV_CACHE, _RUNTIME_ENV_CACHE_UNTIL
+    _RUNTIME_ENV_CACHE = {}
+    _RUNTIME_ENV_CACHE_UNTIL = 0.0
 
 
 def list_market_keys() -> List[str]:

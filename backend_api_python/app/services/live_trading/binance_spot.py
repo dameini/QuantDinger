@@ -685,7 +685,7 @@ class BinanceSpotClient(BaseRestClient):
         return 0.0, ""
 
     def get_fee_rate(self, symbol: str, market_type: str = "spot") -> Optional[Dict[str, float]]:
-        sym = symbol.upper().replace("-", "").replace("/", "")
+        sym = to_binance_futures_symbol(symbol)
         try:
             data = self._signed_request("GET", "/sapi/v1/asset/tradeFee", params={"symbol": sym})
             if isinstance(data, list) and data and isinstance(data[0], dict):
@@ -695,7 +695,7 @@ class BinanceSpotClient(BaseRestClient):
                 if maker > 0 or taker > 0:
                     return {"maker": maker, "taker": taker}
         except Exception as e:
-            logger.warning(f"BinanceSpot get_fee_rate({symbol}) failed: {e}")
+            logger.warning(f"BinanceSpot get_fee_rate({symbol}, symbol_param={sym}) failed: {e}")
         return None
 
     def cancel_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:

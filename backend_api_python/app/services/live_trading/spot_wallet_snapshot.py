@@ -1,4 +1,4 @@
-﻿"""
+"""
 List all non-zero spot wallet coins for account snapshot UI.
 
 Spot holdings are wallet balances, not derivative ``/positions`` rows.

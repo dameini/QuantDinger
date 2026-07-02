@@ -1,13 +1,4 @@
-"""
-Fast Analysis Service 3.0
-系统性重构版本 - 使用统一的数据采集器
-
-核心改进：
-1. 数据源统一 - 使用 MarketDataCollector，与K线模块、自选列表完全一致
-2. 宏观数据 - 新增美元指数、VIX、利率等宏观经济指标
-3. 多维新闻 - 使用结构化API，无需深度阅读
-4. 单次LLM调用 - 强约束prompt，输出结构化分析
-"""
+"""Fast analysis orchestration built on the shared market-data collector."""
 import json
 import os
 import re
@@ -18,169 +9,14 @@ from decimal import Decimal, ROUND_HALF_UP
 from app.utils.logger import get_logger
 from app.services.llm import LLMService
 from app.services.market_data_collector import get_market_data_collector
+from app.services.fast_analysis_formatters import build_trend_outlook_summary, safe_float_price
+from app.services.fast_analysis_geo import (
+    geopolitical_match_level,
+    geopolitical_sentiment_penalty_delta,
+    is_major_geopolitical_news_text,
+)
 
 logger = get_logger(__name__)
-
-
-def _safe_float_price(value: Any, default: Optional[float] = None) -> Optional[float]:
-    """Coerce LLM/string prices to float; invalid -> default."""
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and (value != value):  # NaN
-            return default
-        return float(value)
-    try:
-        s = str(value).strip().replace(",", "")
-        if not s:
-            return default
-        return float(s)
-    except (TypeError, ValueError):
-        return default
-
-
-def _build_trend_outlook_summary(trend_outlook: Dict[str, Any], language: str) -> str:
-    """Human-readable multi-horizon outlook for API / legacy clients."""
-    if not trend_outlook:
-        return ""
-    is_zh = str(language or "").lower().startswith("zh")
-
-    def _lbl(trend: str) -> str:
-        t = str(trend or "HOLD").upper()
-        if is_zh:
-            return {"BUY": "看多", "SELL": "看空", "HOLD": "震荡/中性"}.get(t, "震荡/中性")
-        return {"BUY": "bullish", "SELL": "bearish", "HOLD": "neutral / range"}.get(t, "neutral / range")
-
-    n24 = trend_outlook.get("next_24h") or {}
-    d3 = trend_outlook.get("next_3d") or {}
-    w1 = trend_outlook.get("next_1w") or {}
-    m1 = trend_outlook.get("next_1m") or {}
-
-    if is_zh:
-        parts = [
-            f"约24小时：{_lbl(n24.get('trend'))}（强度 {n24.get('strength', 'neutral')}）",
-            f"约3天：{_lbl(d3.get('trend'))}（强度 {d3.get('strength', 'neutral')}）",
-            f"约1周：{_lbl(w1.get('trend'))}（强度 {w1.get('strength', 'neutral')}）",
-            f"约1月：{_lbl(m1.get('trend'))}（强度 {m1.get('strength', 'neutral')}）",
-        ]
-        return "；".join(parts)
-    parts = [
-        f"~24h: {_lbl(n24.get('trend'))} ({n24.get('strength', 'neutral')})",
-        f"~3d: {_lbl(d3.get('trend'))} ({d3.get('strength', 'neutral')})",
-        f"~1w: {_lbl(w1.get('trend'))} ({w1.get('strength', 'neutral')})",
-        f"~1m: {_lbl(m1.get('trend'))} ({m1.get('strength', 'neutral')})",
-    ]
-    return " | ".join(parts)
-
-
-# -----------------------------------------------------------------------------
-# Geopolitical / major-conflict detection (word boundaries + tiers)
-# Avoid false positives: "war" in "toward/award", "tension" in "extension",
-# "us" in "focus/status", bare country names without conflict context, etc.
-# -----------------------------------------------------------------------------
-_GEO_SEVERE_PATTERNS: List[re.Pattern] = [
-    re.compile(r"\b(?:war|wars|warfare|wartime)\b", re.I),
-    re.compile(r"\b(?:invasion|invaded|invading|invade)\b", re.I),
-    re.compile(r"\b(?:airstrike|air\s*strikes?|missile\s+strike|drone\s+strike)\b", re.I),
-    re.compile(r"\b(?:military\s+attack|armed\s+attack|troops?\s+(?:fire|attack|invade))\b", re.I),
-    re.compile(r"\b(?:declare[sd]?\s+war|state\s+of\s+war|act\s+of\s+war)\b", re.I),
-    re.compile(r"\b(?:martial\s+law|military\s+coup|coup\s+d['\u2019]?etat)\b", re.I),
-    re.compile(r"\b(?:terror(?:ist)?\s+attack|mass\s+shooting\s+at)\b", re.I),
-]
-_GEO_MODERATE_PATTERNS: List[re.Pattern] = [
-    re.compile(r"\bgeopolitical\b", re.I),
-    re.compile(r"\b(?:armed|military)\s+conflict\b", re.I),
-    re.compile(r"\b(?:international\s+)?sanctions?\s+(?:on|against|targeting|hit)\b", re.I),
-    re.compile(r"\b(?:naval\s+blockade|border\s+clash|ceasefire\s+(?:broken|violated))\b", re.I),
-    re.compile(r"\b(?:evacuat\w+\s+(?:the\s+)?embassy|embassy\s+evacuation)\b", re.I),
-    re.compile(r"\b(?:nuclear\s+(?:threat|strike|weapon)|nuclear\s+war)\b", re.I),
-]
-# "Crisis" / "tension" only in clearly geopolitical phrases (not substring of "extension")
-_GEO_CONTEXT_MODERATE: List[re.Pattern] = [
-    re.compile(r"\b(?:geopolitical|diplomatic|border)\s+(?:crisis|tension|standoff)\b", re.I),
-    re.compile(r"\b(?:tensions?\s+(?:rise|escalat|flare|mount)\s+(?:with|between))\b", re.I),
-    re.compile(r"\b(?:middle\s+east|south\s+china\s+sea|taiwan\s+strait)\s+(?:crisis|tension|conflict)\b", re.I),
-]
-_GEO_ZH_SEVERE = (
-    "宣战", "战争爆发", "全面战争", "武装冲突", "军事打击", "军事入侵", "空袭", "导弹袭击",
-    "开战", "交火", "战火",
-)
-_GEO_ZH_MODERATE = (
-    "地缘政治危机", "国际制裁升级", "断交", "撤侨", "军事对峙", "地区冲突升级",
-)
-
-# Optional: country/region + conflict verb (single pattern, avoids "NYSE" noise)
-_GEO_REGION_CONFLICT: List[re.Pattern] = [
-    re.compile(
-        r"\b(?:russia|ukraine|iran|israel|gaza|hamas|taiwan|north\s+korea|dprk|"
-        r"syria|yemen|lebanon|nato)\b.{0,40}\b(?:invade|attack|strike|war|conflict|sanction)\b",
-        re.I,
-    ),
-    re.compile(
-        r"\b(?:invade|attack|strike|war|conflict|sanction)\b.{0,40}\b(?:russia|ukraine|iran|israel|"
-        r"gaza|hamas|taiwan|north\s+korea|dprk|syria|nato)\b",
-        re.I,
-    ),
-]
-
-_GEO_MAJOR_NEWS_SEVERE = [
-    re.compile(r"\b(?:war|wars|warfare)\b", re.I),
-    re.compile(r"\b(?:invasion|invaded|military\s+attack|airstrike)\b", re.I),
-    re.compile(r"\b(?:armed\s+conflict|military\s+conflict)\b", re.I),
-]
-
-
-def _geopolitical_match_level(combined_text: str) -> Tuple[str, Optional[str]]:
-    """
-    Returns (level, reason_tag) where level is 'none'|'severe'|'moderate'.
-    combined_text: title + summary (original case OK; English patterns use lower via regex I flag).
-    """
-    if not combined_text or len(combined_text.strip()) < 4:
-        return "none", None
-    low = combined_text.lower()
-    for pat in _GEO_SEVERE_PATTERNS:
-        if pat.search(low):
-            return "severe", pat.pattern[:48]
-    for z in _GEO_ZH_SEVERE:
-        if z in combined_text:
-            return "severe", z
-    for pat in _GEO_REGION_CONFLICT:
-        if pat.search(low):
-            return "severe", "region+conflict"
-    for pat in _GEO_MODERATE_PATTERNS:
-        if pat.search(low):
-            return "moderate", pat.pattern[:48]
-    for pat in _GEO_CONTEXT_MODERATE:
-        if pat.search(low):
-            return "moderate", pat.pattern[:48]
-    for z in _GEO_ZH_MODERATE:
-        if z in combined_text:
-            return "moderate", z
-    return "none", None
-
-
-def _geopolitical_sentiment_penalty_delta(level: str) -> int:
-    if level == "severe":
-        return -42
-    if level == "moderate":
-        return -18
-    return 0
-
-
-def _is_major_geopolitical_news_text(combined_text: str) -> bool:
-    """Stricter than sentiment: only clear conflict / war signals for _has_major_news."""
-    if not combined_text:
-        return False
-    low = combined_text.lower()
-    for pat in _GEO_MAJOR_NEWS_SEVERE:
-        if pat.search(low):
-            return True
-    for z in _GEO_ZH_SEVERE:
-        if z in combined_text:
-            return True
-    if any(p.search(low) for p in _GEO_REGION_CONFLICT):
-        return True
-    return False
 
 
 class FastAnalysisService:
@@ -1274,7 +1110,7 @@ IMPORTANT:
                     "strength": _trend_strength(score_1m),
                 },
             }
-            trend_outlook_summary = _build_trend_outlook_summary(trend_outlook, language)
+            trend_outlook_summary = build_trend_outlook_summary(trend_outlook, language)
 
             # Consensus confidence:
             consensus_conf = int(max(40, min(98, 50 + consensus_abs * 0.35)))
@@ -1570,7 +1406,7 @@ IMPORTANT:
             text_to_check = f"{title} {summary}"
             low = text_to_check.lower()
 
-            if _is_major_geopolitical_news_text(text_to_check):
+            if is_major_geopolitical_news_text(text_to_check):
                 logger.info(f"Detected major geopolitical event in news: {low[:80]}")
                 return True
 
@@ -1631,8 +1467,8 @@ IMPORTANT:
         eps = max(abs(current_price) * 1e-6, 1e-8)
 
         tl = indicators.get("trading_levels") or {}
-        sl_long = _safe_float_price(tl.get("suggested_stop_loss"))
-        tp_long = _safe_float_price(tl.get("suggested_take_profit"))
+        sl_long = safe_float_price(tl.get("suggested_stop_loss"))
+        tp_long = safe_float_price(tl.get("suggested_take_profit"))
         long_ok = (
             sl_long is not None
             and tp_long is not None
@@ -1653,8 +1489,8 @@ IMPORTANT:
                     analysis["stop_loss"] = round(min(max_price, current_price * 1.05), 6)
                     analysis["take_profit"] = round(max(min_price, current_price * 0.95), 6)
             else:
-                sl_f = _safe_float_price(analysis.get("stop_loss"))
-                tp_f = _safe_float_price(analysis.get("take_profit"))
+                sl_f = safe_float_price(analysis.get("stop_loss"))
+                tp_f = safe_float_price(analysis.get("take_profit"))
                 if sl_f is not None and tp_f is not None and tp_f < current_price < sl_f:
                     analysis["stop_loss"] = round(min(max(sl_f, current_price + eps), max_price), 6)
                     analysis["take_profit"] = round(max(min(tp_f, current_price - eps), min_price), 6)
@@ -1668,8 +1504,8 @@ IMPORTANT:
                 analysis["stop_loss"] = round(sl, 6)
                 analysis["take_profit"] = round(tp, 6)
             else:
-                sl_f = _safe_float_price(analysis.get("stop_loss"))
-                tp_f = _safe_float_price(analysis.get("take_profit"))
+                sl_f = safe_float_price(analysis.get("stop_loss"))
+                tp_f = safe_float_price(analysis.get("take_profit"))
                 if sl_f is not None and tp_f is not None and sl_f < current_price < tp_f:
                     analysis["stop_loss"] = round(max(min(sl_f, current_price - eps), min_price), 6)
                     analysis["take_profit"] = round(min(max(tp_f, current_price + eps), max_price), 6)
@@ -1678,8 +1514,8 @@ IMPORTANT:
                     analysis["take_profit"] = round(min(max_price, current_price * 1.05), 6)
 
         # Last-resort: fix inverted or equal levels
-        sl_f = _safe_float_price(analysis.get("stop_loss"), current_price)
-        tp_f = _safe_float_price(analysis.get("take_profit"), current_price)
+        sl_f = safe_float_price(analysis.get("stop_loss"), current_price)
+        tp_f = safe_float_price(analysis.get("take_profit"), current_price)
         if sl_f is None or tp_f is None:
             return analysis
         if decision == "SELL":
@@ -1708,7 +1544,7 @@ IMPORTANT:
         decision = str(analysis.get("decision", "HOLD")).upper()
         
         # Constrain entry price
-        entry = _safe_float_price(analysis.get("entry_price"), current_price)
+        entry = safe_float_price(analysis.get("entry_price"), current_price)
         if entry is not None and (entry < min_price or entry > max_price):
             logger.warning(f"Entry price {entry} out of bounds, constraining to current price {current_price}")
             analysis["entry_price"] = round(current_price, 6)
@@ -1721,8 +1557,8 @@ IMPORTANT:
         if decision == "SELL":
             stop_default = round(current_price * 1.05, 6)
             tp_default = round(current_price * 0.95, 6)
-            stop_loss = _safe_float_price(analysis.get("stop_loss"), stop_default)
-            take_profit = _safe_float_price(analysis.get("take_profit"), tp_default)
+            stop_loss = safe_float_price(analysis.get("stop_loss"), stop_default)
+            take_profit = safe_float_price(analysis.get("take_profit"), tp_default)
             if stop_loss is None or stop_loss <= current_price or stop_loss > max_price:
                 analysis["stop_loss"] = stop_default
             else:
@@ -1734,8 +1570,8 @@ IMPORTANT:
         else:
             stop_default = round(current_price * 0.95, 6)
             tp_default = round(current_price * 1.05, 6)
-            stop_loss = _safe_float_price(analysis.get("stop_loss"), stop_default)
-            take_profit = _safe_float_price(analysis.get("take_profit"), tp_default)
+            stop_loss = safe_float_price(analysis.get("stop_loss"), stop_default)
+            take_profit = safe_float_price(analysis.get("take_profit"), tp_default)
             if stop_loss is None or stop_loss < min_price or stop_loss >= current_price:
                 analysis["stop_loss"] = stop_default
             else:
@@ -2378,12 +2214,12 @@ IMPORTANT:
             sentiment = item.get("sentiment", "neutral")
             is_global_event = item.get("is_global_event", False)
 
-            level, tag = _geopolitical_match_level(text)
+            level, tag = geopolitical_match_level(text)
             if is_global_event and level == "none":
                 level, tag = "moderate", "is_global_event"
 
             if level != "none":
-                delta = _geopolitical_sentiment_penalty_delta(level)
+                delta = geopolitical_sentiment_penalty_delta(level)
                 new_total = geopolitical_penalty + delta
                 if new_total < max_geo_total:
                     delta = max_geo_total - geopolitical_penalty

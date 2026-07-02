@@ -8,11 +8,56 @@ import traceback
 
 from app.services.kline import KlineService
 from app.utils.logger import get_logger
+from app.services.market.watchlist import validate_watchlist_pair
+from app.utils.request_guard import RequestGuardError, cache_key, guarded_cached
 
 logger = get_logger(__name__)
 
 kline_blp = Blueprint('kline', __name__)
 kline_service = KlineService()
+
+
+def _latest_kline_ttl(timeframe: str) -> int:
+    tf = (timeframe or '').strip()
+    return {
+        '1m': 3,
+        '3m': 4,
+        '5m': 5,
+        '15m': 8,
+        '30m': 10,
+        '1H': 10,
+        '4H': 15,
+        '1D': 30,
+        '1W': 60,
+        '1h': 10,
+        '4h': 15,
+        '1d': 30,
+        '1w': 60,
+    }.get(tf, 10)
+
+
+def _guard_policy(timeframe: str, limit: int, before_time):
+    if before_time:
+        return {
+            'ttl_sec': 300,
+            'stale_ttl_sec': 1800,
+            'timeout_sec': 25,
+            'max_concurrent': 6,
+        }
+    ttl = _latest_kline_ttl(timeframe)
+    if limit <= 10:
+        return {
+            'ttl_sec': ttl,
+            'stale_ttl_sec': max(20, ttl * 4),
+            'timeout_sec': 8,
+            'max_concurrent': 10,
+        }
+    return {
+        'ttl_sec': ttl,
+        'stale_ttl_sec': max(60, ttl * 6),
+        'timeout_sec': 25,
+        'max_concurrent': 10,
+    }
 
 
 @kline_blp.route('/kline', methods=['GET'])
@@ -28,10 +73,11 @@ def get_kline():
         before_time: Return bars before this Unix timestamp (optional)
     """
     try:
-        market = request.args.get('market', 'USStock')
-        symbol = request.args.get('symbol', '')
-        timeframe = request.args.get('timeframe', '1D')
+        market = (request.args.get('market', 'USStock') or '').strip()
+        symbol = (request.args.get('symbol', '') or '').strip()
+        timeframe = (request.args.get('timeframe', '1D') or '').strip()
         limit = int(request.args.get('limit', 300))
+        limit = max(1, min(1000, limit))
         before_time = request.args.get('before_time') or request.args.get('beforeTime')
         
         if before_time:
@@ -43,15 +89,28 @@ def get_kline():
                 'msg': 'Missing symbol parameter',
                 'data': None
             }), 400
+
+        validation_err = validate_watchlist_pair(market, symbol)
+        if validation_err:
+            return jsonify({'code': 0, 'msg': validation_err, 'data': None}), 400
         
         logger.info(f"Requesting K-lines: {market}:{symbol}, timeframe={timeframe}, limit={limit}")
         
-        klines = kline_service.get_kline(
-            market=market,
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=limit,
-            before_time=before_time
+        policy = _guard_policy(timeframe, limit, before_time)
+        klines = guarded_cached(
+            cache_key("indicator_kline", market, symbol, timeframe, limit, before_time or ""),
+            lambda: kline_service.get_kline(
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                limit=limit,
+                before_time=before_time
+            ),
+            ttl_sec=policy['ttl_sec'],
+            stale_ttl_sec=policy['stale_ttl_sec'],
+            timeout_sec=policy['timeout_sec'],
+            namespace="indicator_kline",
+            max_concurrent=policy['max_concurrent'],
         )
         
         if not klines:
@@ -73,6 +132,12 @@ def get_kline():
             'data': klines
         })
         
+    except RequestGuardError as e:
+        return jsonify({
+            'code': 0,
+            'msg': str(e),
+            'data': None
+        }), e.status_code
     except Exception as e:
         logger.error(f"Failed to fetch K-lines: {str(e)}")
         logger.error(traceback.format_exc())

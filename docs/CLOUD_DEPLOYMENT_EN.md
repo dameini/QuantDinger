@@ -1,48 +1,47 @@
-# QuantDinger Cloud Server Deployment Guide
+# QuantDinger Cloud Deployment Guide
 
-This guide covers production-style deployment on a cloud server with Docker Compose, domain setup, HTTPS, reverse proxy, and frontend/backend separation options.
+This guide describes the current production-style Docker deployment for QuantDinger on a cloud server. It covers the recommended GHCR image deployment, optional source deployment, Nginx, HTTPS, upgrades, and common troubleshooting.
+
+For first-time Docker pull and Postgres startup issues, also see [Installation Troubleshooting](INSTALL_TROUBLESHOOTING.md).
 
 ## Recommended Architecture
 
-Recommended setup: single domain + host Nginx reverse proxy
+Use one public domain with a host-level Nginx reverse proxy:
 
-- Public URL: `https://app.example.com`
-- Host Nginx: listens on `80/443`
-- Docker `frontend`: binds to `127.0.0.1:8888`
-- Docker `backend`: binds to `127.0.0.1:5000`
-- Docker `postgres`: binds to `127.0.0.1:5432`
+- Public web URL: `https://app.example.com`
+- Optional mobile H5 URL: `https://m.example.com`
+- Host Nginx listens on `80/443`
+- Docker `frontend` binds to `127.0.0.1:8888`
+- Docker `mobile` binds to `127.0.0.1:8889`
+- Docker `backend` binds to `127.0.0.1:5000`
+- Docker `postgres` and `redis` bind to localhost only
 
-Benefits:
-
-- Only `80/443` are exposed publicly
-- Frontend and API stay on the same origin
-- Backend and database are not directly exposed to the internet
+Only expose `80` and `443` to the public internet. Keep `5000`, `5432`, and `6379` private.
 
 ## 1. Prepare the Server
 
-Recommended:
+Recommended baseline:
 
-- Ubuntu 22.04 / Debian 12
-- 2 vCPU / 4 GB RAM or higher
-- Security group ports open: `22`, `80`, `443`
+- Ubuntu 22.04 / 24.04 or Debian 12
+- 2 vCPU / 4 GB RAM minimum; 4 vCPU / 8 GB RAM is better for AI-heavy use
+- 30 GB+ disk space
+- Security group or firewall allows `22`, `80`, and `443`
 - A domain such as `app.example.com`
 
-DNS steps:
+Create DNS records:
 
-1. Create an `A` record
-2. Host: `app`
-3. Value: your server public IP
-4. Wait for DNS propagation
+```text
+app.example.com -> your server public IP
+m.example.com   -> your server public IP  # optional mobile H5 domain
+```
 
-Verify:
+Verify DNS:
 
 ```bash
 ping app.example.com
 ```
 
-## 2. Install Docker and Docker Compose
-
-Ubuntu / Debian example:
+## 2. Install Docker
 
 ```bash
 curl -fsSL https://get.docker.com | sh
@@ -52,111 +51,108 @@ docker --version
 docker compose version
 ```
 
-If Docker Hub is slow or blocked in your network, you can switch image source later with `IMAGE_PREFIX` in the project-root `.env`.
+Use Compose v2 commands: `docker compose ...`.
 
-## 3. Clone the Project
+## 3. Choose a Deployment Mode
+
+### Recommended: GHCR prebuilt images
+
+Use this mode for normal cloud deployment. It pulls backend, web frontend, and mobile H5 images from GHCR. No local Python or Node build is required.
+
+```bash
+mkdir -p ~/quantdinger
+cd ~/quantdinger
+curl -O https://raw.githubusercontent.com/brokermr810/QuantDinger/main/docker-compose.ghcr.yml
+curl -o backend.env https://raw.githubusercontent.com/brokermr810/QuantDinger/main/backend_api_python/env.example
+```
+
+Edit `backend.env` before first start:
+
+```ini
+ADMIN_USER=your_admin_user
+ADMIN_PASSWORD=your_strong_password
+FRONTEND_URL=https://app.example.com,https://m.example.com
+ALLOW_LOCAL_DESKTOP_BROKERS=false
+```
+
+The GHCR backend entrypoint can generate `SECRET_KEY` on first start and write it back to `backend.env`. You may also set `SECRET_KEY` manually to a long random string.
+
+Create an optional project-root `.env` for Compose orchestration:
+
+```ini
+FRONTEND_PORT=127.0.0.1:8888
+MOBILE_PORT=127.0.0.1:8889
+BACKEND_PORT=127.0.0.1:5000
+DB_PORT=127.0.0.1:5432
+REDIS_PORT=127.0.0.1:6379
+
+# Pin a release instead of floating latest, for example:
+# IMAGE_TAG=3.0.10
+
+# Use a Docker Hub mirror for postgres/redis when needed:
+# IMAGE_PREFIX=docker.m.daocloud.io/library/
+```
+
+Start:
+
+```bash
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
+docker compose -f docker-compose.ghcr.yml ps
+```
+
+### Optional: full repository deployment
+
+Use this mode only when you need to build the backend from local source.
 
 ```bash
 git clone https://github.com/brokermr810/QuantDinger.git
 cd QuantDinger
-```
-
-## 4. Configure `backend_api_python/.env`
-
-Copy the template:
-
-```bash
 cp backend_api_python/env.example backend_api_python/.env
-```
-
-Generate and write `SECRET_KEY`:
-
-```bash
 ./scripts/generate-secret-key.sh
 ```
 
-At minimum, review these values:
+Edit `backend_api_python/.env`:
 
 ```ini
-ADMIN_USER=quantdinger
+ADMIN_USER=your_admin_user
 ADMIN_PASSWORD=your_strong_password
-SECRET_KEY=your_generated_secret
+FRONTEND_URL=https://app.example.com,https://m.example.com
+ALLOW_LOCAL_DESKTOP_BROKERS=false
 ```
 
-If you want AI features, add at least one provider key, for example:
+Optionally create project-root `.env` with the same port settings shown above.
 
-```ini
-OPENROUTER_API_KEY=your_key
-```
-
-## 5. Configure the Project-Root `.env`
-
-The project-root `.env` is used by Docker Compose for ports and image source selection.
-
-Copy the template:
+Start:
 
 ```bash
-cp .env.example .env
+docker compose pull
+docker compose up -d --build
+docker compose ps
 ```
 
-Recommended production values:
+## 4. Understand the Two Env Files
 
-```ini
-FRONTEND_PORT=127.0.0.1:8888
-BACKEND_PORT=127.0.0.1:5000
-DB_PORT=127.0.0.1:5432
-IMAGE_PREFIX=
-```
+Keep these files separate:
 
-Explanation:
+| File | Used by | Purpose |
+|------|---------|---------|
+| `backend.env` | `docker-compose.ghcr.yml` backend container | Runtime app config: admin account, `SECRET_KEY`, LLM keys, OAuth, broker keys |
+| `backend_api_python/.env` | full repository backend container | Same runtime app config when building from source |
+| project-root `.env` | Docker Compose | Ports, image tags, image paths, Postgres image/data options, image mirrors |
 
-- `FRONTEND_PORT=127.0.0.1:8888`: only accessible locally, exposed through host Nginx
-- `BACKEND_PORT=127.0.0.1:5000`: avoid exposing API directly
-- `DB_PORT=127.0.0.1:5432`: avoid exposing PostgreSQL directly
-- `IMAGE_PREFIX=`: empty means official Docker Hub
+Do not put secrets such as exchange API keys into the project-root `.env` unless Compose explicitly needs them.
 
-If image pulls fail, try:
+## 5. Configure Nginx
 
-```ini
-IMAGE_PREFIX=docker.m.daocloud.io/library/
-```
-
-or:
-
-```ini
-IMAGE_PREFIX=docker.xuanyuan.me/library/
-```
-
-## 6. Start the Containers
-
-```bash
-docker-compose up -d --build
-docker-compose ps
-```
-
-Logs:
-
-```bash
-docker-compose logs -f backend
-docker-compose logs -f frontend
-```
-
-At this point, services usually listen on:
-
-- `127.0.0.1:8888`
-- `127.0.0.1:5000`
-- `127.0.0.1:5432`
-
-## 7. Install and Configure Nginx
-
-Install:
+Install Nginx:
 
 ```bash
 sudo apt update
 sudo apt install -y nginx
 ```
 
-Recommended site config `/etc/nginx/sites-available/quantdinger.conf`:
+Create `/etc/nginx/sites-available/quantdinger.conf`:
 
 ```nginx
 server {
@@ -174,9 +170,27 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
+
+server {
+    listen 80;
+    server_name m.example.com;
+
+    client_max_body_size 20m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8889;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
 ```
 
-Enable it:
+If you do not need a separate mobile domain, omit the second server block. Users can still access the mobile H5 service through the bound port or a path/domain you configure yourself.
+
+Enable:
 
 ```bash
 sudo ln -s /etc/nginx/sites-available/quantdinger.conf /etc/nginx/sites-enabled/quantdinger.conf
@@ -192,71 +206,32 @@ sudo ufw allow 'Nginx Full'
 sudo ufw enable
 ```
 
-## 8. Enable HTTPS with Let's Encrypt
-
-Install Certbot:
+## 6. Enable HTTPS
 
 ```bash
 sudo apt install -y certbot python3-certbot-nginx
-```
-
-Request the certificate:
-
-```bash
-sudo certbot --nginx -d app.example.com
-```
-
-Test renewal:
-
-```bash
+sudo certbot --nginx -d app.example.com -d m.example.com
 sudo certbot renew --dry-run
 ```
 
-Then open:
+If you only configured `app.example.com`, request only that domain.
+
+Open:
 
 ```text
 https://app.example.com
+https://m.example.com
 ```
 
-## 9. Recommended Production Mode: Single Domain
+## 7. Optional API Subdomain
 
-This is the recommended mode for the open-source edition.
-
-Why:
-
-- The frontend is pulled as a prebuilt image (`ghcr.io/brokermr810/quantdinger-frontend`) — no local build
-- The frontend container already proxies `/api/*` to `backend:5000` inside Docker
-- Only one public domain and one TLS configuration are needed
-
-Topology:
+The recommended setup keeps API traffic same-origin through the frontend container:
 
 ```text
-Browser
-  -> https://app.example.com
-  -> Host Nginx :443
-  -> 127.0.0.1:8888 (frontend container)
-  -> /api/* then proxied by frontend container to backend:5000
+Browser -> https://app.example.com -> host Nginx -> frontend container -> /api -> backend:5000
 ```
 
-## 10. Advanced Option: Frontend / Backend Separation
-
-If you want:
-
-- frontend: `app.example.com`
-- API: `api.example.com`
-
-you can use a dual-domain setup, but note:
-
-1. the frontend must point API requests to `api.example.com`
-2. backend cross-origin handling must be correct
-3. this is better suited for deployments where you control frontend source/customization
-
-Host Nginx can expose:
-
-- `app.example.com` -> `127.0.0.1:8888`
-- `api.example.com` -> `127.0.0.1:5000`
-
-Example `api.example.com` config:
+If you need a separate `api.example.com`, expose only the host-local backend through Nginx:
 
 ```nginx
 server {
@@ -276,172 +251,149 @@ server {
 }
 ```
 
-If you only want logical separation without cross-origin complexity, keep:
+Also set `FRONTEND_URL` in the backend runtime env to include every public frontend origin.
 
-- `https://app.example.com/`
-- `https://app.example.com/api/`
+## 8. Operations
 
-## 11. Common Operations
-
-Check status:
+For GHCR deployment:
 
 ```bash
-docker-compose ps
+docker compose -f docker-compose.ghcr.yml ps
+docker compose -f docker-compose.ghcr.yml logs -f backend
+docker compose -f docker-compose.ghcr.yml logs -f postgres
+docker compose -f docker-compose.ghcr.yml restart backend
 ```
 
-View logs:
+Update GHCR images:
 
 ```bash
-docker-compose logs -f backend
-docker-compose logs -f frontend
-docker-compose logs -f postgres
+docker compose -f docker-compose.ghcr.yml pull
+docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-Update:
+For full repository deployment:
 
 ```bash
 git pull
-docker-compose up -d --build
+docker compose pull
+docker compose up -d --build
 ```
 
-Restart:
+Back up Postgres before major upgrades:
 
 ```bash
-docker-compose restart backend
-docker-compose restart frontend
+docker exec quantdinger-db pg_dump -U quantdinger quantdinger > quantdinger_backup.sql
 ```
 
-Stop:
+## 9. Postgres 18 and Existing Data
+
+The current default Postgres image is `postgres:18.3-alpine`, with `PGDATA=/var/lib/postgresql/18/docker`.
+
+If you already have a Postgres 16 data volume, do not start it with Postgres 18 directly. Either:
+
+- keep using a matching Postgres 16 image until you migrate;
+- export/import with `pg_dump` and `pg_restore`;
+- run a proper `pg_upgrade` migration.
+
+For a disposable development database only, use the command that matches your deployment mode.
+
+GHCR deployment:
 
 ```bash
-docker-compose down
+docker compose -f docker-compose.ghcr.yml down -v
+docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-## 12. Troubleshooting
+Full repository deployment:
 
-### 1. Image pull failures
+```bash
+docker compose down -v
+docker compose up -d
+```
 
-Symptoms:
+Do not use `down -v` on production data.
 
-- `failed to resolve source metadata`
-- `registry-1.docker.io`
-- `Docker Desktop has no HTTPS proxy`
+## 10. Troubleshooting
 
-Fix:
+### Image pull failures
+
+If `redis`, `postgres`, or Docker Hub images fail to pull, set an image mirror in project-root `.env`:
 
 ```ini
 IMAGE_PREFIX=docker.m.daocloud.io/library/
 ```
 
-Then rerun:
+Then retry:
 
 ```bash
-docker-compose up -d --build
+docker compose -f docker-compose.ghcr.yml pull
 ```
 
-### 2. Backend logs show `exec /usr/local/bin/docker-entrypoint.sh: no such file or directory`
-
-Fix:
+If GHCR images fail:
 
 ```bash
-docker-compose build --no-cache backend
-docker-compose up -d backend
-```
-
-### 3. Frontend logs show `host not found in upstream "backend"`
-
-This usually means backend failed first.
-
-Fix:
-
-```bash
-docker-compose ps
-docker-compose logs backend --tail=100
-docker-compose restart frontend
-```
-
-### 4. `docker compose up` fails to pull `quantdinger-frontend`
-
-The frontend image lives on GHCR (`ghcr.io/brokermr810/quantdinger-frontend`). If the pull fails:
-
-```bash
+docker pull ghcr.io/brokermr810/quantdinger-backend:latest
 docker pull ghcr.io/brokermr810/quantdinger-frontend:latest
+docker pull ghcr.io/brokermr810/quantdinger-mobile:latest
+```
+
+Common causes include network blocks, private package visibility, or a pinned tag that does not exist.
+
+### Backend exits immediately
+
+Check:
+
+```bash
+docker compose -f docker-compose.ghcr.yml logs --tail=100 backend
 ```
 
 Common causes:
 
-- Image visibility set to private — switch the package to public in GitHub, or `docker login ghcr.io` first
-- Network firewall blocks GHCR — set a mirror prefix via `FRONTEND_IMAGE` in project-root `.env`
-- Tag pinned by `IMAGE_TAG` (or `BACKEND_TAG` / `FRONTEND_TAG`) no longer exists — fall back to `latest` or pick an existing semver tag
+- invalid backend env syntax;
+- missing or placeholder `SECRET_KEY` in full repository mode;
+- database not healthy;
+- wrong `DATABASE_URL` override.
 
-### 5. Saving settings fails with `Read-only file system: '/app/.env'`
+### Nginx 502 or blank page
 
-This means `backend_api_python/.env` is mounted read-only into the container.
-
-In `docker-compose.yml`, avoid:
-
-```yaml
-- ./backend_api_python/.env:/app/.env:ro
-```
-
-Use a writable mount instead:
-
-```yaml
-- ./backend_api_python/.env:/app/.env
-```
-
-Then run:
+Check local services first:
 
 ```bash
-docker-compose up -d backend
+curl http://127.0.0.1:8888/health
+curl http://127.0.0.1:8889/health
+curl http://127.0.0.1:5000/api/health
+sudo nginx -t
 ```
 
-### 6. Proxy works on host but not inside Docker
+Then inspect containers:
 
-If your proxy listens on host `127.0.0.1:10808`, do not use `127.0.0.1` inside the container, because that points to the container itself.
+```bash
+docker compose -f docker-compose.ghcr.yml ps
+docker compose -f docker-compose.ghcr.yml logs --tail=100 frontend
+docker compose -f docker-compose.ghcr.yml logs --tail=100 backend
+```
 
-For Docker deployments, use:
+### Exchange or LLM network requests need a proxy
+
+For backend runtime outbound requests, set `PROXY_URL` in `backend.env` or `backend_api_python/.env`.
+
+Inside Docker, do not use `127.0.0.1` for a host proxy unless the proxy is running inside the same container. Use a reachable host address, for example:
 
 ```ini
 PROXY_URL=socks5h://host.docker.internal:10808
 ```
 
-### 7. Exchange logs show `symbol not found`
+On Linux, you may need to expose your proxy on a private interface or configure Docker host gateway support.
 
-If proxy/network access is already working but some symbols still fail, for example:
+### Public ports
 
-```text
-Symbol 'MATIC/USDT' not found on okx
-```
+Do not expose these publicly:
 
-this is usually a market-symbol mapping / token-rename issue on the exchange side, not a general network failure.
-
-### 8. Nginx 502 / 504
-
-Check:
-
-```bash
-docker-compose ps
-curl http://127.0.0.1:8888/health
-curl http://127.0.0.1:5000/api/health
-sudo nginx -t
-```
-
-### 9. PostgreSQL should not be public
-
-Recommended:
-
-```ini
-DB_PORT=127.0.0.1:5432
-```
-
-Do not expose:
-
-- `5432`
 - `5000`
+- `5432`
+- `6379`
 
 Publicly expose only:
 
 - `80`
 - `443`
-

@@ -263,6 +263,24 @@ class BitgetSpotClient(BaseRestClient):
                 raise LiveTradingError(f"BitgetSpot error: {data}")
         return data if isinstance(data, dict) else {"raw": data}
 
+    def get_fee_rate(self, symbol: str, market_type: str = "spot") -> Optional[Dict[str, float]]:
+        sym = to_bitget_um_symbol(symbol)
+        try:
+            raw = self._signed_request(
+                "GET",
+                "/api/v2/common/trade-rate",
+                params={"symbol": sym, "businessType": "spot"},
+            )
+            data = raw.get("data") if isinstance(raw, dict) else None
+            if isinstance(data, dict):
+                maker = abs(float(data.get("makerFeeRate") or 0))
+                taker = abs(float(data.get("takerFeeRate") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"BitgetSpot get_fee_rate({symbol}, businessType=spot, symbol_param={sym}) failed: {e}")
+        return None
+
     def get_symbol_meta(self, *, symbol: str) -> Dict[str, Any]:
         """
         Fetch spot symbol metadata (best-effort).

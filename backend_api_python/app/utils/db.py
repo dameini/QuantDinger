@@ -95,6 +95,10 @@ def _resolve_init_sql_path() -> Path:
     return Path(__file__).resolve().parent.parent.parent / 'migrations' / 'init.sql'
 
 
+def _resolve_market_symbols_sql_path() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / 'migrations' / 'market_symbols_master.sql'
+
+
 def _apply_init_sql(logger):
     """Run ``migrations/init.sql`` idempotently.
 
@@ -113,7 +117,11 @@ def _apply_init_sql(logger):
         return
 
     try:
-        sql_text = init_sql.read_text(encoding='utf-8')
+        sql_parts = [init_sql.read_text(encoding='utf-8')]
+        symbols_sql = _resolve_market_symbols_sql_path()
+        if symbols_sql.exists():
+            sql_parts.append(symbols_sql.read_text(encoding='utf-8'))
+        sql_text = "\n\n".join(sql_parts)
         with get_db_connection() as conn:
             cur = conn.cursor()
             try:
@@ -121,7 +129,10 @@ def _apply_init_sql(logger):
             finally:
                 cur.close()
             conn.commit()
-        logger.info("Applied %s (%d bytes)", init_sql.name, init_sql.stat().st_size)
+        total_size = init_sql.stat().st_size
+        if symbols_sql.exists():
+            total_size += symbols_sql.stat().st_size
+        logger.info("Applied migrations seed SQL (%d bytes)", total_size)
     except Exception as exc:
         logger.warning(
             "Auto-migrate failed (continuing with existing schema): %s. "

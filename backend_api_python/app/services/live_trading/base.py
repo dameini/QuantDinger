@@ -17,6 +17,13 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import requests
 
+from app.utils.resource_guard import (
+    ResourceExhaustedError,
+    assert_fd_available,
+    is_fd_exhaustion,
+    mark_fd_exhausted,
+)
+
 logger = logging.getLogger(__name__)
 
 # Cached SSL verify setting for all live-trading REST calls (requests + SOCKS proxy).
@@ -92,6 +99,15 @@ class LiveTradingError(Exception):
     pass
 
 
+def is_file_descriptor_exhausted(exc: BaseException | str) -> bool:
+    """Detect process file-descriptor exhaustion across wrapped exception chains."""
+    if isinstance(exc, str):
+        text = exc.lower()
+        return "too many open files" in text or "errno 24" in text
+
+    return is_fd_exhaustion(exc)
+
+
 class BaseRestClient:
     def __init__(self, base_url: str, timeout_sec: float = 15.0):
         self.base_url = (base_url or "").rstrip("/")
@@ -115,16 +131,26 @@ class BaseRestClient:
     ) -> Tuple[int, Dict[str, Any], str]:
         url = self._url(path)
         try:
-            resp = requests.request(
-                method=str(method or "GET").upper(),
-                url=url,
-                params=params or None,
-                json=json_body if json_body is not None else None,
-                data=data,
-                headers=headers or None,
-                timeout=self.timeout_sec,
-                verify=_get_requests_verify(),
-            )
+            assert_fd_available("exchange REST")
+            request_headers = dict(headers or {})
+            request_headers.setdefault("Connection", "close")
+            with requests.request(
+                    method=str(method or "GET").upper(),
+                    url=url,
+                    params=params or None,
+                    json=json_body if json_body is not None else None,
+                    data=data,
+                    headers=request_headers or None,
+                    timeout=self.timeout_sec,
+                    verify=_get_requests_verify(),
+            ) as resp:
+                text = resp.text or ""
+                parsed: Dict[str, Any] = {}
+                try:
+                    parsed = resp.json() if text else {}
+                except Exception:
+                    parsed = {"raw_text": text[:2000]}
+                return int(resp.status_code), parsed, text
         except UnicodeEncodeError as e:
             # requests/http.client requires header values to be latin-1 encodable.
             # This usually means user pasted API keys/passphrases containing non-ASCII characters,
@@ -136,6 +162,9 @@ class BaseRestClient:
                 f"Original error: {e}"
             )
         except requests.exceptions.SSLError as e:
+            if is_file_descriptor_exhausted(e):
+                mark_fd_exhausted(e)
+                raise LiveTradingError(f"Resource exhausted: too many open files while calling exchange REST: {e}") from e
             logger.warning(
                 "Exchange HTTPS TLS verify failed (%s). Same setting applies to all REST exchanges (Gate, HTX/hbdm, etc.). "
                 "Behind PROXY_URL/SOCKS or TLS inspection: set LIVE_TRADING_CA_BUNDLE to a PEM bundle (or REQUESTS_CA_BUNDLE), "
@@ -144,13 +173,13 @@ class BaseRestClient:
                 e,
             )
             raise
-        text = resp.text or ""
-        parsed: Dict[str, Any] = {}
-        try:
-            parsed = resp.json() if text else {}
-        except Exception:
-            parsed = {"raw_text": text[:2000]}
-        return int(resp.status_code), parsed, text
+        except requests.exceptions.RequestException as e:
+            if is_file_descriptor_exhausted(e):
+                mark_fd_exhausted(e)
+                raise LiveTradingError(f"Resource exhausted: too many open files while calling exchange REST: {e}") from e
+            raise
+        except ResourceExhaustedError as e:
+            raise LiveTradingError(f"Resource exhausted: too many open files while calling exchange REST: {e}") from e
 
     @staticmethod
     def _now_ms() -> int:

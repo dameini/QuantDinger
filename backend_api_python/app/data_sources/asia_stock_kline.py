@@ -16,15 +16,17 @@ Twelve Data (https://twelvedata.com) supports XSHG/XSHE/XHKG at all intervals.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Generator, List, Optional
 
 import pandas as pd
 import requests
 
 from app.utils.logger import get_logger
+from app.utils.resource_guard import ResourceExhaustedError, assert_fd_available, record_exception
 
 logger = get_logger(__name__)
 
@@ -148,6 +150,41 @@ _TD_INTERVAL_MAP = {
     "1W": "1week",
 }
 
+_TD_DAILY_LIMIT_LOCK = threading.Lock()
+_TD_DAILY_LIMIT_UNTIL = 0.0
+
+
+def _twelvedata_daily_limit_active() -> bool:
+    with _TD_DAILY_LIMIT_LOCK:
+        return time.time() < _TD_DAILY_LIMIT_UNTIL
+
+
+def _mark_twelvedata_daily_limited(symbol: str, exchange: str, message: str) -> None:
+    global _TD_DAILY_LIMIT_UNTIL
+    now = datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).date()
+    until = datetime(
+        tomorrow.year,
+        tomorrow.month,
+        tomorrow.day,
+        0,
+        5,
+        tzinfo=timezone.utc,
+    ).timestamp()
+    first = False
+    with _TD_DAILY_LIMIT_LOCK:
+        if time.time() >= _TD_DAILY_LIMIT_UNTIL:
+            first = True
+        _TD_DAILY_LIMIT_UNTIL = max(_TD_DAILY_LIMIT_UNTIL, until)
+    if first:
+        logger.warning(
+            "TwelveData daily API credits exhausted for %s/%s; "
+            "skipping TwelveData requests until next UTC day. Last message: %s",
+            symbol,
+            exchange,
+            message,
+        )
+
 
 def _td_symbol_and_exchange(tencent_code: str, is_hk: bool) -> tuple[str, str]:
     """Convert Tencent code to Twelve Data (symbol, exchange).
@@ -176,12 +213,20 @@ def fetch_twelvedata_klines(
     before_time: Optional[int],
 ) -> List[Dict[str, Any]]:
     """Fetch K-lines from Twelve Data REST API. Requires TWELVE_DATA_API_KEY."""
+    try:
+        assert_fd_available("TwelveData K-line")
+    except ResourceExhaustedError as e:
+        logger.warning(str(e))
+        return []
+
     api_key = _get_twelve_data_api_key()
     if not api_key:
         return []
 
     interval = _TD_INTERVAL_MAP.get(timeframe)
     if not interval:
+        return []
+    if _twelvedata_daily_limit_active():
         return []
 
     symbol, exchange = _td_symbol_and_exchange(tencent_code, is_hk)
@@ -207,6 +252,11 @@ def fetch_twelvedata_klines(
             data = resp.json()
             break
         except Exception as e:
+            try:
+                record_exception(e, scope="TwelveData K-line")
+            except ResourceExhaustedError as guarded:
+                logger.warning(str(guarded))
+                return []
             if attempt + 1 < _MAX_ATTEMPTS and _is_transient(e):
                 delay = min(_BACKOFF_CAP_SEC, _BACKOFF_BASE_SEC * (2 ** attempt))
                 logger.debug(
@@ -223,7 +273,10 @@ def fetch_twelvedata_klines(
     if data.get("status") != "ok" or "values" not in data:
         code = data.get("code", "")
         msg = data.get("message", str(data))
-        if code == 429 or "API credits" in msg or "minute limit" in msg:
+        msg_l = str(msg).lower()
+        if "api credits" in msg_l or "for the day" in msg_l:
+            _mark_twelvedata_daily_limited(symbol, exchange, msg)
+        elif code == 429 or "minute limit" in msg_l:
             logger.warning("TwelveData rate limit for %s/%s: %s", symbol, exchange, msg)
         elif "Pro" in msg or "Venture" in msg or "upgrading" in msg:
             logger.debug("TwelveData plan limit %s/%s tf=%s: %s", symbol, exchange, timeframe, msg)
@@ -372,6 +425,12 @@ def fetch_yfinance_klines(
 ) -> List[Dict[str, Any]]:
     """Fetch K-lines via yfinance for CN/HK stocks. Globally accessible, no API key needed."""
     try:
+        assert_fd_available("yfinance K-line")
+    except ResourceExhaustedError as e:
+        logger.warning(str(e))
+        return []
+
+    try:
         import yfinance as yf
     except ImportError:
         logger.debug("yfinance not installed; skipping yfinance K-lines")
@@ -401,6 +460,11 @@ def fetch_yfinance_klines(
             )
             break
         except Exception as e:
+            try:
+                record_exception(e, scope="yfinance K-line")
+            except ResourceExhaustedError as guarded:
+                logger.warning(str(guarded))
+                return []
             if attempt + 1 < _MAX_ATTEMPTS and _is_transient(e):
                 delay = min(_BACKOFF_CAP_SEC, _BACKOFF_BASE_SEC * (2 ** attempt))
                 logger.debug(
@@ -501,6 +565,12 @@ def fetch_akshare_minute_klines(
     limit: int,
     before_time: Optional[int],
 ) -> List[Dict[str, Any]]:
+    try:
+        assert_fd_available("AkShare minute K-line")
+    except ResourceExhaustedError as e:
+        logger.warning(str(e))
+        return []
+
     p = _minute_period_str(timeframe)
     if p is None:
         return []
@@ -524,6 +594,11 @@ def fetch_akshare_minute_klines(
                     df = ak.stock_zh_a_hist_min_em(symbol=sym, start_date=sd, end_date=ed, period=p, adjust=adj)
             break
         except Exception as e:
+            try:
+                record_exception(e, scope="AkShare minute K-line")
+            except ResourceExhaustedError as guarded:
+                logger.warning(str(guarded))
+                return []
             if attempt + 1 < _MAX_ATTEMPTS and _is_transient(e):
                 delay = min(_BACKOFF_CAP_SEC, _BACKOFF_BASE_SEC * (2 ** attempt))
                 logger.debug(
@@ -550,6 +625,12 @@ def fetch_akshare_weekly_klines(
     before_time: Optional[int],
 ) -> List[Dict[str, Any]]:
     try:
+        assert_fd_available("AkShare weekly K-line")
+    except ResourceExhaustedError as e:
+        logger.warning(str(e))
+        return []
+
+    try:
         import akshare as ak  # type: ignore
     except ImportError:
         return []
@@ -570,6 +651,11 @@ def fetch_akshare_weekly_klines(
                     df = ak.stock_zh_a_hist(symbol=sym, period="weekly", start_date=start_s, end_date=end_s, adjust="qfq")
             break
         except Exception as e:
+            try:
+                record_exception(e, scope="AkShare weekly K-line")
+            except ResourceExhaustedError as guarded:
+                logger.warning(str(guarded))
+                return []
             if attempt + 1 < _MAX_ATTEMPTS and _is_transient(e):
                 delay = min(_BACKOFF_CAP_SEC, _BACKOFF_BASE_SEC * (2 ** attempt))
                 logger.debug(

@@ -7,7 +7,7 @@ from __future__ import annotations
 import copy
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from app.services.backtest import BacktestService
@@ -189,14 +189,15 @@ class ExperimentRunnerService:
                     snapshot, cand, indicator_params,
                 )
                 try:
-                    result = self.backtest_service.run_strategy_snapshot(
+                    result = self._run_backtest_checked(
                         cand_snapshot,
                         start_date=train_start,
                         end_date=train_end,
+                        candidate_name=str(cand.get('name') or f'R{round_num}_{idx}'),
                     )
                 except Exception as exc:
                     logger.error("Backtest failed for %s: %s", cand.get('name'), exc)
-                    result = {}
+                    continue
 
                 score = scorer.score_result(result, regime=regime)
                 candidate_item = {
@@ -382,6 +383,8 @@ class ExperimentRunnerService:
         """Strip heavy fields (equityCurve, trades list) to keep payload small."""
         if not result:
             return {}
+        if result.get('error'):
+            return {'error': str(result.get('error') or '')}
         return {
             'totalReturn': result.get('totalReturn'),
             'annualReturn': result.get('annualReturn'),
@@ -391,6 +394,65 @@ class ExperimentRunnerService:
             'winRate': result.get('winRate'),
             'totalTrades': result.get('totalTrades'),
         }
+
+    @staticmethod
+    def _result_summary(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not result:
+            return None
+        return {
+            'totalReturn': result.get('totalReturn'),
+            'maxDrawdown': result.get('maxDrawdown'),
+            'sharpeRatio': result.get('sharpeRatio'),
+            'totalTrades': result.get('totalTrades'),
+        }
+
+    @staticmethod
+    def _backtest_error(result: Dict[str, Any]) -> str:
+        if not isinstance(result, dict):
+            return 'Backtest returned an invalid result'
+        err = result.get('error')
+        return str(err).strip() if err else ''
+
+    @staticmethod
+    def _is_no_trade_error(error: Exception) -> bool:
+        text = str(error or '').lower()
+        return (
+            'no signals generated' in text or
+            'no trades executed' in text
+        )
+
+    @staticmethod
+    def _empty_oos_result(error: Exception) -> Dict[str, Any]:
+        return {
+            'totalReturn': 0.0,
+            'annualReturn': 0.0,
+            'maxDrawdown': 0.0,
+            'sharpeRatio': 0.0,
+            'profitFactor': 0.0,
+            'winRate': 0.0,
+            'totalTrades': 0,
+            'equityCurve': [],
+            'oosNote': str(error or ''),
+        }
+
+    def _run_backtest_checked(
+        self,
+        snapshot: Dict[str, Any],
+        *,
+        start_date: datetime,
+        end_date: datetime,
+        candidate_name: str = '',
+    ) -> Dict[str, Any]:
+        result = self.backtest_service.run_strategy_snapshot(
+            snapshot,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        err = self._backtest_error(result)
+        if err:
+            label = f" for {candidate_name}" if candidate_name else ""
+            raise ValueError(f"Backtest failed{label}: {err}")
+        return result
 
     @staticmethod
     def _emit(callback: Optional[Callable], event: str, data: Dict[str, Any]) -> None:
@@ -407,23 +469,31 @@ class ExperimentRunnerService:
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
         base = payload.get('base') or payload
+        parameter_space = payload.get('parameterSpace') or {}
         snapshot, start_date, end_date = self._build_snapshot(base=base, user_id=user_id)
 
         regime = self.detect_regime(base)
         candidates = self._build_candidates(
             base_snapshot=snapshot,
             variants=payload.get('variants') or [],
-            parameter_space=payload.get('parameterSpace') or {},
+            parameter_space=parameter_space,
             evolution=payload.get('evolution') or {},
         )
 
         ranked: List[Dict[str, Any]] = []
+        failures: List[str] = []
         for candidate in candidates:
-            result = self.backtest_service.run_strategy_snapshot(
-                candidate['snapshot'],
-                start_date=start_date,
-                end_date=end_date,
-            )
+            try:
+                result = self._run_backtest_checked(
+                    candidate['snapshot'],
+                    start_date=start_date,
+                    end_date=end_date,
+                    candidate_name=str(candidate.get('name') or ''),
+                )
+            except Exception as exc:
+                logger.error("Pipeline backtest failed for %s: %s", candidate.get('name'), exc)
+                failures.append(str(exc))
+                continue
             score = self.scoring_service.score_result(result, regime=regime)
             ranked.append({
                 'name': candidate['name'],
@@ -433,6 +503,10 @@ class ExperimentRunnerService:
                 'score': score,
                 'result': self._slim_result(result),
             })
+
+        if not ranked:
+            detail = failures[0] if failures else 'No valid candidates were generated'
+            raise ValueError(f'All tuning candidates failed backtest. {detail}')
 
         ranked = self.scoring_service.rank_results(ranked)
         best = ranked[0] if ranked else None
@@ -524,16 +598,19 @@ class ExperimentRunnerService:
                 candidates = [c for c in candidates if c.get('source') != 'baseline']
 
             ranked = []
+            failures: List[str] = []
             for candidate in candidates:
                 try:
-                    result = self.backtest_service.run_strategy_snapshot(
+                    result = self._run_backtest_checked(
                         candidate['snapshot'],
                         start_date=train_start,
                         end_date=train_end,
+                        candidate_name=str(candidate.get('name') or ''),
                     )
                 except Exception as exc:
                     logger.error("structured_tune backtest failed for %s: %s", candidate.get('name'), exc)
-                    result = {}
+                    failures.append(f"{candidate.get('name') or 'candidate'}: {exc}")
+                    continue
                 score = scorer.score_result(result, regime=regime)
                 ranked.append(enrich_experiment_candidate({
                     'name': candidate['name'],
@@ -544,6 +621,10 @@ class ExperimentRunnerService:
                     'score': score,
                     'result': self._slim_result(result),
                 }))
+
+            if not ranked:
+                detail = failures[0] if failures else 'No valid candidates were generated'
+                raise ValueError(f'All tuning candidates failed backtest. {detail}')
 
         evaluation_trace = self._build_evaluation_trace(ranked)
         ranked = scorer.rank_results(ranked)
@@ -651,16 +732,19 @@ class ExperimentRunnerService:
                 },
             )
             ranked: List[Dict[str, Any]] = []
+            failures: List[str] = []
             for candidate in candidates:
                 try:
-                    result = self.backtest_service.run_strategy_snapshot(
+                    result = self._run_backtest_checked(
                         candidate['snapshot'],
                         start_date=train_start,
                         end_date=train_end,
+                        candidate_name=str(candidate.get('name') or ''),
                     )
                 except Exception as exc:
                     logger.error("fallback backtest failed: %s", exc)
-                    result = {}
+                    failures.append(str(exc))
+                    continue
                 score = active_scorer.score_result(result, regime=regime)
                 ranked.append({
                     'name': candidate['name'],
@@ -671,32 +755,38 @@ class ExperimentRunnerService:
                     'score': score,
                     'result': self._slim_result(result),
                 })
+            if not ranked:
+                detail = failures[0] if failures else 'No valid candidates were generated'
+                raise ValueError(f'All tuning candidates failed backtest. {detail}')
             return ranked
 
         ranked: List[Dict[str, Any]] = []
+        failures: List[str] = []
 
         # Optionally evaluate the baseline first so the user always sees how
         # the unmodified strategy compares to optimizer-found candidates.
         if include_baseline:
             try:
-                base_result = self.backtest_service.run_strategy_snapshot(
+                base_result = self._run_backtest_checked(
                     copy.deepcopy(base_snapshot),
                     start_date=train_start,
                     end_date=train_end,
+                    candidate_name='baseline',
                 )
             except Exception as exc:
                 logger.error("baseline backtest failed: %s", exc)
-                base_result = {}
-            base_score = active_scorer.score_result(base_result, regime=regime)
-            ranked.append({
-                'name': 'baseline',
-                'reasoning': '',
-                'source': 'baseline',
-                'overrides': {},
-                'snapshot': copy.deepcopy(base_snapshot),
-                'score': base_score,
-                'result': self._slim_result(base_result),
-            })
+                failures.append(str(exc))
+            else:
+                base_score = active_scorer.score_result(base_result, regime=regime)
+                ranked.append({
+                    'name': 'baseline',
+                    'reasoning': '',
+                    'source': 'baseline',
+                    'overrides': {},
+                    'snapshot': copy.deepcopy(base_snapshot),
+                    'score': base_score,
+                    'result': self._slim_result(base_result),
+                })
 
         gen_idx = 0
         while True:
@@ -708,13 +798,15 @@ class ExperimentRunnerService:
             for cand_idx, overrides in enumerate(batch, start=1):
                 snap = self._apply_overrides_to_snapshot(base_snapshot, overrides)
                 try:
-                    result = self.backtest_service.run_strategy_snapshot(
+                    result = self._run_backtest_checked(
                         snap, start_date=train_start, end_date=train_end,
+                        candidate_name=f'{method}_g{gen_idx}_c{cand_idx}',
                     )
                 except Exception as exc:
                     logger.error("%s backtest failed for gen=%d cand=%d: %s",
                                  method, gen_idx, cand_idx, exc)
-                    result = {}
+                    failures.append(str(exc))
+                    continue
                 score = active_scorer.score_result(result, regime=regime)
                 overall = float((score or {}).get('overallScore') or 0.0)
                 tell_buffer.append((overrides, overall))
@@ -727,8 +819,13 @@ class ExperimentRunnerService:
                     'score': score,
                     'result': self._slim_result(result),
                 })
+            if not tell_buffer:
+                break
             optimizer.tell(tell_buffer)
 
+        if not ranked:
+            detail = failures[0] if failures else 'No valid candidates were generated'
+            raise ValueError(f'All tuning candidates failed backtest. {detail}')
         return ranked
 
     @staticmethod
@@ -829,7 +926,12 @@ class ExperimentRunnerService:
         if not start_raw or not end_raw:
             raise ValueError('startDate/start_date and endDate/end_date are required (YYYY-MM-DD)')
         start_date = datetime.strptime(str(start_raw), '%Y-%m-%d')
-        end_date = datetime.strptime(str(end_raw), '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+        requested_end = datetime.strptime(str(end_raw), '%Y-%m-%d').date()
+        latest_complete_day = datetime.now().date() - timedelta(days=1)
+        end_day = min(requested_end, latest_complete_day)
+        end_date = datetime.combine(end_day, datetime.min.time()).replace(hour=23, minute=59, second=59)
+        if end_date <= start_date:
+            raise ValueError('Backtest end date must be before today and later than start date')
         return start_date, end_date
 
     @staticmethod
@@ -874,30 +976,48 @@ class ExperimentRunnerService:
         oos_start: datetime,
         oos_end: datetime,
         regime: Dict[str, Any],
-        top_k: int = 5,
+        top_k: Optional[int] = None,
         scorer: Optional[StrategyScoringService] = None,
     ) -> List[Dict[str, Any]]:
-        """Re-backtest top-K candidates on OOS data and annotate the rank list.
+        """Re-backtest candidates on OOS data and annotate the rank list.
 
-        We attach ``oosScore``/``oosResult`` and a degradation flag so the
-        client can flag overfit candidates. The mutation is in-place; the
-        same list is returned for chaining.
+        We attach compact OOS metrics and a degradation flag so the client
+        can flag overfit candidates. The mutation is in-place; the same list
+        is returned for chaining.
         """
         if not ranked or oos_end <= oos_start:
             return ranked
         active_scorer = scorer or self.scoring_service
-        for candidate in ranked[:top_k]:
+        limit = len(ranked) if top_k is None else max(0, min(int(top_k), len(ranked)))
+        for candidate in ranked[:limit]:
             try:
-                oos_result = self.backtest_service.run_strategy_snapshot(
+                oos_result = self._run_backtest_checked(
                     candidate.get('snapshot') or {},
                     start_date=oos_start,
                     end_date=oos_end,
+                    candidate_name=str(candidate.get('name') or ''),
                 )
             except Exception as exc:
                 logger.warning(
                     "OOS backtest failed for %s: %s", candidate.get('name'), exc
                 )
-                oos_result = {}
+                if self._is_no_trade_error(exc):
+                    oos_result = self._empty_oos_result(exc)
+                    oos_score = active_scorer.score_result(oos_result, regime=regime)
+                    is_overall = float(((candidate.get('score') or {}).get('overallScore') or 0))
+                    oos_overall = float((oos_score or {}).get('overallScore') or 0)
+                    degradation = round((is_overall - oos_overall) / is_overall, 4) if is_overall > 0 else None
+                    candidate['oosScore'] = oos_score
+                    candidate['oosResult'] = self._slim_result(oos_result)
+                    candidate['oosSummary'] = self._result_summary(candidate['oosResult'])
+                    candidate['oosDegradation'] = degradation
+                    candidate['oosOverfit'] = bool(
+                        degradation is not None and degradation > 0.4
+                    )
+                    candidate['oosNote'] = 'No OOS trades were generated.'
+                    continue
+                candidate['oosError'] = str(exc)
+                continue
             oos_score = active_scorer.score_result(oos_result, regime=regime)
             is_overall = float(((candidate.get('score') or {}).get('overallScore') or 0))
             oos_overall = float((oos_score or {}).get('overallScore') or 0)
@@ -906,6 +1026,7 @@ class ExperimentRunnerService:
                 degradation = round((is_overall - oos_overall) / is_overall, 4)
             candidate['oosScore'] = oos_score
             candidate['oosResult'] = self._slim_result(oos_result)
+            candidate['oosSummary'] = self._result_summary(candidate['oosResult'])
             candidate['oosDegradation'] = degradation
             # Severely overfit if OOS score collapses by 40%+ from IS.
             candidate['oosOverfit'] = bool(
@@ -1194,29 +1315,18 @@ class ExperimentRunnerService:
         if not best:
             return None
         result = best.get('result') or {}
-        oos_result = best.get('oosResult') or {}
-        oos_summary = None
-        if oos_result:
-            oos_summary = {
-                'totalReturn': oos_result.get('totalReturn'),
-                'maxDrawdown': oos_result.get('maxDrawdown'),
-                'sharpeRatio': oos_result.get('sharpeRatio'),
-                'totalTrades': oos_result.get('totalTrades'),
-            }
+        oos_summary = best.get('oosSummary')
         return {
             'name': best.get('name'),
             'score': best.get('score'),
             'source': best.get('source'),
             'overrides': enrich_experiment_overrides(best.get('overrides') or {}),
             'snapshot': best.get('snapshot'),
-            'summary': {
-                'totalReturn': result.get('totalReturn'),
-                'maxDrawdown': result.get('maxDrawdown'),
-                'sharpeRatio': result.get('sharpeRatio'),
-                'totalTrades': result.get('totalTrades'),
-            },
+            'summary': ExperimentRunnerService._result_summary(result),
             'oosSummary': oos_summary,
             'oosScore': best.get('oosScore'),
             'oosDegradation': best.get('oosDegradation'),
             'oosOverfit': bool(best.get('oosOverfit')),
+            'oosError': best.get('oosError'),
+            'oosNote': best.get('oosNote'),
         }

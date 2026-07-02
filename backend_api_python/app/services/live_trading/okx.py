@@ -426,8 +426,11 @@ class OkxClient(BaseRestClient):
         return self._signed_request("GET", "/api/v5/account/balance")
 
     def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
-        inst_type = "SPOT" if market_type == "spot" else "SWAP"
-        inst_id = symbol.upper()
+        mt = str(market_type or "swap").strip().lower()
+        if mt in ("futures", "future", "perp", "perpetual"):
+            mt = "swap"
+        inst_type = "SPOT" if mt == "spot" else "SWAP"
+        inst_id = to_okx_spot_inst_id(symbol) if mt == "spot" else to_okx_swap_inst_id(symbol)
         try:
             raw = self._signed_request("GET", "/api/v5/account/trade-fee", params={"instType": inst_type, "instId": inst_id})
             data = (raw.get("data") or []) if isinstance(raw, dict) else []
@@ -438,7 +441,7 @@ class OkxClient(BaseRestClient):
                 if maker > 0 or taker > 0:
                     return {"maker": maker, "taker": taker}
         except Exception as e:
-            logger.warning(f"OKX get_fee_rate({symbol}) failed: {e}")
+            logger.warning(f"OKX get_fee_rate({symbol}, market_type={mt}, inst_id={inst_id}) failed: {e}")
         return None
 
     def get_positions(self, *, inst_id: str = "", inst_type: str = "SWAP") -> Dict[str, Any]:

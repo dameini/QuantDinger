@@ -94,6 +94,52 @@ def delete_script_source():
         return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
 
 
+@strategy_blp.route("/strategies/script-sources/versions", methods=["GET"])
+@login_required
+def list_script_source_versions():
+    try:
+        source_id = int(request.args.get("sourceId") or request.args.get("source_id") or request.args.get("id") or 0)
+        if not source_id:
+            return jsonify({"code": 0, "msg": "source id is required", "data": []}), 400
+        ok, rows = get_script_source_service().list_versions(source_id, g.user_id)
+        if not ok:
+            return jsonify({"code": 0, "msg": "script source not found", "data": []}), 404
+        return jsonify({"code": 1, "msg": "success", "data": rows})
+    except Exception as exc:
+        logger.error("list_script_source_versions failed: %s", exc)
+        return jsonify({"code": 0, "msg": str(exc), "data": []}), 500
+
+
+@strategy_blp.route("/strategies/script-sources/versions/<int:version_id>", methods=["GET"])
+@login_required
+def get_script_source_version(version_id: int):
+    try:
+        item = get_script_source_service().get_version(version_id, g.user_id)
+        if not item:
+            return jsonify({"code": 0, "msg": "version not found", "data": None}), 404
+        return jsonify({"code": 1, "msg": "success", "data": item})
+    except Exception as exc:
+        logger.error("get_script_source_version failed: %s", exc)
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
+@strategy_blp.route("/strategies/script-sources/versions/restore", methods=["POST"])
+@login_required
+def restore_script_source_version():
+    try:
+        payload = _source_payload()
+        version_id = int(payload.get("versionId") or payload.get("version_id") or 0)
+        if not version_id:
+            return jsonify({"code": 0, "msg": "version id is required", "data": None}), 400
+        item = get_script_source_service().restore_version(version_id, g.user_id)
+        if not item:
+            return jsonify({"code": 0, "msg": "version not found", "data": None}), 404
+        return jsonify({"code": 1, "msg": "success", "data": item})
+    except Exception as exc:
+        logger.error("restore_script_source_version failed: %s", exc)
+        return jsonify({"code": 0, "msg": str(exc), "data": None}), 500
+
+
 @strategy_blp.route("/strategies/script-sources/publish", methods=["POST"])
 @login_required
 def publish_script_source():
@@ -124,6 +170,7 @@ def publish_script_source():
             price=payload.get("price") or 0,
             is_admin=is_admin,
             existing_indicator_id=int(payload.get("indicatorId") or payload.get("indicator_id") or 0),
+            source_id=source_id,
         )
         if data is not None:
             data["source_id"] = source_id

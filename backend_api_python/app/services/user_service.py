@@ -573,15 +573,7 @@ class UserService:
             return False
     
     def get_token_version(self, user_id: int) -> int:
-        """
-        获取用户当前的 token 版本号。
-        
-        Args:
-            user_id: 用户ID
-        
-        Returns:
-            当前 token 版本号，默认为 1
-        """
+        """Return the current token version for a user; defaults to 1."""
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
@@ -599,16 +591,7 @@ class UserService:
             return 1
     
     def increment_token_version(self, user_id: int) -> int:
-        """
-        递增用户的 token 版本号，使旧的 token 失效。
-        用于实现单一客户端登录（踢出其他设备）。
-        
-        Args:
-            user_id: 用户ID
-        
-        Returns:
-            新的 token 版本号
-        """
+        """Increment token version so older tokens become invalid."""
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
