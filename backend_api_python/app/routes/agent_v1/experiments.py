@@ -10,6 +10,7 @@ from app.utils.agent_auth import (
 )
 from app.utils.agent_jobs import submit_job
 from app.utils.logger import get_logger
+from flask import request
 
 from . import agent_v1_bp
 from ._helpers import envelope, error, get_json_or_400
@@ -61,6 +62,7 @@ def submit_pipeline():
         kind="experiment_pipeline",
         request_payload=payload,
         runner=_run,
+        idempotency_key=request.headers.get("Idempotency-Key"),
     )
     return envelope(job, message="queued", status=202)
 

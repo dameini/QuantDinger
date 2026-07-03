@@ -25,7 +25,7 @@ def fresh_module(monkeypatch):
 
 
 def test_mcp_tool_registry_complete(fresh_module):
-    assert len(fresh_module.MCP_TOOL_NAMES) == 26
+    assert len(fresh_module.MCP_TOOL_NAMES) == 29
     # Every exported name should correspond to a registered @mcp.tool function.
     for name in fresh_module.MCP_TOOL_NAMES:
         assert hasattr(fresh_module, name), f"missing tool function: {name}"
@@ -41,6 +41,18 @@ def test_update_strategy_blocks_running_without_trade_scope(fresh_module):
     out = fresh_module.update_strategy(1, {"status": "running"})
     assert out.get("error") is True
     assert out.get("status") == 403
+
+
+def test_stop_strategy_requires_confirmation(fresh_module):
+    out = fresh_module.stop_strategy(1)
+    assert out.get("error") is True
+    assert out.get("status") == 400
+
+
+def test_place_quick_order_requires_confirmation(fresh_module):
+    out = fresh_module.place_quick_order("Crypto", "BTC/USDT", "buy", 0.001)
+    assert out.get("error") is True
+    assert out.get("status") == 400
 
 
 def test_indicator_code_size_rejected_in_mcp(monkeypatch, fresh_module):

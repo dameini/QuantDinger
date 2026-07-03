@@ -40,6 +40,7 @@ def register(app) -> None:
     from . import backtests  # noqa: F401
     from . import experiments  # noqa: F401
     from . import portfolio  # noqa: F401
+    from . import runtime  # noqa: F401
     from . import quick_trade  # noqa: F401
     from . import jobs as jobs_module  # noqa: F401
     from . import indicators  # noqa: F401

@@ -150,13 +150,23 @@ Restart the IDE, then ask things like:
   2024-01-01 and 2024-06-30; use `wait_for_job` for the result."*
 - *"Create a strategy named **eth-trend-bot**, use the indicator I just
   saved, leave it in `stopped` state."*
+- *"Call `runtime_overview` and summarize what is currently running."*
+- *"Stop strategy 123 with `stop_strategy(confirm_stop=true)` because I asked
+  you to stop it."*
+- *"Place a paper quick order with `place_quick_order(confirm_order=true)`.
+  If this token is live-capable, require `confirm_live_trading=true` too."*
 
 ### MCP tools vs REST
 
-The MCP server wraps **Read (R), Workspace write (W), and Backtest (B)** tools
-only. It does **not** expose trading (`quick-trade/*`), admin token APIs, or
-credential vault access — even if your token has those scopes. That boundary
-is intentional.
+The MCP server wraps **Read (R), Workspace write (W), Backtest (B)**, and
+explicit Trading (T) tools. `runtime_overview` is read-only. `stop_strategy`
+requires `T` scope and `confirm_stop=true`. `place_quick_order` requires `T`
+scope and `confirm_order=true`; if the token is live-capable
+(`paper_only=false`), it also requires `confirm_live_trading=true` and the
+backend must have `AGENT_LIVE_TRADING_ENABLED=true`.
+
+MCP still does **not** expose admin token APIs or credential vault access,
+even if your token has those scopes.
 
 Long-running jobs: prefer MCP `wait_for_job` or bounded `stream_job_until_done`
 (capped by `QUANTDINGER_MCP_JOB_STREAM_MAX_*` env vars). Raw Gateway SSE is
@@ -191,4 +201,4 @@ layered-contracts model.
 - [OpenAPI 3.0 spec](agent-openapi.json) — machine-readable contract for
   `/api/agent/v1`.
 - [MCP server README](../../mcp_server/README.md) — installation, env vars,
-  and developer notes for the `quantdinger-mcp` package itself.
+  tool list, and common tool-call examples for the `quantdinger-mcp` package.

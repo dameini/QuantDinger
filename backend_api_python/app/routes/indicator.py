@@ -48,6 +48,10 @@ logger = get_logger(__name__)
 indicator_blp = Blueprint("indicator", __name__)
 
 
+def _sse_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
 def _now_ts() -> int:
     return int(time.time())
 
@@ -683,7 +687,7 @@ def ai_generate():
     if not prompt:
         # Keep SSE contract (match PHP behavior) so frontend doesn't look "stuck".
         def _err_stream():
-            yield "data: " + json.dumps({"error": _indicator_ai_text("prompt_required", lang)}, ensure_ascii=False) + "\n\n"
+            yield "data: " + _sse_json({"error": _indicator_ai_text("prompt_required", lang)}) + "\n\n"
             yield "data: [DONE]\n\n"
 
         return Response(
@@ -1047,7 +1051,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             debug["human_summary"] = _indicator_human_summary(
                 validation, validation, False, False, "initial", lang=lang
             )
-            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            logger.info("ai_generate debug=%s", _sse_json(debug))
             return code_text, debug
 
         logger.warning("ai_generate produced code needing auto-fix: %s", _format_validation_issues(validation))
@@ -1066,7 +1070,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             debug["human_summary"] = _indicator_human_summary(
                 validation, validation, True, False, "initial", lang=lang
             )
-            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            logger.info("ai_generate debug=%s", _sse_json(debug))
             return code_text, debug
 
         repaired_validation = _validate_indicator_code_internal(repaired)
@@ -1082,7 +1086,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             debug["human_summary"] = _indicator_human_summary(
                 validation, repaired_validation, True, True, "repaired", lang=lang
             )
-            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            logger.info("ai_generate debug=%s", _sse_json(debug))
             return repaired, debug
 
         repaired_hint_codes = {h.get("code") for h in repaired_validation.get("hints", [])}
@@ -1098,7 +1102,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             debug["human_summary"] = _indicator_human_summary(
                 validation, repaired_validation, True, True, "repaired", lang=lang
             )
-            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            logger.info("ai_generate debug=%s", _sse_json(debug))
             return repaired, debug
 
         if repaired_hint_codes.intersection(AUTO_FIX_HINT_CODES):
@@ -1113,7 +1117,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
             debug["human_summary"] = _indicator_human_summary(
                 validation, repaired_validation, True, False, "initial", lang=lang
             )
-            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            logger.info("ai_generate debug=%s", _sse_json(debug))
             return code_text, debug
 
         debug = {
@@ -1126,7 +1130,7 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
         debug["human_summary"] = _indicator_human_summary(
             validation, repaired_validation, True, False, "repaired", lang=lang
         )
-        logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+        logger.info("ai_generate debug=%s", _sse_json(debug))
         return repaired, debug
 
     # Capture user_id before generator runs (generator executes outside request context)
@@ -1141,19 +1145,19 @@ Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **n
         )
         if not ok:
             error_msg = f"Insufficient credits: {msg}" if msg else _indicator_ai_text("insufficient_credits", lang)
-            yield "data: " + json.dumps({"error": error_msg}, ensure_ascii=False) + "\n\n"
+            yield "data: " + _sse_json({"error": error_msg}) + "\n\n"
             yield "data: [DONE]\n\n"
             return
 
         code_text, debug_info = _generate_final_code()
 
-        yield "data: " + json.dumps({"debug": debug_info}, ensure_ascii=False) + "\n\n"
+        yield "data: " + _sse_json({"debug": debug_info}) + "\n\n"
 
         # Stream in chunks (front-end appends).
         chunk_size = 200
         for i in range(0, len(code_text), chunk_size):
             chunk = code_text[i : i + chunk_size]
-            yield "data: " + json.dumps({"content": chunk}, ensure_ascii=False) + "\n\n"
+            yield "data: " + _sse_json({"content": chunk}) + "\n\n"
         yield "data: [DONE]\n\n"
 
     return Response(

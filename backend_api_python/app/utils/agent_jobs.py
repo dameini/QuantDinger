@@ -150,6 +150,51 @@ def submit_job(
     }
 
 
+def record_completed_job(
+    *,
+    user_id: int,
+    agent_token_id: Optional[int],
+    kind: str,
+    request_payload: dict,
+    result: Any,
+    idempotency_key: Optional[str] = None,
+) -> dict:
+    """Persist a completed synchronous agent action for idempotent replay."""
+    job_id = _new_job_id()
+    now = datetime.utcnow()
+    with get_db_connection() as db:
+        cur = db.cursor()
+        cur.execute(
+            """
+            INSERT INTO qd_agent_jobs
+              (job_id, user_id, agent_token_id, kind, status, request, result,
+               idempotency_key, created_at, started_at, finished_at)
+            VALUES (%s, %s, %s, %s, 'succeeded', %s::jsonb, %s::jsonb, %s, %s, %s, %s)
+            """,
+            (
+                job_id,
+                int(user_id),
+                agent_token_id,
+                kind,
+                json.dumps(request_payload, default=str),
+                json.dumps(result, default=str),
+                idempotency_key,
+                now,
+                now,
+                now,
+            ),
+        )
+        db.commit()
+        cur.close()
+
+    return {
+        "job_id": job_id,
+        "status": "succeeded",
+        "kind": kind,
+        "created_at": now.isoformat() + "Z",
+    }
+
+
 def _runner_accepts_progress(runner: Callable) -> bool:
     """True if `runner` declares a second positional parameter (on_progress)."""
     try:

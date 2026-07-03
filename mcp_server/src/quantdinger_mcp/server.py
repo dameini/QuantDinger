@@ -4,7 +4,7 @@ QuantDinger MCP server — exposes the Agent Gateway as MCP tools.
 This is intentionally a thin wrapper:
   * REST stays the source of truth (`/api/agent/v1`).
   * Exposes Read (R), Workspace write (W), and Backtest (B) tools.
-  * Trading (T) is NOT exposed here — use REST directly if explicitly enabled.
+  * Live order placement is NOT exposed here; runtime stop is exposed with T.
   * The user-supplied agent token's scopes still gate every call server-side.
 
 If you want to expose more (e.g. trading), prefer issuing a token with the
@@ -35,10 +35,13 @@ MCP_TOOL_NAMES = (
     "list_markets",
     "search_symbols",
     "get_klines",
-    "get_price",
-    "list_strategies",
-    "get_strategy",
-    "list_jobs",
+    "get_price",
+    "list_strategies",
+    "get_strategy",
+    "runtime_overview",
+    "stop_strategy",
+    "place_quick_order",
+    "list_jobs",
     "get_job",
     "wait_for_job",
     "stream_job_until_done",
@@ -128,7 +131,11 @@ mcp = FastMCP(
     instructions=(
         "Tools for the QuantDinger self-hosted quant platform. "
         "All tools are tenant-scoped via the configured agent token. "
-        "Trading is intentionally NOT exposed via MCP; use the REST API for that. "
+        "Live order placement is available only through place_quick_order with "
+        "T scope, confirm_order=true, and confirm_live_trading=true when the "
+        "token is not paper-only. Server-side live trading flags still apply. "
+        "Runtime overview is available, and stop_strategy can stop a tenant-owned "
+        "strategy when the token has T scope. "
         "SECURITY: never log or paste the agent token; responses may include "
         "redacted (***) credential placeholders — do not attempt to recover them. "
         "INDICATOR WORKFLOW (required): "
@@ -225,13 +232,109 @@ def list_strategies(limit: int = 50) -> Any:
 
 
 @mcp.tool()
-def get_strategy(strategy_id: int) -> Any:
-    """Get a strategy by id (tenant-scoped; secrets redacted)."""
-    return _get(f"/api/agent/v1/strategies/{int(strategy_id)}")
-
-
-@mcp.tool()
-def get_job(job_id: str) -> Any:
+def get_strategy(strategy_id: int) -> Any:
+    """Get a strategy by id (tenant-scoped; secrets redacted)."""
+    return _get(f"/api/agent/v1/strategies/{int(strategy_id)}")
+
+
+@mcp.tool()
+def runtime_overview() -> Any:
+    """Compact runtime overview for this tenant.
+
+    Returns running strategy counts, running strategy summaries, position
+    count, pending-order count, paper-order count, and unrealized PnL.
+    """
+    return _get("/api/agent/v1/runtime/overview")
+
+
+@mcp.tool()
+def stop_strategy(strategy_id: int, confirm_stop: bool = False) -> Any:
+    """Stop one tenant-owned strategy (requires T scope).
+
+    This does not place orders and does not delete the strategy. Pass
+    `confirm_stop=true` only after the user explicitly asks to stop it.
+    """
+    if not confirm_stop:
+        return {
+            "error": True,
+            "status": 400,
+            "body": {
+                "message": (
+                    "Stopping a strategy changes runtime state. Re-call with "
+                    "confirm_stop=true after explicit user approval."
+                ),
+            },
+        }
+    return _post(f"/api/agent/v1/strategies/{int(strategy_id)}/stop")
+
+
+@mcp.tool()
+def place_quick_order(
+    market: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    order_type: str = "market",
+    limit_price: float | None = None,
+    credential_id: int | None = None,
+    market_type: str = "spot",
+    leverage: int = 1,
+    margin_mode: str | None = None,
+    idempotency_key: str | None = None,
+    confirm_order: bool = False,
+    confirm_live_trading: bool = False,
+) -> Any:
+    """Place a quick order through Agent Gateway (requires T scope).
+
+    Paper-only tokens create paper fills. Live-capable tokens require
+    `confirm_live_trading=true` and the server-side live-trading flag.
+    """
+    if not confirm_order:
+        return {
+            "error": True,
+            "status": 400,
+            "body": {
+                "message": (
+                    "Order placement changes account state. Re-call with "
+                    "confirm_order=true after explicit user approval."
+                ),
+            },
+        }
+
+    identity = _get("/api/agent/v1/whoami")
+    if isinstance(identity, dict) and identity.get("paper_only") is False and not confirm_live_trading:
+        return {
+            "error": True,
+            "status": 400,
+            "body": {
+                "message": (
+                    "This Agent Token is live-capable. Re-call with "
+                    "confirm_live_trading=true after explicit user approval."
+                ),
+            },
+        }
+
+    payload: dict[str, Any] = {
+        "market": market,
+        "symbol": symbol,
+        "side": side,
+        "qty": float(qty),
+        "order_type": order_type,
+        "market_type": market_type,
+        "leverage": int(leverage or 1),
+    }
+    if limit_price is not None:
+        payload["limit_price"] = float(limit_price)
+    if credential_id is not None:
+        payload["credential_id"] = int(credential_id)
+    if margin_mode:
+        payload["margin_mode"] = margin_mode
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+    return _post("/api/agent/v1/quick-trade/orders", json=payload, headers=headers)
+
+
+@mcp.tool()
+def get_job(job_id: str) -> Any:
     """Poll a previously-submitted backtest / experiment job."""
     return _get(f"/api/agent/v1/jobs/{job_id}")
 
@@ -598,4 +701,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

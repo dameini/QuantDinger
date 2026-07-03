@@ -27,7 +27,7 @@ You may see errors like:
 可能会看到类似错误：
 
 ```text
-failed to resolve reference "docker.io/library/redis:7-alpine"
+failed to resolve reference "docker.io/library/redis:8-alpine"
 failed to do request: Head "https://registry-1.docker.io/v2/library/redis/manifests/7-alpine"
 connecting to registry-1.docker.io:443: connectex: A connection attempt failed
 ```
@@ -125,7 +125,7 @@ Opening this URL in a browser may show `UNAUTHORIZED`:
 浏览器打开下面地址时可能显示 `UNAUTHORIZED`：
 
 ```text
-https://registry-1.docker.io/v2/library/redis/manifests/7-alpine
+https://registry-1.docker.io/v2/library/redis/manifests/8-alpine
 ```
 
 This is not an image problem. It means the Docker Registry endpoint is reachable, but the browser did not send Docker's authentication token.

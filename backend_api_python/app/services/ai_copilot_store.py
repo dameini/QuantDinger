@@ -2,7 +2,7 @@
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from app.utils.logger import get_logger
@@ -15,7 +15,20 @@ def now_utc() -> datetime:
 
 
 def json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default,
+    )
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
 
 
 def row_to_dict(row: Any) -> dict:
@@ -249,4 +262,3 @@ def load_recent_messages(cur, session_id: int, limit: int = 12) -> list[dict]:
     )
     rows = [row_to_dict(r) for r in (cur.fetchall() or [])]
     return list(reversed(rows))
-

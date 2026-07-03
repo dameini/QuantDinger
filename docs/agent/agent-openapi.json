@@ -126,7 +126,11 @@
           "side":        { "type": "string", "enum": ["buy","sell"] },
           "qty":         { "type": "number" },
           "order_type":  { "type": "string", "enum": ["market","limit"], "default": "market" },
-          "limit_price": { "type": "number", "nullable": true }
+          "limit_price": { "type": "number", "nullable": true },
+          "credential_id": { "type": "integer", "description": "Required for live agent trading" },
+          "market_type": { "type": "string", "enum": ["spot","swap"], "default": "spot" },
+          "leverage": { "type": "integer", "default": 1 },
+          "margin_mode": { "type": "string", "enum": ["cross","isolated"], "nullable": true }
         }
       }
     }
@@ -217,6 +221,23 @@
         "x-scope-class": "W",
         "parameters": [{ "in": "path", "name": "strategy_id", "required": true, "schema": { "type": "integer" } }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/api/agent/v1/strategies/{strategy_id}/stop": {
+      "post": {
+        "summary": "Stop a tenant-owned strategy",
+        "description": "Persists status='stopped', attempts to stop the runtime executor, and verifies the final persisted status. Does not delete the strategy and does not place orders.",
+        "x-scope-class": "T",
+        "parameters": [{ "in": "path", "name": "strategy_id", "required": true, "schema": { "type": "integer" } }],
+        "responses": { "200": { "description": "Stopped" }, "404": { "description": "Strategy not found" } }
+      }
+    },
+    "/api/agent/v1/runtime/overview": {
+      "get": {
+        "summary": "Runtime overview",
+        "description": "Compact tenant runtime overview: strategy counts, running strategy summaries, positions, pending orders, paper orders, and unrealized PnL.",
+        "x-scope-class": "R",
         "responses": { "200": { "description": "OK" } }
       }
     },
@@ -367,7 +388,8 @@
     },
     "/api/agent/v1/quick-trade/orders": {
       "post": {
-        "summary": "Place an order (paper-only by default)",
+        "summary": "Place a quick order (paper by default; live only when fully unlocked)",
+        "description": "Requires T scope. Paper-only tokens record qd_agent_paper_orders. Live execution requires token paper_only=false, AGENT_LIVE_TRADING_ENABLED=true, and credential_id. Live orders reuse the same execution path as human Quick Trade.",
         "x-scope-class": "T",
         "parameters": [{ "in": "header", "name": "Idempotency-Key", "required": false, "schema": { "type": "string" } }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderRequest" } } } },

@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from flask import Response, g, jsonify, request, stream_with_context
@@ -26,7 +26,7 @@ from app.services.ai_skill_registry import (
     render_prompt_template,
     set_skill_enabled,
 )
-from app.services.ai_tool_registry import build_tool_prompt, public_tool_registry
+from app.services.ai_tool_registry import build_tool_prompt, list_tools, public_tool_registry
 from app.services.ai_copilot_store import (
     create_session as store_create_session,
     detect_memory_candidates as store_detect_memory_candidates,
@@ -52,6 +52,7 @@ from app.data_providers.news import get_economic_calendar_payload
 from app.utils.auth import admin_required, login_required
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.utils.timeutil import to_utc_iso
 
 logger = get_logger(__name__)
 
@@ -70,6 +71,18 @@ def _json_dumps(value: Any) -> str:
     return store_json_dumps(value)
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return to_utc_iso(value) or value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _plain_text(value: Any) -> str:
     if value is None:
         return ""
@@ -79,7 +92,7 @@ def _plain_text(value: Any) -> str:
 
 
 def _row_to_dict(row: Any) -> dict:
-    return store_row_to_dict(row)
+    return _json_safe(store_row_to_dict(row))
 
 
 def _json_loads(value: Any, default: Any = None) -> Any:
@@ -87,7 +100,7 @@ def _json_loads(value: Any, default: Any = None) -> Any:
 
 
 def _get_user_memories(cur, user_id: int, limit: int = 12) -> list[dict]:
-    return store_get_user_memories(cur, user_id, limit)
+    return _json_safe(store_get_user_memories(cur, user_id, limit))
 
 
 def _detect_memory_candidates(message: str, language: str) -> list[dict]:
@@ -116,6 +129,8 @@ def _detect_intent(message: str, has_image: bool) -> str:
         return "market_analysis"
     if any(k in text for k in ("雷达", "机会", "扫描", "radar", "opportunity", "scan")):
         return "opportunity_radar"
+    if any(k in text for k in ("交易计划", "trade plan", "trading plan", "entry trigger", "stop loss", "take profit")):
+        return "market_analysis"
     return "general"
 
 
@@ -365,7 +380,7 @@ def _attachment_meta(attachments: list[dict]) -> list[dict]:
 
 
 def _get_session(cur, user_id: int, session_id: int | None) -> dict | None:
-    return store_get_session(cur, user_id, session_id)
+    return _json_safe(store_get_session(cur, user_id, session_id))
 
 
 def _create_session(cur, user_id: int, title: str, context: dict) -> int:
@@ -404,7 +419,7 @@ def _insert_message(
 
 
 def _load_recent_messages(cur, session_id: int, limit: int = 12) -> list[dict]:
-    return store_load_recent_messages(cur, session_id, limit)
+    return _json_safe(store_load_recent_messages(cur, session_id, limit))
 
 def _to_float(value: Any, default: float | None = None) -> float | None:
     try:
@@ -1294,13 +1309,14 @@ def _snapshot_for_candidate(candidate: dict | None) -> dict | None:
 
 def _research_task_flags(message: str, intent: str, has_image: bool = False) -> dict:
     text = (message or "").lower()
+    wants_trade_plan = any(k in text for k in ("交易计划", "trade plan", "trading plan", "entry trigger", "stop loss", "take profit", "position sizing"))
     wants_macro = any(k in text for k in ("nfp", "cpi", "fomc", "fed", "rates", "pce", "gdp", "inflation", "payroll", "非农", "利率", "通胀", "就业", "宏观"))
     wants_market_data = any(
         k in text for k in ("price", "quote", "trend", "support", "resistance", "行情", "价格", "走势", "支撑", "阻力", "k线", "kline", "多少钱", "股价", "现价")
     )
     return {
         "intent": intent,
-        "needs_market_data": wants_market_data or (intent in {"market_analysis", "opportunity_radar"} and not wants_macro),
+        "needs_market_data": wants_trade_plan or wants_market_data or (intent in {"market_analysis", "opportunity_radar"} and not wants_macro),
         "needs_news": any(k in text for k in ("latest", "news", "headline", "event", "ipo", "spac", "spacex", "新闻", "消息", "事件", "上市", "影响")),
         "needs_macro": wants_macro,
         "needs_fundamentals": any(k in text for k in ("valuation", "market cap", "earnings", "revenue", "fundamental", "估值", "市值", "财报", "营收", "基本面")),
@@ -1467,6 +1483,98 @@ def _legacy_intelligence_context(research_context: dict) -> dict:
         "search": research_context.get("news") or {},
         "macro": research_context.get("macro") or {},
         "data_gaps": research_context.get("data_gaps") or [],
+    }
+
+
+def _agent_usage_payload(agent_plan: dict | None, context: dict, language: str) -> dict:
+    """Build a compact, user-visible trace of skills and data tools used."""
+    plan = agent_plan if isinstance(agent_plan, dict) else {}
+    research = context.get("research_context") if isinstance(context.get("research_context"), dict) else {}
+    skill_items: list[dict[str, Any]] = []
+    seen_skills: set[str] = set()
+
+    for item in plan.get("skill_details") or []:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("id") or "").strip()
+        if not sid or sid in seen_skills:
+            continue
+        seen_skills.add(sid)
+        skill_items.append({
+            "id": sid,
+            "label": item.get("label") or sid,
+            "category": item.get("category") or "",
+            "risk_level": item.get("risk_level") or "read",
+            "read_only": bool(item.get("read_only", True)),
+        })
+
+    workflow = research.get("workflow") if isinstance(research.get("workflow"), dict) else {}
+    for item in workflow.get("recommended_skills") or []:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("id") or "").strip()
+        if not sid or sid in seen_skills:
+            continue
+        seen_skills.add(sid)
+        skill_items.append({
+            "id": sid,
+            "label": item.get("label") or sid,
+            "category": item.get("category") or "",
+            "risk_level": item.get("risk_level") or "read",
+            "read_only": bool(item.get("read_only", True)),
+        })
+
+    tool_by_id = {tool.get("id"): tool for tool in list_tools(language)}
+    tool_ids: list[tuple[str, str]] = []
+    market_data = research.get("market_data") if isinstance(research.get("market_data"), dict) else {}
+    news = research.get("news") if isinstance(research.get("news"), dict) else {}
+    macro = research.get("macro") if isinstance(research.get("macro"), dict) else {}
+    if context.get("market_snapshot") or market_data.get("selected_snapshot") or market_data.get("primary_snapshot"):
+        tool_ids.append(("market_data.lookup", "market_snapshot"))
+    if plan.get("intent") == "strategy_build":
+        workflow_name = str(plan.get("workflow") or "")
+        if workflow_name == "script_strategy":
+            tool_ids.append(("script_strategy.generate", "strategy_workflow"))
+        elif workflow_name == "trading_bot":
+            tool_ids.append(("trading_bot.create_stopped", "strategy_workflow"))
+        else:
+            tool_ids.append(("indicator.generate", "strategy_workflow"))
+
+    tool_items = []
+    seen_tools: set[str] = set()
+    for tool_id, source in tool_ids:
+        if tool_id in seen_tools:
+            continue
+        seen_tools.add(tool_id)
+        registry_item = tool_by_id.get(tool_id) or {}
+        tool_items.append({
+            "id": tool_id,
+            "label": registry_item.get("label") or tool_id,
+            "category": registry_item.get("category") or source,
+            "source": source,
+            "status": "used",
+            "read_only": bool(registry_item.get("read_only", True)),
+            "risk_level": registry_item.get("risk_level") or "read",
+        })
+
+    return {
+        "skills": skill_items[:6],
+        "tools": tool_items[:6],
+        "intent": plan.get("intent") or context.get("intent") or "",
+        "workflow": plan.get("workflow") or "",
+    }
+
+
+def _agent_usage_action(agent_plan: dict | None, context: dict, language: str) -> dict | None:
+    payload = _agent_usage_payload(agent_plan, context, language)
+    if not payload.get("skills") and not payload.get("tools"):
+        return None
+    return {
+        "key": "agent-usage",
+        "type": "agent_usage",
+        "icon": "apartment",
+        "label": "本次使用" if (language or "").lower().startswith("zh") else "Used this turn",
+        "payload": payload,
     }
 
 
@@ -2127,6 +2235,10 @@ def chat_message():
             if not answer:
                 answer = "The model did not return a usable answer."
 
+            actions = parsed.get("actions") or []
+            usage_action = _agent_usage_action(agent_plan, context, language)
+            if usage_action:
+                actions = [usage_action, *actions]
             assistant_id = _insert_message(
                 cur,
                 session_id=sid,
@@ -2135,7 +2247,7 @@ def chat_message():
                 content=answer,
                 attachments=[],
                 intent=intent,
-                actions=parsed.get("actions") or [],
+                actions=actions,
             )
             cur.execute(
                 "UPDATE qd_ai_copilot_sessions SET title = COALESCE(NULLIF(title, ''), ?), updated_at = NOW() WHERE id = ?",
@@ -2154,7 +2266,8 @@ def chat_message():
                 "intent": intent,
                 "agent_intent": agent_plan,
                 "confidence": parsed.get("confidence", 50),
-                "actions": parsed.get("actions") or [],
+                "actions": actions,
+                "agent_usage": usage_action.get("payload") if usage_action else None,
                 "memory_candidates": _detect_memory_candidates(message, language),
                 "artifact": parsed.get("artifact") or {"type": "none"},
                 "costs": costs,
@@ -2200,6 +2313,7 @@ def chat_message_stream():
         sid = None
         costs = {}
         chunks: list[str] = []
+        usage_action = _agent_usage_action(agent_plan, context, language)
         try:
             with get_db_connection() as db:
                 cur = db.cursor()
@@ -2237,7 +2351,15 @@ def chat_message_stream():
                     intent,
                     json_response=False,
                 )
-                yield _sse("meta", {"session_id": sid, "user_message_id": user_message_id, "intent": intent, "agent_intent": agent_plan, "costs": costs})
+                yield _sse("meta", {
+                    "session_id": sid,
+                    "user_message_id": user_message_id,
+                    "intent": intent,
+                    "agent_intent": agent_plan,
+                    "agent_usage": usage_action.get("payload") if usage_action else None,
+                    "actions": [usage_action] if usage_action else [],
+                    "costs": costs,
+                })
                 for delta in LLMService().stream_llm_api(llm_messages, temperature=0.35):
                     chunks.append(delta)
                     yield _sse("delta", {"text": delta})
@@ -2251,6 +2373,7 @@ def chat_message_stream():
                     content=answer,
                     attachments=[],
                     intent=intent,
+                    actions=[usage_action] if usage_action else [],
                 )
                 cur.execute(
                     "UPDATE qd_ai_copilot_sessions SET title = COALESCE(NULLIF(title, ''), ?), updated_at = NOW() WHERE id = ?",
@@ -2263,6 +2386,8 @@ def chat_message_stream():
                     "message_id": assistant_id,
                     "intent": intent,
                     "confidence": 50,
+                    "agent_usage": usage_action.get("payload") if usage_action else None,
+                    "actions": [usage_action] if usage_action else [],
                     "costs": costs,
                     "memory_candidates": _detect_memory_candidates(message, language),
                 })
@@ -2270,7 +2395,11 @@ def chat_message_stream():
             logger.error(f"chat_message_stream failed: {e}", exc_info=True)
             yield _sse("error", {"msg": str(e), "session_id": sid, "costs": costs})
 
-    return Response(generate(), mimetype="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return Response(generate(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    })
 
 
 @ai_chat_blp.route("/chat/sessions", methods=["GET"])

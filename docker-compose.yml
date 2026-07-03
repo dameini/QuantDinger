@@ -22,7 +22,9 @@
 #   `docker.xuanyuan.me/library/`.
 # Backend Dockerfile uses official Debian/PyPI sources by default.
 # For mainland China builds, set BUILD_REGION=cn to use Aliyun mirrors with fallback.
-# For slow pulls of base images, optionally set IMAGE_PREFIX or Docker Engine registry-mirrors.
+# The backend build defaults to a Docker Hub mirror for python:3.12 because
+# Docker Hub auth/base-image pulls are a common first-install failure. Set
+# PYTHON_BASE_IMAGE=python:3.12-slim-bookworm to force the official source.
 
 services:
   # ========================
@@ -64,7 +66,7 @@ services:
   # Redis (optional cache layer)
   # ========================
   redis:
-    image: ${IMAGE_PREFIX:-}redis:7-alpine
+    image: ${REDIS_IMAGE:-${IMAGE_PREFIX:-}redis:8-alpine}
     container_name: quantdinger-redis
     restart: unless-stopped
     command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
@@ -86,7 +88,7 @@ services:
       context: ./backend_api_python
       dockerfile: Dockerfile
       args:
-        BASE_IMAGE: ${IMAGE_PREFIX:-}python:3.12-slim-bookworm
+        BASE_IMAGE: ${PYTHON_BASE_IMAGE:-docker.1ms.run/library/python:3.12-slim-bookworm}
         # global (default): use official Debian/PyPI sources.
         # cn: use Aliyun apt/PyPI mirrors with fallback to official.
         BUILD_REGION: ${BUILD_REGION:-global}

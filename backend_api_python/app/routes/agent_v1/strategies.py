@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.backtest_limits import validate_backtest_range
+from app.services.strategy_snapshot import StrategySnapshotResolver
 from app.services.strategy import StrategyService
 from app.utils.agent_auth import (
-    SCOPE_R, SCOPE_W, agent_required, current_user_id,
+    SCOPE_B, SCOPE_R, SCOPE_W, agent_required, current_user_id,
 )
 from app.utils.logger import get_logger
 from flask import request
@@ -118,17 +120,31 @@ def update_strategy(strategy_id: int):
         return err
 
     new_status = (body.get("status") or "").strip().lower()
-    if new_status == "running":
+    if new_status and new_status not in {"running", "stopped"}:
+        return error(400, "status must be running or stopped")
+
+    if new_status in {"running", "stopped"}:
         from app.utils.agent_auth import current_token, parse_scopes
         if "T" not in parse_scopes(current_token().get("scopes")):
             return error(
                 403,
-                "Activating a strategy requires T (trading) scope on this token",
+                "Changing strategy runtime status requires T (trading) scope on this token",
                 http=403,
             )
 
+    config_body = {k: v for k, v in body.items() if k != "status"}
     try:
-        ok = _strategy_service.update_strategy(strategy_id, body, user_id=current_user_id())
+        if config_body:
+            ok = _strategy_service.update_strategy(strategy_id, config_body, user_id=current_user_id())
+        else:
+            ok = bool(_strategy_service.get_strategy(strategy_id, user_id=current_user_id()))
+
+        if ok and new_status:
+            ok = _strategy_service.update_strategy_status(
+                strategy_id,
+                new_status,
+                user_id=current_user_id(),
+            )
     except Exception as exc:
         logger.error(f"agent_v1/strategies update failed: {exc}", exc_info=True)
         return error(500, "update_strategy failed", details=str(exc), http=500)
@@ -138,3 +154,68 @@ def update_strategy(strategy_id: int):
 
     row = _strategy_service.get_strategy(strategy_id, user_id=current_user_id())
     return envelope(_project(row), message="updated")
+
+
+@agent_v1_bp.route("/strategies/<int:strategy_id>/backtest", methods=["POST"])
+@agent_required(SCOPE_B)
+def backtest_strategy(strategy_id: int):
+    """Backtest an existing tenant strategy snapshot.
+
+    This covers both IndicatorStrategy and ScriptStrategy records and mirrors
+    the human `/api/strategies/backtest` path without requiring a browser JWT.
+    """
+    from datetime import datetime
+    from app.services.backtest import BacktestService
+
+    body, err = get_json_or_400()
+    if err:
+        return err
+
+    start_text = str(body.get("start_date") or body.get("startDate") or "").strip()
+    end_text = str(body.get("end_date") or body.get("endDate") or "").strip()
+    if not start_text or not end_text:
+        return error(400, "start_date and end_date are required (YYYY-MM-DD)")
+
+    try:
+        start_date = datetime.strptime(start_text, "%Y-%m-%d")
+        end_date = datetime.strptime(end_text, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    except ValueError:
+        return error(400, "Invalid date. Use YYYY-MM-DD.")
+
+    user_id = current_user_id()
+    strategy = _strategy_service.get_strategy(strategy_id, user_id=user_id)
+    if not strategy:
+        return error(404, "Strategy not found", http=404)
+
+    override_config = body.get("override_config") or body.get("overrideConfig") or {}
+    if not isinstance(override_config, dict):
+        return error(400, "override_config must be an object")
+
+    try:
+        snapshot = StrategySnapshotResolver(user_id=user_id).resolve(strategy, override_config)
+        snapshot["user_id"] = user_id
+        svc = BacktestService()
+        warmup_bars = svc._estimate_warmup_bars(
+            snapshot.get("code") or "",
+            (snapshot.get("strategy_config") or {}).get("indicator_params")
+            if isinstance(snapshot.get("strategy_config"), dict)
+            else None,
+        )
+        range_error = validate_backtest_range(
+            market=snapshot.get("market") or "",
+            symbol=snapshot.get("symbol") or "",
+            timeframe=snapshot.get("timeframe") or "1D",
+            start_date=start_date,
+            end_date=end_date,
+            warmup_bars=warmup_bars,
+        )
+        if range_error:
+            return error(400, range_error.get("msg") or "Invalid backtest range", details=range_error)
+        result = svc.run_strategy_snapshot(snapshot, start_date=start_date, end_date=end_date)
+    except ValueError as exc:
+        return error(400, str(exc))
+    except Exception as exc:
+        logger.error(f"agent_v1/strategies backtest failed: {exc}", exc_info=True)
+        return error(500, "strategy backtest failed", details=str(exc), http=500)
+
+    return envelope({"strategy_id": strategy_id, "result": result}, message="backtested")

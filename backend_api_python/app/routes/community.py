@@ -32,6 +32,7 @@ def get_market_indicators():
         page_size: Page size (default 12)
         keyword: Search keyword
         pricing_type: 'free' / 'paid' / empty (all)
+        vip_free: 1/true to show VIP-free paid assets only
         sort_by: 'score' (default) / 'newest' / 'hot' / 'price_asc' /
                  'price_desc' / 'rating'.
                  'score' sorts by the composite multi-factor backtest score
@@ -44,6 +45,8 @@ def get_market_indicators():
         page_size = int(request.args.get('page_size', 12))
         keyword = request.args.get('keyword', '').strip()
         pricing_type = request.args.get('pricing_type', '').strip() or None
+        vip_free_raw = request.args.get('vip_free', '').strip().lower()
+        vip_free = vip_free_raw in ('1', 'true', 'yes', 'y', 'on')
         sort_by = request.args.get('sort_by', 'score').strip()
         asset_type = request.args.get('asset_type', '').strip() or None
         
@@ -61,6 +64,7 @@ def get_market_indicators():
             page_size=page_size,
             keyword=keyword if keyword else None,
             pricing_type=pricing_type,
+            vip_free=vip_free,
             sort_by=sort_by,
             user_id=g.user_id,
             accept_language=accept_lang,

@@ -165,7 +165,7 @@ QuantDinger is a **self-hosted, local-first AI trading OS** — not a chatbot wi
 | **Agent-native** | First-class **Agent Gateway** (`/api/agent/v1`) + **[`quantdinger-mcp`](https://pypi.org/project/quantdinger-mcp/)** on PyPI — Cursor, Claude Code, and Codex can read markets, run backtests, and trade (paper by default) with full audit logs. |
 | **Dual strategy runtimes** | **`IndicatorStrategy`** (four-way dataframe signals + chart overlays) and **`ScriptStrategy`** (event-driven `on_bar`, explicit orders) — research and production in the same codebase. |
 | **Multi-venue execution** | Direct adapters for Binance, OKX, Bitget, Bybit, Gate, HTX, Coinbase Exchange, Kraken, **IBKR**, and **Alpaca** — unified Broker Accounts page with isolated multi-tenant sessions. |
-| **Production-grade infra** | **PostgreSQL 18** + **Redis 7**, connection pooling, background workers (orders, portfolio monitor, reflection), idempotent schema bootstrap, GHCR multi-arch images (amd64/arm64). |
+| **Production-grade infra** | **PostgreSQL 18** + **Redis 8**, connection pooling, background workers (orders, portfolio monitor, reflection), idempotent schema bootstrap, GHCR multi-arch images (amd64/arm64). |
 | **Security by default** | Refuses default `SECRET_KEY`, agent tokens hashed at rest, **paper-only trading** unless explicitly unlocked server-side, every agent call audit-logged. |
 | **Operator-ready** | OAuth, multi-user roles, credits/membership/USDT billing toggles, an 11-language web UI, and multilingual docs — build a commercial AI trading product on top, not just a hobby bot. |
 
@@ -235,13 +235,13 @@ Deeper references: [AI Integration design](docs/agent/AI_INTEGRATION_DESIGN.md) 
 - **Build** — Professional KLine chart UI; `IndicatorStrategy` (four-way dataframe signals: `open_long`, `close_long`, `open_short`, `close_short`) and `ScriptStrategy` (`on_bar`, `ctx.buy()` / `ctx.sell()`); AI code generation as a starting point, Python as source of truth.
 - **Validate** — Server-side backtests with equity curves, drawdown metrics, trade logs, and strategy snapshots — no client-side-only backtest theater.
 - **Operate** — Live strategy bots, quick trade, crypto spot/swap execution through direct exchange adapters, **IBKR** / **Alpaca** workflows for traditional markets; unified **Broker Accounts** page; notifications (Telegram, email, SMS, Discord, webhooks).
-- **Platform** — Docker Compose + GHCR images, PostgreSQL 18, Redis 7, OAuth, multi-user RBAC, credits / membership / USDT billing toggles, an 11-language web UI, and multilingual documentation.
+- **Platform** — Docker Compose + GHCR images, PostgreSQL 18, Redis 8, OAuth, multi-user RBAC, credits / membership / USDT billing toggles, an 11-language web UI, and multilingual documentation.
 
 ## Architecture
 
 **Design principle:** separate **market data ingestion**, **strategy/backtest compute**, and **order execution** so research never shares a code path with live capital unless you explicitly promote a strategy.
 
-**Stack:** Nginx serves the prebuilt Vue SPA (`ghcr.io/brokermr810/quantdinger-frontend`); **Flask + Gunicorn** API hosts strategy, AI, billing, and agent services; **PostgreSQL 18** is the system of record; **Redis 7** backs cache and worker coordination. Exchanges, brokers, LLMs, and payment rails plug in through env-driven adapters — swap providers without forking core code.
+**Stack:** Nginx serves the prebuilt Vue SPA (`ghcr.io/brokermr810/quantdinger-frontend`); **Flask + Gunicorn** API hosts strategy, AI, billing, and agent services; **PostgreSQL 18** is the system of record; **Redis 8** backs cache and worker coordination. Exchanges, brokers, LLMs, and payment rails plug in through env-driven adapters — swap providers without forking core code.
 
 **Runtime flow:** market feeds → indicator/signal layer → strategy engine → backtest or live runtime → venue-specific execution adapters; pending orders dispatched by background workers with health checks and retry semantics.
 
@@ -268,7 +268,7 @@ flowchart LR
 
     subgraph DATA[State Layer]
         PG[(PostgreSQL 18)]
-        REDIS[(Redis 7)]
+        REDIS[(Redis 8)]
         FILES[Logs and Runtime Data]
     end
 

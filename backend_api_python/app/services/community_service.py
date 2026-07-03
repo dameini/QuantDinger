@@ -75,6 +75,7 @@ class CommunityService:
         page_size: int = 12,
         keyword: str = None,
         pricing_type: str = None,  # 'free' / 'paid' / None(all)
+        vip_free: bool = False,
         sort_by: str = 'score',    # 'score' / 'newest' / 'hot' / 'price_asc' / 'price_desc' / 'rating'
         user_id: int = None,       # Current user id, used to mark purchased items.
         accept_language: str = 'en-US',  # Select name_i18n / description_i18n.
@@ -122,6 +123,9 @@ class CommunityService:
                     where_clauses.append("(i.pricing_type = 'free' OR i.price <= 0)")
                 elif pricing_type == 'paid':
                     where_clauses.append("(i.pricing_type != 'free' AND i.price > 0)")
+
+                if vip_free:
+                    where_clauses.append("(COALESCE(i.vip_free, FALSE) = TRUE)")
 
                 _allowed_asset_types = ('indicator', 'script_template', 'bot_preset')
                 if asset_type and str(asset_type).strip() in _allowed_asset_types:
@@ -1394,6 +1398,7 @@ class CommunityService:
                     SELECT 
                         p.id as purchase_id, p.price as purchase_price, p.created_at as purchase_time,
                         i.id, i.name, i.description, i.preview_image, i.avg_rating,
+                        i.pricing_type, i.price, COALESCE(i.vip_free, FALSE) as vip_free,
                         COALESCE(i.asset_type, 'indicator') as asset_type,
                         u.nickname as seller_nickname, u.avatar as seller_avatar
                     FROM qd_indicator_purchases p
@@ -1458,6 +1463,9 @@ class CommunityService:
                             'description': row['description'][:100] if row['description'] else '',
                             'preview_image': row['preview_image'] or '',
                             'avg_rating': float(row['avg_rating'] or 0),
+                            'pricing_type': row.get('pricing_type') or 'free',
+                            'price': float(row.get('price') or 0),
+                            'vip_free': bool(row.get('vip_free') or False),
                             'asset_type': asset_type,
                         },
                         'seller': {

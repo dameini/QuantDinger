@@ -62,6 +62,10 @@ def validate_indicator_code(code: str, user_params: Dict[str, Any] | None = None
         "params": merged_params,
         "output": None,
     }
+    # Match the backtest execution contract exposed to agents: OHLCV series are
+    # available as convenience globals in addition to df columns.
+    for col in ("open", "high", "low", "close", "volume"):
+        exec_env[col] = exec_env["df"][col]
     exec_env["__builtins__"] = build_safe_builtins()
 
     exec_result = safe_exec_with_validation(

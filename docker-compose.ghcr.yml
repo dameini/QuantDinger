@@ -66,7 +66,7 @@ services:
       retries: 5
 
   redis:
-    image: ${IMAGE_PREFIX:-}redis:7-alpine
+    image: ${REDIS_IMAGE:-${IMAGE_PREFIX:-}redis:8-alpine}
     container_name: quantdinger-redis
     restart: unless-stopped
     command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]

@@ -136,6 +136,30 @@ _SKILLS: tuple[SkillDefinition, ...] = (
         ui={"tone": "strategy", "workflow": "indicator"},
     ),
     SkillDefinition(
+        id="trade_plan",
+        category="research",
+        icon="profile",
+        label=_s("交易计划", "Trading plan"),
+        description=_s(
+            "把当前行情、关键价位和风险约束整理成可执行的交易检查清单",
+            "Turn market context, key levels, and risk constraints into an executable trading checklist",
+        ),
+        prompt_template=_s(
+            "请基于 {symbol_label} 制定一份可执行的交易计划（trade plan）：方向判断、关键价位、入场触发、止损、止盈、仓位控制，以及什么情况下应该等待不做。必须优先使用系统行情快照；数据不足时给出条件化方案。",
+            "Create an executable trading plan for {symbol_label}: directional bias, key levels, entry trigger, stop loss, take profit, position sizing, and when to stay out. Use system market snapshots first; if data is missing, provide a conditional plan.",
+        ),
+        system_instruction=(
+            "Use market_snapshot and research_context before answering. Produce a concise trading checklist with "
+            "bias, evidence, trigger, invalidation, stop, take-profit, sizing, and no-trade conditions. "
+            "Do not create orders or scheduled tasks."
+        ),
+        keywords=("交易计划", "trade plan", "trading plan", "entry", "stop loss", "take profit", "position sizing"),
+        requires=("market_data", "risk_context"),
+        produces=("trade_plan", "risk_checklist"),
+        priority=92,
+        ui={"tone": "plan"},
+    ),
+    SkillDefinition(
         id="script_strategy",
         category="strategy",
         icon="code",
@@ -882,6 +906,7 @@ def render_prompt_template(skill: SkillDefinition, language: str, context: dict[
 def match_skills(message: str, intent: str = "", limit: int = 5) -> list[SkillDefinition]:
     text = (message or "").lower()
     intent = (intent or "").lower()
+    wants_trade_plan = any(token in text for token in ("交易计划", "trade plan", "trading plan", "entry trigger", "stop loss", "take profit", "position sizing"))
     wants_strategy = any(token in text for token in ("策略", "写策略", "生成策略", "创建策略", "设计策略", "交易策略", "strategy", "bot"))
     wants_market_data = any(token in text for token in ("行情", "价格", "实时价格", "k线", "kline", "klines", "ohlcv", "成交量", "quote", "price"))
     wants_code = any(token in text for token in ("代码", "指标", "脚本", "indicator", "script", "code", "ide"))
@@ -893,6 +918,8 @@ def match_skills(message: str, intent: str = "", limit: int = 5) -> list[SkillDe
         score = 0
         if skill.category in intent or skill.id in intent:
             score += 20
+        if wants_trade_plan and skill.id == "trade_plan":
+            score += 30
         for keyword in skill.keywords:
             if keyword.lower() in text:
                 score += 10

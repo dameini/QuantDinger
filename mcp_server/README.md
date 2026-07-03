@@ -14,8 +14,13 @@ remains the source of truth.
 
 ## Security model
 
-- **No live trading via MCP.** `quick-trade/*` endpoints are intentionally
-  not wrapped. Use REST with an explicitly scoped `T` token if needed.
+- **Order placement is explicit and server-gated.** `place_quick_order`
+  requires `T` scope and `confirm_order=true`. If the token is live-capable
+  (`paper_only=false`), the MCP call also requires `confirm_live_trading=true`,
+  and the backend still requires `AGENT_LIVE_TRADING_ENABLED=true`.
+- **Runtime stop is allowed, gated, and explicit.** MCP can read the runtime
+  overview and stop a tenant-owned strategy, but stopping requires `T` scope
+  and `confirm_stop=true`.
 - **Scope gating stays on the server.** The MCP layer forwards your agent
   token; it cannot bypass allowlists or scopes.
 - **Defense in depth:** MCP redacts known credential fields (`api_key`,
@@ -29,7 +34,8 @@ remains the source of truth.
 
 ## What it exposes
 
-Read-class (R), Workspace write (W), and Backtest-class (B) tools.
+Read-class (R), Workspace write (W), Backtest-class (B), and explicit
+Trading-class (T) tools.
 
 | Tool | Class | Purpose |
 |------|-------|---------|
@@ -41,6 +47,9 @@ Read-class (R), Workspace write (W), and Backtest-class (B) tools.
 | `get_price` | R | Latest price |
 | `list_strategies` | R | Tenant's strategies (compact) |
 | `get_strategy` | R | One strategy (secrets redacted) |
+| `runtime_overview` | R | Running strategy / position / pending-order overview |
+| `stop_strategy` | T | Stop a tenant-owned strategy (`confirm_stop=true`) |
+| `place_quick_order` | T | Place paper/live quick order (`confirm_order=true`) |
 | `list_jobs` | R | Recent async jobs |
 | `get_job` | R | Poll one job |
 | `wait_for_job` | R | Poll until terminal or timeout |
@@ -144,4 +153,154 @@ a subprocess, point them at the URL the server is bound to (e.g.
 Never put production exchange keys or admin JWTs in the MCP config — only
 agent tokens, scoped to the capabilities the client actually needs.
 
-Recommended scopes for indicator authoring: **R + W + B**.
+Recommended scopes:
+
+- Indicator authoring and backtesting: **R + W + B**
+- Runtime overview only: **R**
+- Runtime stop from MCP: **R + T** (and call `stop_strategy` with `confirm_stop=true`)
+- Quick order placement: **R + T**. Paper orders work with paper-only tokens;
+  live orders additionally require `paper_only=false`, `confirm_live_trading=true`,
+  and `AGENT_LIVE_TRADING_ENABLED=true` on the backend.
+
+## Common tool calls
+
+MCP clients usually let you ask in natural language, but the examples below
+show the exact tool names and required confirmation flags.
+
+### Check connection and token
+
+Ask your MCP client:
+
+```text
+Use the QuantDinger MCP tool `whoami` and tell me the token scopes, paper_only
+status, and allowed markets.
+```
+
+Useful tools:
+
+- `check_health` - verify the backend is reachable.
+- `whoami` - inspect scopes, allowlists, and whether the token is paper-only.
+- `list_markets` - list markets allowed by the token.
+
+### Read markets
+
+```text
+Use `search_symbols` to search Crypto symbols matching BTC, then use
+`get_klines` to fetch 300 1H candles for BTC/USDT.
+```
+
+Typical parameters:
+
+```json
+{
+  "market": "Crypto",
+  "symbol": "BTC/USDT",
+  "timeframe": "1H",
+  "limit": 300
+}
+```
+
+### Create an indicator and backtest it
+
+Recommended flow:
+
+1. `get_indicator_authoring_contract`
+2. `validate_indicator_code`
+3. `save_indicator`
+4. `create_strategy`
+5. `submit_backtest`
+6. `wait_for_job` or `stream_job_until_done`
+
+Prompt example:
+
+```text
+Call `get_indicator_authoring_contract`, write a simple SMA crossover indicator,
+validate it with `validate_indicator_code`, save it with `save_indicator`, then
+run `submit_backtest` on BTC/USDT 1H from 2024-01-01 to 2024-06-30.
+Use `wait_for_job` for the result.
+```
+
+### Runtime overview
+
+```text
+Use `runtime_overview` and summarize all running strategies, positions,
+pending orders, paper orders, and unrealized PnL.
+```
+
+Requires scope: **R**
+
+### Stop a strategy
+
+Stopping is a runtime state change, so it requires explicit confirmation:
+
+```text
+Stop strategy 123 using `stop_strategy` with `confirm_stop=true`.
+```
+
+Tool call shape:
+
+```json
+{
+  "strategy_id": 123,
+  "confirm_stop": true
+}
+```
+
+Requires scope: **T**
+
+### Place a paper or live quick order
+
+Order placement is always explicit:
+
+```text
+Place a small paper quick order on BTC/USDT using `place_quick_order` with
+confirm_order=true. Do not use live trading unless I explicitly say so.
+```
+
+Paper-order call shape:
+
+```json
+{
+  "market": "Crypto",
+  "symbol": "BTC/USDT",
+  "side": "buy",
+  "qty": 0.001,
+  "order_type": "market",
+  "market_type": "spot",
+  "confirm_order": true
+}
+```
+
+Live-order call shape:
+
+```json
+{
+  "market": "Crypto",
+  "symbol": "BTC/USDT",
+  "side": "buy",
+  "qty": 0.001,
+  "order_type": "market",
+  "market_type": "spot",
+  "credential_id": 1,
+  "confirm_order": true,
+  "confirm_live_trading": true
+}
+```
+
+Live orders require all of the following:
+
+- Agent Token has **T** scope.
+- Token is issued with `paper_only=false`.
+- The backend has `AGENT_LIVE_TRADING_ENABLED=true`.
+- The tool call includes `confirm_order=true`.
+- The tool call includes `confirm_live_trading=true`.
+- `credential_id` points to a saved exchange credential owned by the user.
+
+### Job streaming
+
+For long-running backtests or optimization jobs:
+
+```text
+Submit the backtest, then use `stream_job_until_done` with a 300 second cap.
+If streaming is unavailable, use `wait_for_job`.
+```
