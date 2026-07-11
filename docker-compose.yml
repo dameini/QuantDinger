@@ -144,6 +144,7 @@ services:
       # Spot full close / open fee buffer (Admin → Settings → Live Trading, or backend_api_python/.env)
       - SPOT_CLOSE_SAFETY_RATIO=${SPOT_CLOSE_SAFETY_RATIO:-0.998}
       - SPOT_OPEN_QUOTE_BUFFER=${SPOT_OPEN_QUOTE_BUFFER:-0.995}
+      - STRATEGY_MAX_CONSECUTIVE_ERRORS=${STRATEGY_MAX_CONSECUTIVE_ERRORS:-50}
       # Container egress does not automatically inherit the host shell proxy.
       # Set these in the project-root `.env` when exchanges are reachable only
       # through a proxy / soft-router path.

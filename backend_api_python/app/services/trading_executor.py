@@ -1745,9 +1745,9 @@ class TradingExecutor:
         
         # Auto-stop policy: prevent endless error spam when a strategy is no longer runnable
         try:
-            max_consecutive_errors = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_ERRORS", "5"))
+            max_consecutive_errors = int(os.getenv("STRATEGY_MAX_CONSECUTIVE_ERRORS", "50"))
         except Exception:
-            max_consecutive_errors = 5
+            max_consecutive_errors = 50
         if max_consecutive_errors < 1:
             max_consecutive_errors = 1
         consecutive_errors = 0
@@ -1772,34 +1772,97 @@ class TradingExecutor:
               - BARK_AUTO_STOP_SOUND=
               - BARK_AUTO_STOP_ICON=
               - BARK_AUTO_STOP_TIMEOUT_SEC=4
-            """
-            bark_url = (os.getenv("BARK_AUTO_STOP_URL") or "").strip().rstrip("/")
-            if not bark_url:
-                return
-            try:
-                from urllib.parse import quote
-                import requests
 
-                title = f"QD Auto-Stopped | {strategy_name}"
-                body = f"{symbol} | {str(reason or '').strip()}".strip(" |")
-                url = f"{bark_url}/{quote(title)}/{quote(body)}"
-                params: Dict[str, Any] = {}
-                group = (os.getenv("BARK_AUTO_STOP_GROUP") or "").strip()
-                sound = (os.getenv("BARK_AUTO_STOP_SOUND") or "").strip()
-                icon = (os.getenv("BARK_AUTO_STOP_ICON") or "").strip()
-                if group:
-                    params["group"] = group
-                if sound:
-                    params["sound"] = sound
-                if icon:
-                    params["icon"] = icon
+            Fallback:
+              - if BARK_AUTO_STOP_URL is unset or delivery fails, reuse the
+                owning user's Bark webhook from notification_settings.
+            """
+            title = f"QD Auto-Stopped | {strategy_name}"
+            body = f"{symbol} | {str(reason or '').strip()}".strip(" |")
+            bark_url = (os.getenv("BARK_AUTO_STOP_URL") or "").strip().rstrip("/")
+            if bark_url:
                 try:
-                    timeout_sec = float(os.getenv("BARK_AUTO_STOP_TIMEOUT_SEC") or "4")
-                except Exception:
-                    timeout_sec = 4.0
-                requests.get(url, params=params, timeout=max(1.0, timeout_sec))
+                    from urllib.parse import quote
+                    import requests
+
+                    url = f"{bark_url}/{quote(title)}/{quote(body)}"
+                    params: Dict[str, Any] = {}
+                    group = (os.getenv("BARK_AUTO_STOP_GROUP") or "").strip()
+                    sound = (os.getenv("BARK_AUTO_STOP_SOUND") or "").strip()
+                    icon = (os.getenv("BARK_AUTO_STOP_ICON") or "").strip()
+                    if group:
+                        params["group"] = group
+                    if sound:
+                        params["sound"] = sound
+                    if icon:
+                        params["icon"] = icon
+                    try:
+                        timeout_sec = float(os.getenv("BARK_AUTO_STOP_TIMEOUT_SEC") or "4")
+                    except Exception:
+                        timeout_sec = 4.0
+                    resp = requests.get(url, params=params, timeout=max(1.0, timeout_sec))
+                    if 200 <= int(getattr(resp, "status_code", 0) or 0) < 300:
+                        return
+                    logger.debug(
+                        "bark auto-stop env notify failed: status=%s body=%s",
+                        getattr(resp, "status_code", None),
+                        str(getattr(resp, "text", "") or "")[:200],
+                    )
+                except Exception as e:
+                    logger.debug("bark auto-stop env notify failed: %s", e)
+
+            try:
+                from app.services.signal_notifier import SignalNotifier
+
+                with get_db_connection() as db:
+                    cur = db.cursor()
+                    cur.execute(
+                        """
+                        SELECT
+                            u.notification_settings
+                        FROM qd_strategies_trading s
+                        LEFT JOIN qd_users u ON u.id = s.user_id
+                        WHERE s.id = ?
+                        """,
+                        (int(strategy_id),),
+                    )
+                    row = cur.fetchone() or {}
+                    cur.close()
+
+                settings_raw = row.get("notification_settings") or ""
+                settings = {}
+                if settings_raw:
+                    try:
+                        parsed = json.loads(settings_raw)
+                        if isinstance(parsed, dict):
+                            settings = parsed
+                    except Exception:
+                        settings = {}
+
+                bark_url = str(settings.get("webhook_url") or "").strip()
+                if "api.day.app" not in bark_url.lower():
+                    return
+
+                payload = {
+                    "event": "qd.strategy_auto_stopped",
+                    "title": title,
+                    "message": body,
+                    "strategy": {"id": int(strategy_id), "name": strategy_name},
+                    "instrument": {"symbol": symbol},
+                    "level": "error",
+                    "timestamp_iso": datetime.utcnow().isoformat() + "Z",
+                }
+                notifier = SignalNotifier()
+                ok, err = notifier._notify_webhook(
+                    url=bark_url,
+                    payload=payload,
+                    token_override=str(settings.get("webhook_token") or "").strip() or None,
+                    signing_secret_override=str(settings.get("webhook_signing_secret") or "").strip() or None,
+                )
+                if not ok:
+                    logger.debug("bark auto-stop user notify failed: strategy_id=%s err=%s", strategy_id, err)
             except Exception as e:
-                logger.debug("bark auto-stop notify failed: %s", e)
+                logger.debug("bark auto-stop user notify failed: %s", e)
 
         def _set_db_stopped_best_effort(reason: str) -> None:
             """Best-effort: mark strategy stopped to avoid zombie 'running' status."""
