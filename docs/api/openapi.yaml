@@ -1296,6 +1296,26 @@ paths:
       - Users
       operationId: postApiUsersSystemStrategiesToggle
       x-visibility: internal
+  /api/users/system-strategies/delete:
+    delete:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Delete any strategy from the system overview (admin only).
+      tags:
+      - Users
+      operationId: deleteApiUsersSystemStrategiesDelete
+      x-visibility: internal
   /api/users/admin-orders:
     get:
       responses:
@@ -2593,6 +2613,26 @@ paths:
       tags:
       - Strategy
       operationId: getApiStrategiesTrades
+      x-visibility: internal
+  /api/strategies/trades/sync:
+    post:
+      responses:
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanErrorEnvelope'
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HumanSuccessEnvelope'
+      summary: Manually sync HTX exchange trade history into strategy trade records.
+      tags:
+      - Strategy
+      operationId: postApiStrategiesTradesSync
       x-visibility: internal
   /api/strategies/equityCurve:
     get:
@@ -4745,11 +4785,12 @@ paths:
       summary: List published marketplace indicators.
       description: "Query params:\npage: Page number (default 1)\npage_size: Page\
         \ size (default 12)\nkeyword: Search keyword\npricing_type: 'free' / 'paid'\
-        \ / empty (all)\nsort_by: 'score' (default) / 'newest' / 'hot' / 'price_asc'\
-        \ /\n         'price_desc' / 'rating'.\n         'score' sorts by the composite\
-        \ multi-factor backtest score\n         (see services/experiment/scoring.py)\
-        \ and is now the\n         default — putting genuinely well-performing indicators\n\
-        \         at the top of the marketplace, not just the newest ones."
+        \ / empty (all)\nvip_free: 1/true to show VIP-free paid assets only\nsort_by:\
+        \ 'score' (default) / 'newest' / 'hot' / 'price_asc' /\n         'price_desc'\
+        \ / 'rating'.\n         'score' sorts by the composite multi-factor backtest\
+        \ score\n         (see services/experiment/scoring.py) and is now the\n  \
+        \       default — putting genuinely well-performing indicators\n         at\
+        \ the top of the marketplace, not just the newest ones."
       tags:
       - Community
       operationId: getApiCommunityIndicators
